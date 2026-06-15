@@ -93,6 +93,22 @@ build fetches the pinned Swift package dependencies; the first launch provisions
 the on-device transcription runtime (a managed Python environment and the model
 weights) into the app's own data folder.
 
+### Optional Meet extension
+
+Blaise records fine on its own. To *also* pull Google Meet participant names and
+active-speaker timing (for better speaker labelling), install the companion
+Chrome extension:
+
+1. Download `blaise-meet-extension.zip` from the [Releases](../../releases) page
+   and unzip it (or use the repo's `extension/` folder if you cloned it).
+2. Open `chrome://extensions` and toggle **Developer mode** (top right).
+3. Click **Load unpacked** and select the unzipped folder (the one containing
+   `manifest.json`).
+
+It reads only participant display names and speaking times from the Meet page and
+delivers them encrypted to Blaise on `127.0.0.1` — no audio, captions, or chat,
+and nothing leaves your machine. Entirely optional.
+
 ## First-run setup
 
 On first launch Blaise walks you through:
@@ -180,22 +196,6 @@ the project's bar: **tests must pass by their exit code, and they are never
 weakened or gamed to go green.** Environment-gated tests (real audio hardware, API
 keys, heavyweight models) skip cleanly and record their reason rather than
 silently passing.
-
-## Roadmap
-
-Near-term, and good places to start (see the issue tracker for "good first issue"
-labels):
-
-- Deterministic, glossary-driven name substitution (replace a misheard surface
-  form with its canonical spelling only where the glossary gives an unambiguous
-  target).
-- Markdown sidecar export alongside the JSON payload, for Obsidian and other note
-  systems (the local-folder handoff destination that makes "bring your own
-  agentic system" real).
-- Meeting-detail polish: inline meeting rename, an audio player at the top of the
-  notes page, calendar attendee names, "Copy All" on notes and transcript.
-- A "done" state for action items, with a completed archive.
-- Timecode links from notes items back to the audio span they came from.
 
 ## Licence
 
