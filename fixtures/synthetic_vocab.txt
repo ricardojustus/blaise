@@ -1,0 +1,43 @@
+# synthetic_vocab.txt — synthetic vocabulary for C5 correction.
+# Grammar: 'canonical' or 'canonical|alias1|alias2'; '#' comments; fields trimmed.
+# Hand-authored fictional fixture (Vexatron Labs / Quoll Harbour universe);
+# dispositions are recorded in synthetic_vocab.manifest.json (the data source of
+# truth) and exercised by the C5 vocab-correction suites.
+# people
+Sam Rivera
+Marco Vidal|Vido|Vidau
+Leo Marston|Larso
+Toban Vane|Tobes
+Elena Marquez|Nira
+Fernando Marsh|Marsa
+Luca Zander|Zandi
+Eduardo Nolan|Ed
+Adrian Cole
+Silas Yarrow
+Anna Reyes
+Lance Quoll
+A.J. Stone
+Frank D'avlin
+Kobi
+Kuvira
+# places and studio
+Vexatron Labs|Vexatron
+Quoll Harbour|Quol Harbour
+# projects
+Project Saltmarsh|Saltmarsh
+Petball
+Aurora Tales|Aurora Tales: The Last Confession
+KORU
+# partners and companies
+Nexus|Nexus Quest|Nexus Vista Engine|Nexus Vista Worlds
+Tidewell|The Tidewell Company International
+Solitaire Pictures
+DozenLabs
+Apex Games
+Cerebros
+Astrari
+PlayForge
+# generic / app terms
+Blaise
+Claude
+Aurora Engine

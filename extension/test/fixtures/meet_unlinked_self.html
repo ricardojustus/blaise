@@ -1,0 +1,34 @@
+<!--
+  RECONSTRUCTED fixture — NOT a real Meet capture. Same sources and
+  replacement plan as meet_in_call.html (see that file's header).
+
+  Scenario (self-model rule 3 + residual-risk b): self tile labeled "You"
+  carries NO participant id, and the panel self row "Conta Local" has a
+  participant id the tile never exposes — so the two CANNOT be linked.
+  Expected: the tile becomes the anonymous self entry (isSelf, null name);
+  the panel row flows as an ordinary NAMED participant (stated, harmless
+  miss — real account name, resolved by C4 voting + aliases).
+-->
+<div class="ctrl-bar">
+  <button aria-label="Leave call" class="end-call"></button>
+</div>
+<main class="grid">
+  <div class="tile self-tile">
+    <div data-self-name="You" class="name-label">You</div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+  <div data-requested-participant-id="pid-2" class="tile">
+    <div data-self-name="Maria Silva" class="name-label">Maria Silva</div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+</main>
+<aside class="panel">
+  <div role="list" class="participant-list">
+    <div role="listitem" data-participant-id="pid-9" aria-label="Conta Local">
+      <span>Conta Local</span>
+    </div>
+    <div role="listitem" data-participant-id="pid-2" aria-label="Maria Silva">
+      <span>Maria Silva</span>
+    </div>
+  </div>
+</aside>

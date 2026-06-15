@@ -1,0 +1,99 @@
+# Blaise CI — builds the app and runs the Swift + extension test suites on
+# macOS runners. Environment-gated tests (real audio hardware, API keys,
+# heavyweight models) skip cleanly with recorded reasons, so the suite is
+# CI-ready by construction.
+#
+# ─── Runner facts (verified against live GitHub docs, June 2026) ──────────────
+# GitHub-hosted macOS runners:
+#   * macos-26 (alias of macos-26-arm64, Apple Silicon) is GENERALLY AVAILABLE
+#     (GA since 2026-02-26). Image macOS 26.4.
+#   * Installed Xcode on macos-26 includes 26.5, 26.4.1 (default), 26.3, 26.2,
+#     26.1.1, 26.0.1. Blaise builds against the macOS 26 SDK and is verified
+#     locally with Xcode 26.5, which is present on the image — so this workflow
+#     selects 26.5 explicitly via xcode-select.
+#   * Node.js: 24 is the image default; 22 is cached. The extension suite needs
+#     Node >= 20.19, so actions/setup-node pins 22 for reproducibility.
+# Sources:
+#   https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
+#   https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md
+#   https://github.com/actions/runner-images/issues/14001  (default Xcode 26.4.1 from 2026-05-18)
+#
+# Because a macOS 26 image with Xcode 26 EXISTS, no compile-only fallback is
+# needed: this workflow runs the full suite. If a future toolchain bump outpaces
+# the hosted image (GitHub's macOS images lag Apple's releases), the honest
+# fallback is to drop to the highest available Xcode 26.x, build what compiles,
+# and treat the full suite as a local pre-merge step documented in CONTRIBUTING
+# — switch this workflow to that mode with a clearly-marked TODO rather than
+# silently letting it pass on a partial build.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. a force-push to a PR branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test (macOS 26)
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26.5
+        run: sudo xcode-select -switch /Applications/Xcode_26.5.app
+
+      - name: Report toolchain
+        run: |
+          xcodebuild -version || true
+          /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift --version
+
+      - name: Set up Node.js 22 (extension suite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # SwiftPM cache: the resolved dependency checkouts and the build's
+      # ModuleCache. Keyed on Package.resolved so a dependency bump invalidates
+      # it; falls back to the most recent partial cache otherwise.
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('app/Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-
+
+      - name: Build (release app)
+        run: scripts/build_app.sh
+
+      # scripts/test.sh runs BOTH the Swift Testing suite and the extension's
+      # vitest suite. Environment-gated tests (real audio hardware, cloud API
+      # keys, heavyweight models) skip cleanly and record their reason under
+      # .test-skips/ — see CONTRIBUTING. The step below fails the job on any
+      # non-skip failure (test.sh propagates the suite's exit code) and then
+      # surfaces the recorded skip reasons in the log for the reviewer.
+      - name: Test (Swift + extension)
+        run: scripts/test.sh
+
+      - name: Report recorded test skips
+        if: always()
+        run: |
+          if [ -d .test-skips ] && [ -n "$(ls -A .test-skips 2>/dev/null)" ]; then
+            echo "Environment-gated tests skipped on this runner (reasons recorded):"
+            for f in .test-skips/*; do
+              echo "  - $(basename "$f"): $(cat "$f")"
+            done
+          else
+            echo "No tests skipped on this runner."
+          fi

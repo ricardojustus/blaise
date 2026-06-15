@@ -1,0 +1,20 @@
+{
+  "_comment": "Expected outcomes for wire_batch_lifecycle_golden.json: both deliveries ack 200; the event ingests ONCE; the ingestor forwards ONE acted-on signal (meetingCode, capturedAtMs, lifecycle) per delivery but the tracker's monotonic guard drops the replay; a fresh call-started (now - atMs <= 120 s) posts exactly ONE 'Meeting in progress' notification.",
+  "meetingCode": "abc-defg-hij",
+  "selfSubstitutionName": "Conta Local",
+  "schemaVersion": 2,
+  "lifecycle": {
+    "kind": "call-started",
+    "atMs": 1781135999000
+  },
+  "capturedAtMs": 1781136000000,
+  "activeSpeakerEvents": [
+    {
+      "display_name": "Maria Silva",
+      "participant_id": "pid-2",
+      "start_epoch_millis": 1781135990000,
+      "end_epoch_millis": 1781135995500
+    }
+  ],
+  "expectedMeetStartNotifications": 1
+}

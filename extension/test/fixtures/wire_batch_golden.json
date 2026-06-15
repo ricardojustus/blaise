@@ -1,0 +1,18 @@
+{
+  "_comment": "Cross-chunk golden (C12 -> C10/C11 listener acceptance). deliveries[1] is a byte-identical REPLAY of deliveries[0] (AEAD does not prevent replay; the listener's per-meeting seen-id dedupe must ingest its events exactly once). Synthetic names only. Regenerate with scripts/make_golden.mjs only on contract changes.",
+  "contract": "docs/meet_events_contract.md",
+  "testSecret": "5db1ae0d3b1f6c2a9e84d7f0c6b35a18e29f4c7d8a01b3e5f6a7c8d9e0f1a2b3",
+  "endpoint": "POST /v1/meet-events",
+  "aad": "blaise-meet-events-v1",
+  "ackHeader": "X-Blaise-Ack",
+  "deliveries": [
+    {
+      "iv": "Ge0438nS65ePfymP",
+      "ciphertext": "pFWuNC+wa8bmy8kGFcWvlD9mXDbgOQ/6i5N/jAbEh9CoyF2xZsrxExn58BqTNcYW24ujQZjQhezUEXUg0QPbQAUYBDQS05nUzzWK71Y5U580zDrYFneI/Ar33V6m5HSJ6z5ibziYIOmZQ49foipGmseElJgURTerphfCScFw1Xl5shwGJySpXC6tVIcrt7oV0ax5yLtnMqJ7CdPQ0CV4GQR/wo7qf1HV25TR96nXfpKSl/eOHcmomrED/GshdTh/gW86PwpBDfRBnztjRC0loqxglVhLjblzZUbvBJ/PYgcQq5Fzq58cotKuIRe/lw6fU6yZfYLW6lt9c1BClRkG8IE5Q+mEzIuyPGWgZRtrvnLzA3LWdKVn9hzOiXPUP+zN90Ry9NLira3QkXfzJYxgOBDce/xTaJrC3wpSaS4nRqfKh22TqUVzjUA/mHk8o9wvfw0SRVDo4gAf+d+lGouB3wE1CgWI8LEihLEBU7eTqkPavol2wmb40mcvqgt1G4I0tfqpYbN1PgA0qtaIcdpR7cCpBkoO1WL9hm9Y9dAdXnwzxvEd003LnMj3UzKWgEkvMhbFDLHhfCLtIlKS1PtzOGOQDcXEqwiIw5ngjTzyu12CPDRkRhtCRxnIZogZkIKlVp2hcELzfJvspw7jp3v+ms0k6aXrZE/ObXDzHehU/OhkIi8clNFao4CSAYhMZKxr7A0qgB1wFQ9CGNXnfRnpQ2frHzyWXreTt1FCvHhr4f06BtLc5vkJMmboRjt8y0wCL368nDagqqhy0ErQPtTijEpxo6td34Tb/fTZx/Nyqk0lwunlm/qDheJ+PmKKNTqbS1yGPkfCINrP1fcdRhzllBvFbJIre+b6M8LKYr99jtsqXbxdqxwhCT24Tk/BepNZ68MierkyDZznn5TOiEqXbXJnx1OzPIFlwc0yV2Zi+IC8AL2+I2aTuaORFJewpJkUhZk2zJOKB2IvBOg8yu2RxD0fstM/O7R6vvFxhgEL1ppL04JkYKvrUHMoPplzRVSpEwn6vNnORRDz5tv5QKt5W5rn5EA1r673NQKgGEudaWsf2j//FU6t7Lm8IgB2vexf+yqmW8sRAlFakbmhPodbkVJXjrajVBMTki9f4q5ZjK5W9pmS6sJf8x5sFVvooLWgGmLwzM0VHB7UjUSko9vPw53FgzHF+RijQVWBO2+bUFtqkhCK"
+    },
+    {
+      "iv": "Ge0438nS65ePfymP",
+      "ciphertext": "pFWuNC+wa8bmy8kGFcWvlD9mXDbgOQ/6i5N/jAbEh9CoyF2xZsrxExn58BqTNcYW24ujQZjQhezUEXUg0QPbQAUYBDQS05nUzzWK71Y5U580zDrYFneI/Ar33V6m5HSJ6z5ibziYIOmZQ49foipGmseElJgURTerphfCScFw1Xl5shwGJySpXC6tVIcrt7oV0ax5yLtnMqJ7CdPQ0CV4GQR/wo7qf1HV25TR96nXfpKSl/eOHcmomrED/GshdTh/gW86PwpBDfRBnztjRC0loqxglVhLjblzZUbvBJ/PYgcQq5Fzq58cotKuIRe/lw6fU6yZfYLW6lt9c1BClRkG8IE5Q+mEzIuyPGWgZRtrvnLzA3LWdKVn9hzOiXPUP+zN90Ry9NLira3QkXfzJYxgOBDce/xTaJrC3wpSaS4nRqfKh22TqUVzjUA/mHk8o9wvfw0SRVDo4gAf+d+lGouB3wE1CgWI8LEihLEBU7eTqkPavol2wmb40mcvqgt1G4I0tfqpYbN1PgA0qtaIcdpR7cCpBkoO1WL9hm9Y9dAdXnwzxvEd003LnMj3UzKWgEkvMhbFDLHhfCLtIlKS1PtzOGOQDcXEqwiIw5ngjTzyu12CPDRkRhtCRxnIZogZkIKlVp2hcELzfJvspw7jp3v+ms0k6aXrZE/ObXDzHehU/OhkIi8clNFao4CSAYhMZKxr7A0qgB1wFQ9CGNXnfRnpQ2frHzyWXreTt1FCvHhr4f06BtLc5vkJMmboRjt8y0wCL368nDagqqhy0ErQPtTijEpxo6td34Tb/fTZx/Nyqk0lwunlm/qDheJ+PmKKNTqbS1yGPkfCINrP1fcdRhzllBvFbJIre+b6M8LKYr99jtsqXbxdqxwhCT24Tk/BepNZ68MierkyDZznn5TOiEqXbXJnx1OzPIFlwc0yV2Zi+IC8AL2+I2aTuaORFJewpJkUhZk2zJOKB2IvBOg8yu2RxD0fstM/O7R6vvFxhgEL1ppL04JkYKvrUHMoPplzRVSpEwn6vNnORRDz5tv5QKt5W5rn5EA1r673NQKgGEudaWsf2j//FU6t7Lm8IgB2vexf+yqmW8sRAlFakbmhPodbkVJXjrajVBMTki9f4q5ZjK5W9pmS6sJf8x5sFVvooLWgGmLwzM0VHB7UjUSko9vPw53FgzHF+RijQVWBO2+bUFtqkhCK"
+    }
+  ]
+}

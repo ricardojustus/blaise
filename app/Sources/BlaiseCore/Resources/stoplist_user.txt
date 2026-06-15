@@ -1,0 +1,11 @@
+# stoplist_user.txt — optional per-install C5 suppression supplement.
+#
+# The bundled copy ships EMPTY: a fresh install's suppression set is the
+# top-3000 PT/EN frequency lists, minus stoplist_exclusions, plus the
+# per-glossary suppression augmentation the C5 admission step derives from the
+# user's own Glossary.md. There are no built-in project terms.
+#
+# To suppress your own project/team names (so an everyday word that collides
+# with a name is not case-restored in ordinary speech), add one folded word per
+# line to <dataRoot>/stoplist_user.txt; the runtime unions those on top of the
+# bundled set. Lines starting with `#` are comments.

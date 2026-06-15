@@ -1,0 +1,27 @@
+# stoplist_project.txt — project supplement to the suppression set.
+# Synthetic fixture: fictional Vexatron Labs / Quoll Harbour project codenames
+# that ALSO spell everyday Portuguese (nautical) words. A project name that
+# collides with an ordinary word must be SUPPRESSED, not auto-corrected — exact
+# casing is delegated to C6. Word-per-line; '#' comments; folded on membership.
+# [level_a(i)] 'vela' is an everyday PT word (candle / sail); the codename casing is contextual (C6)
+vela
+# [level_a(i)] 'barco' is the PT word for boat; the codename casing is contextual (C6)
+barco
+# [level_a(i)] 'farol' is the PT word for lighthouse/headlight; the codename casing is contextual (C6)
+farol
+# [level_a(i)] 'maré' folds to 'mare' — the PT word for tide; the codename casing is contextual (C6)
+maré
+# [level_a(i)] 'âncora' folds to 'ancora' — the PT word for anchor; the codename casing is contextual (C6)
+âncora
+# [level_a(i)] 'bússola' folds to 'bussola' — the PT word for compass; the codename casing is contextual (C6)
+bússola
+# [level_a(i)] 'pedra' is an everyday PT word (stone); the codename casing is contextual (C6)
+pedra
+# [level_b_flip] 'ponte' is a real PT word (bridge, lexicon rank ~1.7k); case-restoring the codename surface would corrupt ordinary PT speech; suppressed, delegated to C6 [entry: Quoll Harbour]
+ponte
+# [level_a(i)] 'cais' is the PT word for quay/wharf; the codename casing is contextual (C6)
+cais
+# [level_b_flip] 'proa' is a real PT word (bow of a ship, lexicon rank ~13k); case-restoring the codename surface would corrupt ordinary PT speech; suppressed, delegated to C6 [entry: Quoll Harbour]
+proa
+# [level_b_flip] 'leme' is a real PT word (rudder/helm, lexicon rank ~9.9k); case-restoring the codename surface would corrupt ordinary PT speech; suppressed, delegated to C6 [entry: Quoll Harbour]
+leme

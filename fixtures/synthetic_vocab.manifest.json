@@ -1,0 +1,336 @@
+{
+  "aliasAdmissions": [
+    {
+      "alias": "Tobes",
+      "canonical": "Toban Vane",
+      "verdict": "admitted",
+      "residualRisk": "'Tobes' could be read as a casual given-name nickname — rule (d) judgment: admitted only as a curated, evidenced mishearing of Toban Vane in Vexatron Labs meetings, overridable by C6 context",
+      "evidence": "synthetic clause fixture: a curated mishearing of the UX coordinator Toban Vane"
+    },
+    {
+      "alias": "Marsa",
+      "canonical": "Fernando Marsh",
+      "verdict": "admitted",
+      "residualRisk": "rule (d) judgment: 'Marsa' has no accent-stripped real-name reading and is absent from both lexicons and br_common_names — lexical garbage that can only be the mishearing of the surname Marsh",
+      "evidence": "synthetic clause fixture: the spoken surname 'Marsh' rendered as 'Marsa'"
+    },
+    {
+      "alias": "Quol Harbour",
+      "canonical": "Quoll Harbour",
+      "verdict": "admitted",
+      "residualRisk": "the planted C5 mishearing: ASR drops one 'l' from the studio location 'Quoll Harbour'; the distinctive core 'quol' is absent from both lexicons, so the spaced surface only ever spells the location",
+      "evidence": "synthetic clause fixture: 'Quol Harbour' as the misheard 'Quoll Harbour'"
+    }
+  ],
+  "aliasCount": 16,
+  "assertions": {
+    "alias_punctuation_apostrophes_only": true,
+    "glossary_people_covered": true,
+    "level_a_hits_all_reviewed": true,
+    "level_b_flagged_all_reviewed": true,
+    "mishearing_aliases_admitted": true,
+    "no_folded_surface_collisions": true,
+    "no_multi_token_alias_with_all_common_cores_unless_curated_brand": true,
+    "no_pipe_in_terms": true,
+    "stoplist_project_words_effective": true
+  },
+  "compoundAliasScan": [
+    {
+      "alias": "Quol Harbour",
+      "canonical": "Quoll Harbour",
+      "cores": [
+        "quol",
+        "harbour"
+      ],
+      "lexiconCommonCores": [
+        "harbour"
+      ],
+      "verdict": "added",
+      "detail": "the planted mishearing of the studio location; 'quol' is absent from both lexicons, so the distinctive core anchors the bigram and the spaced surface only ever spells 'Quoll Harbour'"
+    },
+    {
+      "alias": "Nexus Quest",
+      "canonical": "Nexus",
+      "cores": [
+        "nexus",
+        "quest"
+      ],
+      "lexiconCommonCores": [
+        "nexus",
+        "quest"
+      ],
+      "verdict": "added_curated_brand_compound",
+      "detail": "a curated brand compound of the Nexus platform; both cores are lexicon-present but the spaced product name does not occur in ordinary speech — admitted as a brand spelling, exempt from the all-common-cores rejection"
+    },
+    {
+      "alias": "Nexus Vista Engine",
+      "canonical": "Nexus",
+      "cores": [
+        "nexus",
+        "vista",
+        "engine"
+      ],
+      "lexiconCommonCores": [
+        "nexus",
+        "vista",
+        "engine"
+      ],
+      "verdict": "added_curated_brand_compound",
+      "detail": "a curated brand compound of the Nexus platform; the trigram is unambiguously the engine name, exempt from the all-common-cores rejection"
+    },
+    {
+      "alias": "Nexus Vista Worlds",
+      "canonical": "Nexus",
+      "cores": [
+        "nexus",
+        "vista",
+        "worlds"
+      ],
+      "lexiconCommonCores": [
+        "nexus",
+        "vista",
+        "worlds"
+      ],
+      "verdict": "added_curated_brand_compound",
+      "detail": "a curated brand compound of the Nexus platform; the trigram is unambiguously the worlds product, exempt from the all-common-cores rejection"
+    },
+    {
+      "alias": "The Tidewell Company International",
+      "canonical": "Tidewell",
+      "cores": [
+        "the",
+        "tidewell",
+        "company",
+        "international"
+      ],
+      "lexiconCommonCores": [
+        "the",
+        "company",
+        "international"
+      ],
+      "verdict": "added",
+      "detail": "the full legal name of the Tidewell partner; the distinctive core 'tidewell' (absent from both lexicons) anchors the four-gram"
+    },
+    {
+      "alias": "Aurora Tales: The Last Confession",
+      "canonical": "Aurora Tales",
+      "cores": [
+        "aurora",
+        "tales",
+        "the",
+        "last",
+        "confession"
+      ],
+      "lexiconCommonCores": [
+        "aurora",
+        "tales",
+        "the",
+        "last",
+        "confession"
+      ],
+      "verdict": "added_curated_brand_compound",
+      "detail": "the full subtitle of the Aurora Tales title; all five cores are lexicon-common, but the five-gram is a distinctive product name that never occurs in ordinary speech — curated in, exempt from the all-common-cores rejection"
+    },
+    {
+      "alias": "Dozen Labs",
+      "canonical": "DozenLabs",
+      "cores": [
+        "eleven",
+        "labs"
+      ],
+      "lexiconCommonCores": [
+        "eleven",
+        "labs"
+      ],
+      "verdict": "rejected_all_cores_lexicon_common",
+      "detail": "all cores lexicon-common at rank <= 40000 (eleven: en 4903; labs: pt 34396, en 8410) — spaced split of the brand compound REJECTED by the alias-core scan: both cores are common words, so the bigram occurs in ordinary speech"
+    },
+    {
+      "alias": "Apex Game",
+      "canonical": "Apex Games",
+      "cores": [
+        "apex",
+        "game"
+      ],
+      "lexiconCommonCores": [
+        "apex",
+        "game"
+      ],
+      "verdict": "rejected_all_cores_lexicon_common",
+      "detail": "all cores lexicon-common at rank <= 40000 (apex: en 24016; game: pt 7954, en 456) — singular split of the studio name REJECTED by the alias-core scan: both cores are common words, so the bigram occurs in ordinary speech"
+    }
+  ],
+  "entryCount": 33,
+  "levelA": [
+    {
+      "surface": "Kuvira",
+      "canonical": "Kuvira",
+      "enRank": 44361,
+      "disposition": "accept_name_shaped(ii)",
+      "justification": "appears deep in the en lexicon (~rank 44k) as a proper name; not a PT/EN word — case restore of the given name is desired"
+    },
+    {
+      "surface": "Blaise",
+      "canonical": "Blaise",
+      "enRank": 38703,
+      "disposition": "accept_name_shaped(ii)",
+      "justification": "the app's own name; en lexicon hit (~rank 38.7k) is the French given name (Blaise Pascal), not an EN word — case restore desired"
+    },
+    {
+      "surface": "Claude",
+      "canonical": "Claude",
+      "enRank": 6857,
+      "ptRank": 7525,
+      "disposition": "accept_name_shaped(ii)",
+      "justification": "given name in both lexicons; Claude-the-product casing matches the name"
+    },
+    {
+      "surface": "Silas",
+      "canonical": "Silas Yarrow",
+      "enRank": 10934,
+      "ptRank": 10560,
+      "disposition": "accept_name_shaped(ii)",
+      "justification": "en/pt lexicon presence is the given name of glossary person Silas Yarrow, not a word"
+    },
+    {
+      "surface": "Nexus",
+      "canonical": "Nexus",
+      "enRank": 28213,
+      "ptRank": 44649,
+      "disposition": "accept_name_shaped(ii)",
+      "justification": "lexicon presence is name-shaped (well outside top-3000); Nexus-the-platform casing matches — case restore desired"
+    },
+    {
+      "surface": "Lance",
+      "canonical": "Lance Quoll",
+      "ptRank": 1957,
+      "enRank": 4464,
+      "disposition": "suppress_common_word(i)",
+      "justification": "'lance' is a common PT word (top-3000, throw/bid); case-restoring every bare 'lance' would rewrite ordinary speech, so Lance-the-person casing is delegated to C6; the full name Lance Quoll stays"
+    }
+  ],
+  "levelB": [
+    {
+      "canonical": "Lance Quoll",
+      "cores": [
+        "lance",
+        "quoll"
+      ],
+      "nonStopCores": [
+        "quoll"
+      ],
+      "classification": "mixed",
+      "disposition": "auto",
+      "justification": "'quoll' is distinctive (absent from both lexicons); firing the mixed window case-restores the known person whatever the diff"
+    },
+    {
+      "canonical": "Nexus Vista Engine",
+      "cores": [
+        "nexus",
+        "vista",
+        "engine"
+      ],
+      "nonStopCores": [
+        "nexus",
+        "engine"
+      ],
+      "classification": "mixed",
+      "disposition": "reviewed",
+      "justification": "'vista' (pt rank 984) is a stop core, but 'nexus'/'engine' are name-shaped; the trigram is unambiguously the platform"
+    },
+    {
+      "canonical": "Aurora Tales",
+      "cores": [
+        "aurora",
+        "tales"
+      ],
+      "nonStopCores": [
+        "aurora",
+        "tales"
+      ],
+      "classification": "mixed",
+      "disposition": "auto",
+      "justification": "neither core is top-3000; firing the bigram case-restores the title"
+    },
+    {
+      "canonical": "Apex Games",
+      "cores": [
+        "apex",
+        "games"
+      ],
+      "nonStopCores": [
+        "apex"
+      ],
+      "classification": "mixed",
+      "disposition": "auto",
+      "justification": "'games' (en rank 1520) is a stop core, but 'apex' is name-shaped; firing case-restores the studio name"
+    }
+  ],
+  "multiTokenEntryCount": 21,
+  "notes": [
+    "Hand-authored fictional fixture (Vexatron Labs / Quoll Harbour universe). Not a derivation run: rows are curated to exercise the C5 vocab-correction suites with synthetic data only — no real names anywhere.",
+    "stoplist_project carries fictional nautical project codenames that ALSO spell everyday PT words; a codename that collides with a common word is suppressed (exact casing delegated to C6).",
+    "Curated brand/title compounds (Nexus Quest / Nexus Vista Engine / Nexus Vista Worlds / Aurora Tales: The Last Confession) ship as multi-token ALIASES even though all their cores are lexicon-common: the spaced product/title surfaces never occur in ordinary speech, so they are exempt from the all-common-cores rejection that drops phonetic mishearing aliases (Dozen Labs / Apex Game)."
+  ],
+  "spec": "C5 synthetic fixture",
+  "stoplistProject": [
+    {
+      "word": "vela",
+      "source": "level_a(i)",
+      "justification": "'vela' is an everyday PT word (candle / sail); the codename casing is contextual (C6)"
+    },
+    {
+      "word": "barco",
+      "source": "level_a(i)",
+      "justification": "'barco' is the PT word for boat; the codename casing is contextual (C6)"
+    },
+    {
+      "word": "farol",
+      "source": "level_a(i)",
+      "justification": "'farol' is the PT word for lighthouse/headlight; the codename casing is contextual (C6)"
+    },
+    {
+      "word": "mare",
+      "source": "level_a(i)",
+      "justification": "'maré' folds to 'mare' — the PT word for tide; the codename casing is contextual (C6)"
+    },
+    {
+      "word": "ancora",
+      "source": "level_a(i)",
+      "justification": "'âncora' folds to 'ancora' — the PT word for anchor; the codename casing is contextual (C6)"
+    },
+    {
+      "word": "bussola",
+      "source": "level_a(i)",
+      "justification": "'bússola' folds to 'bussola' — the PT word for compass; the codename casing is contextual (C6)"
+    },
+    {
+      "word": "pedra",
+      "source": "level_a(i)",
+      "justification": "'pedra' is an everyday PT word (stone); the codename casing is contextual (C6)"
+    },
+    {
+      "word": "ponte",
+      "source": "level_b_flip",
+      "justification": "'ponte' is a real PT word (bridge, lexicon rank ~1.7k); case-restoring the codename surface would corrupt ordinary PT speech; suppressed, delegated to C6 [entry: Quoll Harbour]"
+    },
+    {
+      "word": "cais",
+      "source": "level_a(i)",
+      "justification": "'cais' is the PT word for quay/wharf; the codename casing is contextual (C6)"
+    },
+    {
+      "word": "proa",
+      "source": "level_b_flip",
+      "justification": "'proa' is a real PT word (bow of a ship, lexicon rank ~13k); case-restoring the codename surface would corrupt ordinary PT speech; suppressed, delegated to C6 [entry: Quoll Harbour]"
+    },
+    {
+      "word": "leme",
+      "source": "level_b_flip",
+      "justification": "'leme' is a real PT word (rudder/helm, lexicon rank ~9.9k); case-restoring the codename surface would corrupt ordinary PT speech; suppressed, delegated to C6 [entry: Quoll Harbour]"
+    }
+  ],
+  "singleTokenSurfaceCount": 12,
+  "tool": "hand-authored synthetic fixture (not a derive_vocab.sh run)",
+  "warnings": []
+}

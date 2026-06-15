@@ -1,0 +1,55 @@
+<!--
+  RECONSTRUCTED fixture — NOT a real Meet capture.
+  Built 2026-06-10 from the OSS DOM references in research/c12_meet_extension.md:
+    - panel shape: meetingbot src/bots/meet/src/bot.ts (pushed 2026-04-09) +
+      talk-time (2024): role="list" > role="listitem"[data-participant-id],
+      name in first span / aria-label
+    - tile shape: meetingbot ([data-requested-participant-id]) +
+      talk-o-meter / Lechner ([data-self-name] name labels)
+    - leave-call button: TranscripTonic wait-for-end-call pattern
+  All names are SYNTHETIC. Replace this file with the sanitized
+  __blaiseSnapshot() output at the live-Meet Human Touchpoint.
+
+  Scenario: in-call; self tile labeled "Você" WITH participant id pid-1;
+  People panel OPEN, self row "Conta Local" shares pid-1 (rule-2 link);
+  two other participants on tiles, one panel-only participant; one
+  merged-audio grouping wrapping a row (adaptive-audio wrinkle).
+-->
+<div class="ctrl-bar">
+  <button aria-label="Sair da chamada" class="end-call"></button>
+</div>
+<main class="grid">
+  <div data-requested-participant-id="pid-1" class="tile">
+    <div data-self-name="Você" class="name-label">Você</div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+  <div data-requested-participant-id="pid-2" class="tile">
+    <div data-self-name="Maria Silva" class="name-label">Maria Silva</div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+  <div data-requested-participant-id="pid-3" class="tile">
+    <div data-self-name="João Pereira" class="name-label">João Pereira</div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+</main>
+<aside class="panel">
+  <div role="list" class="participant-list">
+    <div role="listitem" data-participant-id="pid-1" aria-label="Conta Local">
+      <span>Conta Local</span>
+    </div>
+    <div role="listitem" data-participant-id="pid-2" aria-label="Maria Silva">
+      <span>Maria Silva</span>
+    </div>
+    <div role="listitem" data-participant-id="pid-3" aria-label="João Pereira">
+      <span>João Pereira</span>
+    </div>
+    <div role="listitem" data-participant-id="pid-4" aria-label="Participante Um">
+      <span>Participante Um</span>
+    </div>
+    <div class="merged-audio" aria-label="">
+      <div role="listitem" data-participant-id="pid-5" aria-label="Ana Souza">
+        <span>Ana Souza</span>
+      </div>
+    </div>
+  </div>
+</aside>

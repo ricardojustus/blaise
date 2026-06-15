@@ -1,0 +1,51 @@
+{
+  "_comment": "Expected listener ingestion for wire_batch_golden.json: decrypt both deliveries with testSecret, substitute selfSubstitutionName for isSelf events (displayName is null on the wire by design), dedupe by per-meeting seen-id set. Events are in ActiveSpeakerEvent Codable form (snake_case, BlaiseCore/SpeakerResolver.swift). Each event appears ONCE despite the replayed delivery.",
+  "meetingCode": "abc-defg-hij",
+  "selfSubstitutionName": "Conta Local",
+  "expectedRoster": [
+    {
+      "displayName": "Conta Local",
+      "participantID": "pid-1",
+      "isSelf": true
+    },
+    {
+      "displayName": "Maria Silva",
+      "participantID": "pid-2",
+      "isSelf": false
+    },
+    {
+      "displayName": "João Pereira",
+      "participantID": "pid-3",
+      "isSelf": false
+    },
+    {
+      "displayName": "Participante Um",
+      "isSelf": false
+    }
+  ],
+  "activeSpeakerEvents": [
+    {
+      "display_name": "Maria Silva",
+      "participant_id": "pid-2",
+      "start_epoch_millis": 1781135000000,
+      "end_epoch_millis": 1781135004500
+    },
+    {
+      "display_name": "Conta Local",
+      "participant_id": "pid-1",
+      "start_epoch_millis": 1781135005000,
+      "end_epoch_millis": 1781135012000
+    },
+    {
+      "display_name": "Participante Um",
+      "start_epoch_millis": 1781135013000,
+      "end_epoch_millis": 1781135015500
+    },
+    {
+      "display_name": "Maria Silva",
+      "participant_id": "pid-2",
+      "start_epoch_millis": 1781135016000,
+      "end_epoch_millis": 1781135021000
+    }
+  ]
+}

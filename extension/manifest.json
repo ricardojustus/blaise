@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Blaise Meet Companion",
+  "version": "0.2.0",
+  "description": "Passive Google Meet participant and active-speaker capture for the Blaise app. Encrypted delivery to 127.0.0.1 only; nothing leaves this machine.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1:18429/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": [
+        "src/selectors.js",
+        "src/events.js",
+        "src/crypto.js",
+        "src/observer.js",
+        "src/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "options_page": "src/options.html",
+  "action": {
+    "default_title": "Blaise Meet Companion"
+  }
+}

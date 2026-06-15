@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Xcode / Swift Package Manager
+*.xcuserstate
+xcuserdata/
+.build/
+app/.build/
+build/
+DerivedData/
+dist/
+
+# Python (ASR tooling virtualenvs / caches / downloaded models)
+.venv/
+__pycache__/
+*.pyc
+models/
+
+# Node (browser extension)
+extension/node_modules/
+extension/.cft/
+
+# Per-run machine-state skip records (the test runner rewrites these each run;
+# environment-gated, never a source of truth) — must not be committed.
+.test-skips/

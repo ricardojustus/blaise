@@ -1,0 +1,316 @@
+import Foundation
+
+/// Renders the human markdown document from `NotesStructured` — pure and
+/// deterministic (same inputs → byte-identical output). Engines never return
+/// markdown; consistency between markdown and structured holds by
+/// construction (C7 stores both).
+///
+/// ALL engine strings are treated as untrusted markdown: no engine string
+/// can introduce an H1/H2 or impersonate a section heading.
+public enum NotesRenderer {
+    /// Travels in `NotesProvenance.rendererVersion` — the markdown artifact
+    /// depends on it (D5 parity).
+    ///
+    /// G3 bumped "1" → "2": the user action-items section title is now
+    /// name-driven ("Ações do the user" → "Ações de <name>", plus the unnamed
+    /// "My action items"/"Minhas ações" variants), so the SAME
+    /// `(structured, language, meetingTitle)` renders different bytes than a
+    /// pre-G3 renderer. The identity name those bytes depend on is captured
+    /// separately in `NotesProvenance.userName`.
+    public static let version = "2"
+
+    /// - Parameters:
+    ///   - language: BCP-47; prefix match `pt*` → Portuguese headings,
+    ///     anything else → English (B-1: notes in the dominant language; the
+    ///     user's action-items section is always rendered, same language).
+    ///   - meetingTitle: H1 fallback when `s.title` is nil/blank.
+    ///   - userName: drives the user action-items section title
+    ///     (`<name> — Action Items` / `Ações de <name>`). Empty (pre-onboarding
+    ///     identity) → the neutral "My action items" / "Minhas ações" (G3).
+    /// - Throws: `EngineError.invalidStructuredNotes` if `summary` is
+    ///   empty/whitespace (refusal, not rendering — anti-hallucination).
+    public static func render(
+        _ s: NotesStructured, language: String, meetingTitle: String, userName: String = ""
+    ) throws -> String {
+        let strings = LocalizedStrings.match(language, userName: userName)
+
+        let summary = s.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !summary.isEmpty else {
+            throw EngineError.invalidStructuredNotes("summary is empty")
+        }
+
+        // Title is flattened FIRST; a title that flattens to nothing (e.g.
+        // only "#" characters) falls back to meetingTitle (impl audit M3).
+        var titleLine = s.title.map(flattenToTitleLine) ?? ""
+        if titleLine.isEmpty {
+            titleLine = flattenToTitleLine(meetingTitle)
+        }
+
+        let detailedNotes = s.detailedNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var blocks: [String] = []
+        blocks.append("# \(titleLine)")
+        blocks.append("## \(strings.summary)")
+        blocks.append(demoteHeadings(in: summary))
+        blocks.append("## \(strings.detailedNotes)")
+        blocks.append(detailedNotes.isEmpty ? strings.noneMarker : demoteHeadings(in: detailedNotes))
+        blocks.append("## \(strings.decisions)")
+        blocks.append(renderList(s.decisions.map { "- \(normalizeListText($0))" }, emptyMarker: strings.noneMarker))
+        blocks.append("## \(strings.actionItems)")
+        blocks.append(renderList(s.actionItems.map(renderActionItem), emptyMarker: strings.noneMarker))
+        blocks.append("## \(strings.userActionItems)")
+        blocks.append(renderList(s.userActionItems.map(renderActionItem), emptyMarker: strings.userNoneMarker))
+        return blocks.joined(separator: "\n\n") + "\n"
+    }
+
+    // MARK: - Localization (BCP-47 primary-subtag match)
+
+    struct LocalizedStrings {
+        let summary: String
+        let detailedNotes: String
+        let decisions: String
+        let actionItems: String
+        let userActionItems: String
+        /// anti-hallucination pattern: an empty section is stated, not invented.
+        let noneMarker: String
+        let userNoneMarker: String
+
+        /// G3 name-driven: `userName` empty → neutral "My action items" /
+        /// "Minhas ações"; otherwise `<name>'s action items` (EN) / "Ações de
+        /// <name>" (PT). The empty-section marker follows the same name.
+        static func english(userName: String) -> LocalizedStrings {
+            let name = userName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return LocalizedStrings(
+                summary: "Summary",
+                detailedNotes: "Detailed notes",
+                decisions: "Decisions",
+                actionItems: "Action items",
+                userActionItems: name.isEmpty ? "My action items" : "\(name)'s action items",
+                noneMarker: "None noted.",
+                userNoneMarker: name.isEmpty ? "No action items for me." : "No action items for \(name)."
+            )
+        }
+
+        static func portuguese(userName: String) -> LocalizedStrings {
+            let name = userName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return LocalizedStrings(
+                summary: "Resumo",
+                detailedNotes: "Notas detalhadas",
+                decisions: "Decisões",
+                actionItems: "Itens de ação",
+                userActionItems: name.isEmpty ? "Minhas ações" : "Ações de \(name)",
+                noneMarker: "Nada registrado.",
+                userNoneMarker: name.isEmpty ? "Nenhuma ação para mim." : "Nenhuma ação para \(name)."
+            )
+        }
+
+        static func match(_ language: String, userName: String) -> LocalizedStrings {
+            let primary = language.split(separator: "-").first.map(String.init) ?? language
+            return primary.lowercased() == "pt"
+                ? .portuguese(userName: userName) : .english(userName: userName)
+        }
+    }
+
+    // MARK: - Normalization of untrusted engine strings
+
+    /// Title/meetingTitle → single line: newlines become spaces, leading `#`
+    /// run stripped, surrounding whitespace trimmed.
+    static func flattenToTitleLine(_ raw: String) -> String {
+        var line = raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        while line.hasPrefix("#") {
+            line.removeFirst()
+        }
+        return line.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Demotes headings so none outranks H3, fence-aware (impl audit H1/M1/M2):
+    /// - ATX (`#`/`##` …): rewritten to `###`.
+    /// - Setext (text line + `===`/`---` underline): the text line becomes an
+    ///   H3 and the underline is dropped.
+    /// - Lines inside fenced code blocks (``` / ~~~) are never touched.
+    /// - An unclosed fence is closed at the end of the body so engine output
+    ///   cannot swallow subsequent section headings into a code block.
+    static func demoteHeadings(in body: String) -> String {
+        // CRLF/CR normalize first: every rule below is line-based and a
+        // trailing \r must not hide an underline or marker (verify N2).
+        let normalized = body
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var result: [String] = []
+        var openFence: String? = nil
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+            if let open = openFence {
+                result.append(line) // verbatim inside code block
+                if isClosingFence(line, for: open) {
+                    openFence = nil
+                }
+                index += 1
+                continue
+            }
+            if let delimiter = openingFenceDelimiter(of: line) {
+                openFence = delimiter
+                result.append(line)
+                index += 1
+                continue
+            }
+            // Setext: a paragraph line followed by an `===`/`---` underline
+            // forms an H1/H2 — demote to ATX H3. Only a PARAGRAPH line can
+            // host a setext heading (not list items, blockquotes, headings —
+            // there `---` is a thematic break; verify N5).
+            if index + 1 < lines.count,
+               isParagraphLine(line),
+               isSetextUnderline(lines[index + 1]) {
+                result.append("### " + line.trimmingCharacters(in: .whitespaces))
+                index += 2 // drop the underline
+                continue
+            }
+            result.append(demoteHeadingLine(line))
+            index += 1
+        }
+        if let open = openFence {
+            result.append(open) // close an unclosed fence with ITS OWN delimiter (verify N4)
+        }
+        return result.joined(separator: "\n")
+    }
+
+    /// CommonMark opening fence: ≤3 spaces indent, 3+ of ` or ~; a BACKTICK
+    /// fence's info string may not contain a backtick (verify N1).
+    private static func openingFenceDelimiter(of line: String) -> String? {
+        let indent = line.prefix(while: { $0 == " " })
+        guard indent.count <= 3 else { return nil }
+        let afterIndent = line.dropFirst(indent.count)
+        for fenceChar: Character in ["`", "~"] {
+            let run = afterIndent.prefix(while: { $0 == fenceChar })
+            if run.count >= 3 {
+                let info = afterIndent.dropFirst(run.count)
+                if fenceChar == "`" && info.contains("`") { return nil }
+                return String(run)
+            }
+        }
+        return nil
+    }
+
+    /// CommonMark closing fence: same char, ≥ opening length, nothing but
+    /// spaces/tabs after (verify N3).
+    private static func isClosingFence(_ line: String, for open: String) -> Bool {
+        guard let fenceChar = open.first else { return false }
+        let indent = line.prefix(while: { $0 == " " })
+        guard indent.count <= 3 else { return false }
+        let afterIndent = line.dropFirst(indent.count)
+        let run = afterIndent.prefix(while: { $0 == fenceChar })
+        guard run.count >= open.count else { return false }
+        return afterIndent.dropFirst(run.count).allSatisfy { $0 == " " || $0 == "\t" }
+    }
+
+    /// A line that can host a setext heading: non-blank, not an ATX heading,
+    /// not a fence, not a list item / blockquote / thematic-break-ish line.
+    private static func isParagraphLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+        guard atxHeadingLevel(of: line) == nil, openingFenceDelimiter(of: line) == nil else { return false }
+        if let first = trimmed.first {
+            if first == ">" { return false }
+            if (first == "-" || first == "*" || first == "+"),
+               trimmed.count == 1 || trimmed.dropFirst().first == " " { return false }
+            if first.isASCII && first.isNumber {
+                // CommonMark ordered-list marker: 1–9 ASCII digits + . or )
+                // (an uncapped/non-ASCII run is a paragraph and CAN host a
+                // setext heading — verify N7).
+                let digits = trimmed.prefix(while: { $0.isASCII && $0.isNumber })
+                let rest = trimmed.dropFirst(digits.count)
+                if digits.count <= 9,
+                   let punct = rest.first, punct == "." || punct == ")",
+                   rest.count == 1 || rest.dropFirst().first == " " { return false }
+            }
+        }
+        return true
+    }
+
+    /// CommonMark setext underline: only `=` or only `-` (1+), ≤3 spaces indent.
+    private static func isSetextUnderline(_ line: String) -> Bool {
+        let indent = line.prefix(while: { $0 == " " })
+        guard indent.count <= 3 else { return false }
+        let body = line.dropFirst(indent.count).trimmingCharacters(in: .whitespaces)
+        guard !body.isEmpty else { return false }
+        return body.allSatisfy { $0 == "=" } || body.allSatisfy { $0 == "-" }
+    }
+
+    /// ATX heading level (1–6) of a line, or nil.
+    private static func atxHeadingLevel(of line: String) -> Int? {
+        let indent = line.prefix(while: { $0 == " " })
+        guard indent.count <= 3 else { return nil }
+        let afterIndent = line.dropFirst(indent.count)
+        let hashes = afterIndent.prefix(while: { $0 == "#" })
+        guard (1...6).contains(hashes.count) else { return nil }
+        let rest = afterIndent.dropFirst(hashes.count)
+        guard rest.isEmpty || rest.first == " " || rest.first == "\t" else { return nil }
+        return hashes.count
+    }
+
+    private static func demoteHeadingLine(_ line: String) -> String {
+        let indent = line.prefix(while: { $0 == " " })
+        guard indent.count <= 3 else { return line } // 4+ spaces = code block
+        let afterIndent = line.dropFirst(indent.count)
+        let hashes = afterIndent.prefix(while: { $0 == "#" })
+        guard (1...2).contains(hashes.count) else { return line } // H3+ already fine; 7+ # is not a heading
+        let rest = afterIndent.dropFirst(hashes.count)
+        guard rest.isEmpty || rest.first == " " || rest.first == "\t" else { return line } // "#hashtag" is not a heading
+        return "###" + rest
+    }
+
+    /// List-item strings (decisions, ActionItem owner/text): internal
+    /// newlines collapse to spaces; leading markdown structure tokens
+    /// (heading `#` runs, list markers `-`/`*`/`+`, ordered markers `1.`/`1)`,
+    /// blockquote `>`) are stripped repeatedly.
+    static func normalizeListText(_ raw: String) -> String {
+        let oneLine = raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        var text = Substring(oneLine)
+        while true {
+            let before = text
+            text = text.drop(while: { $0 == " " || $0 == "\t" })
+            if let first = text.first {
+                if first == ">" {
+                    text = text.dropFirst()
+                } else if first == "#" {
+                    let run = text.prefix(while: { $0 == "#" })
+                    if isMarkerBoundary(text.dropFirst(run.count)) { text = text.dropFirst(run.count) }
+                } else if first == "-" || first == "*" || first == "+" {
+                    if isMarkerBoundary(text.dropFirst()) { text = text.dropFirst() }
+                } else if first.isWholeNumber {
+                    let digits = text.prefix(while: { $0.isWholeNumber })
+                    let afterDigits = text.dropFirst(digits.count)
+                    if let punct = afterDigits.first, punct == "." || punct == ")",
+                       isMarkerBoundary(afterDigits.dropFirst()) {
+                        text = afterDigits.dropFirst()
+                    }
+                }
+            }
+            if text == before { break }
+        }
+        return text.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// A structure marker only counts when followed by whitespace or
+    /// end-of-string ("1.5x" and "#hashtag" stay intact).
+    private static func isMarkerBoundary(_ rest: Substring) -> Bool {
+        rest.isEmpty || rest.first == " " || rest.first == "\t"
+    }
+
+    private static func renderActionItem(_ item: ActionItem) -> String {
+        "- **\(normalizeListText(item.owner)):** \(normalizeListText(item.text))"
+    }
+
+    private static func renderList(_ lines: [String], emptyMarker: String) -> String {
+        lines.isEmpty ? emptyMarker : lines.joined(separator: "\n")
+    }
+}

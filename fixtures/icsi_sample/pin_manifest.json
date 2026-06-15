@@ -1,0 +1,24 @@
+{
+  "asr_provenance" : {
+    "engine" : "mlx-whisper-large-v3-turbo",
+    "engine_version" : "0.4.3",
+    "model" : "mlx-community\/whisper-large-v3-turbo",
+    "runtime" : "mlx-whisper\/subprocess",
+    "transcribed_at" : "2026-06-14T22:24:15Z",
+    "vocabulary_hints_applied" : false
+  },
+  "audio" : {
+    "bits_per_sample" : 16,
+    "channels" : 1,
+    "data_byte_count" : 9600000,
+    "sample_rate" : 16000,
+    "sha256" : "bec3e83136f35d838a3db02fe985b30f2516e0ef9b36ad888c44310a88855cb9"
+  },
+  "diarization_speaker_count" : 2,
+  "dominant_language" : "en",
+  "final_segment_count" : 10,
+  "intermediate_segment_count" : 10,
+  "meeting_id" : "Bmr001",
+  "pipeline_version" : "1.0",
+  "schema_version" : 1
+}

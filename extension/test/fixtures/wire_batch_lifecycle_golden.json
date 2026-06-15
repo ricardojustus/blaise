@@ -1,0 +1,18 @@
+{
+  "_comment": "C14 cross-chunk golden (extension -> listener/tracker). deliveries[1] is a byte-identical REPLAY of deliveries[0]: the per-meeting seen-id dedupe ingests its event once, and the tracker's per-code monotonic guard must let the replay re-fire NOTHING. Synthetic names only. Regenerate with scripts/make_lifecycle_golden.mjs only on contract changes.",
+  "contract": "docs/meet_events_contract.md (schema v2)",
+  "testSecret": "5db1ae0d3b1f6c2a9e84d7f0c6b35a18e29f4c7d8a01b3e5f6a7c8d9e0f1a2b3",
+  "endpoint": "POST /v1/meet-events",
+  "aad": "blaise-meet-events-v1",
+  "ackHeader": "X-Blaise-Ack",
+  "deliveries": [
+    {
+      "iv": "+ovVgp1BJZmM/rIv",
+      "ciphertext": "lPpAl5LAS/LWw+1nR/7w2YWrSVge/3hNkRzf7liC7ik5MaKSKuk9s/am+SJWZyL6xAKmom5sHN8Qm64AITrj79ZGAQUpEn0qAHb7mYkssKoqiUhip+4TQkseNNg08Csd07zNSrJcsTZLtPLIiUD1niZz6opFzGHwSnpYyzwnjdgDIHq6R85Wkb+Gg/HN5Emb/2e1hN6CkFSGoK20fyRdpa+Uf1WZQMFaIwnWFNbXvTAXFWJvGUVXqfTI5opotiNbiEsIXMF5ofXMZKXcuDhn0DBuG6XSWx4ubpv3BBq3dtWmlL29PXAr2Zx+vSvwKSJui7qLA1pHoSu05Lrvu+OS0IAKbRd1eoEy0bZEXsDPzGo/akanuDMhFdOjZI29fktEgcQL1OYfoFpO8Atj9WSfqdMsCJTJgrZL6X+9XGV0M/BpMHXfoP2d1f5l7bfCudO3fK0QRON3bPn/xWP2UEm6FVggc3tzgZ7pgLnvc2CuhyBbcjL12DaJ22fQJgTLy5FtaQqtFUWhtqkjE/fQL+tZf7tkwZXVIdMZYjomvuERJr27qrZxVBpPc1hs+JipAH3iMNO2ZwbjYRpVAtxoW9DY6AcEZ8gaCGb9Oz2O9KdsK1Bk4Oit"
+    },
+    {
+      "iv": "+ovVgp1BJZmM/rIv",
+      "ciphertext": "lPpAl5LAS/LWw+1nR/7w2YWrSVge/3hNkRzf7liC7ik5MaKSKuk9s/am+SJWZyL6xAKmom5sHN8Qm64AITrj79ZGAQUpEn0qAHb7mYkssKoqiUhip+4TQkseNNg08Csd07zNSrJcsTZLtPLIiUD1niZz6opFzGHwSnpYyzwnjdgDIHq6R85Wkb+Gg/HN5Emb/2e1hN6CkFSGoK20fyRdpa+Uf1WZQMFaIwnWFNbXvTAXFWJvGUVXqfTI5opotiNbiEsIXMF5ofXMZKXcuDhn0DBuG6XSWx4ubpv3BBq3dtWmlL29PXAr2Zx+vSvwKSJui7qLA1pHoSu05Lrvu+OS0IAKbRd1eoEy0bZEXsDPzGo/akanuDMhFdOjZI29fktEgcQL1OYfoFpO8Atj9WSfqdMsCJTJgrZL6X+9XGV0M/BpMHXfoP2d1f5l7bfCudO3fK0QRON3bPn/xWP2UEm6FVggc3tzgZ7pgLnvc2CuhyBbcjL12DaJ22fQJgTLy5FtaQqtFUWhtqkjE/fQL+tZf7tkwZXVIdMZYjomvuERJr27qrZxVBpPc1hs+JipAH3iMNO2ZwbjYRpVAtxoW9DY6AcEZ8gaCGb9Oz2O9KdsK1Bk4Oit"
+    }
+  ]
+}

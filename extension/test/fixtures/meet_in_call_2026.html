@@ -1,0 +1,69 @@
+<!--
+  RECONSTRUCTED fixture — NOT a full live-DOM dump.
+  Built 2026-06-11 from FIELD EVIDENCE: 99 wire batches captured live from
+  meeting abc-defg-hij (Meet UI of June 2026) plus the garbage strings they
+  carried. What the evidence pins down:
+    - tiles carry BOTH data-participant-id AND data-requested-participant-id,
+      values shaped "spaces/<space>/devices/<n>"
+    - the legacy [data-self-name] name label is GONE (roster names were null)
+    - tile hover controls leak Material icon ligature text glued to localized
+      labels into naive text reads, verbatim from the field:
+        "keep_outlineFixar Adrian Cole na tela principal"
+        "frame_personReenquadrar"
+    - the pin control's label embeds the participant's full display name
+      (pt-BR template "Fixar <name> na tela principal")
+  What is RECONSTRUCTED (plausible, not field-confirmed): the plain name-bar
+  div, exact nesting of hover controls and tooltips, icon class names
+  (google-symbols verified against TranscripTonic, June 2026). All names are
+  SYNTHETIC. Replace with sanitized __blaiseSnapshot() output when a live
+  capture is taken.
+
+  Scenario: in-call (pt-BR UI); self tile shows "Você" in the name bar with
+  participant id; one tile with name bar + pin control; one DEGRADED tile
+  whose only name surface is the pin label (matches the field, where roster
+  names were null); one tile with NO name surface at all (reframe control
+  only) — must yield a null name, never icon/menu text.
+-->
+<div class="ctrl-bar">
+  <button aria-label="Sair da chamada" class="end-call"><i class="google-symbols">call_end</i></button>
+</div>
+<main class="grid">
+  <div data-participant-id="spaces/demo/devices/1"
+       data-requested-participant-id="spaces/demo/devices/1" class="tile">
+    <div class="namebar"><span>Você</span></div>
+    <div class="hover-actions">
+      <!-- icon ligature nested INSIDE the label span: a naive span read
+           yields the verbatim field garbage "frame_personReenquadrar" -->
+      <button aria-label="Reenquadrar"><span class="tip"><i class="google-symbols">frame_person</i>Reenquadrar</span></button>
+    </div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+  <div data-participant-id="spaces/demo/devices/2"
+       data-requested-participant-id="spaces/demo/devices/2" class="tile">
+    <div class="hover-actions">
+      <!-- naive span read here yields the verbatim field garbage
+           "keep_outlineFixar Maria Silva na tela principal" -->
+      <button aria-label="Fixar Maria Silva na tela principal"><span class="tip"><i class="google-symbols">keep_outline</i>Fixar Maria Silva na tela principal</span></button>
+      <button aria-label="Reenquadrar"><span class="tip"><i class="google-symbols">frame_person</i>Reenquadrar</span></button>
+    </div>
+    <div class="namebar"><span>Maria Silva</span></div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+  <div data-participant-id="spaces/demo/devices/3"
+       data-requested-participant-id="spaces/demo/devices/3" class="tile">
+    <!-- degraded: no name bar; pin tooltip text sits OUTSIDE the button -->
+    <div class="hover-actions">
+      <button><i class="google-symbols">keep_outline</i></button>
+      <span class="floating-tip">Fixar João Pereira na tela principal</span>
+    </div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+  <div data-participant-id="spaces/demo/devices/4"
+       data-requested-participant-id="spaces/demo/devices/4" class="tile">
+    <!-- no name surface at all: reframe control only -->
+    <div class="hover-actions">
+      <button aria-label="Reenquadrar"><span class="tip"><i class="google-symbols">frame_person</i>Reenquadrar</span></button>
+    </div>
+    <div class="talk-bars"><div class="bar idle"></div></div>
+  </div>
+</main>

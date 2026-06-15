@@ -1,0 +1,105 @@
+{
+  "asr_provenance" : {
+    "engine" : "mlx-whisper-large-v3-turbo",
+    "engine_version" : "0.4.3",
+    "model" : "mlx-community\/whisper-large-v3-turbo",
+    "runtime" : "mlx-whisper\/subprocess",
+    "transcribed_at" : "2026-06-14T22:24:15Z",
+    "vocabulary_hints_applied" : false
+  },
+  "dominant_language" : "en",
+  "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+  "pipeline_version" : "1.0",
+  "segments" : [
+    {
+      "end_seconds" : 93.2,
+      "id" : 1,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 0,
+      "speaker_label" : "S0",
+      "start_seconds" : 1.9200000000000021,
+      "text" : " Okay, so we're live.  Okay.  Are we live or are we Memorex?  We're somewhere in between.  Okay, so we have some sheets for some...  Right, so...  You're going to sit there?  Is that all right?  Yeah, I can't even put this thing in.  Okay.  Okay, so this is February 2nd, 2000.  This is meeting number one with Adam and Dan and Morgan, about 5 o'clock in the afternoon.  Yeah.  A range of microphones.  What's this one here?  This one has a couple of easy electra.  That's the dummy PDA.  That's connected too?  Yep.  Yeah, it is.  That's connected.  Both channels.  Both channels.  Yeah.  Yeah, it is at the moment.  Yeah.  Okay.  Although the gain is pretty low.  So for the red numbers task,  let's just name the microphones.  Okay.  So I'm speaking on the air-mounted wired headset thing.  Right, and I'm now talking on microphone number two, the wireless microphone number two.  I have no idea which one I'm on.  Oh, one.  Oh, I'm number one.  Absolutely.  Okay, which is a lapel that gets sticking through my lapel.  Okay, so this is the PZM nearest the machine room end of the table.  I know, but yeah, it's number three it says, but we'll be able to figure it out.  This is in the middle of the table.  This is further down the table."
+    },
+    {
+      "end_seconds" : 161.74,
+      "id" : 2,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 1,
+      "speaker_label" : "S0",
+      "start_seconds" : 95.5,
+      "text" : " And this one is right at the end of the table.  And then we've got the, this is the left side of the dummy PDA,  and this will be the right side.  I think we're saying it's going to be like watching some of these home movies.  Yes, it'll be pretty horrible.  Very exciting.  So what I have on these forms here is for the red numbers, red digits test,  and it's extracted directly from Aurora.  So what I was thinking is you could start just by filling it out  and then reading the numbers on the form.  Okay, what do we do with this stuff on top?  Fill it out.  Do we say it afterwards?  No, just write it down.  Why are we writing it down?  So that when we transcribe the data, we can figure out who said it  and their gender and the date and the time  and what mic they were on and all that sort of thing.  Okay, that's good.  So I don't need to fill that out right now.  Maybe you should just say it.  Why don't you want to fill it out right now just so that...  So then we're not spending the time writing it out,  just so that we're spending the time talking.  Well, how about you give me one of those and we can fill it out  and Morgan can read and then we can do it like that.  I'm just concerned about a bunch of dead time  while we're all sitting here and fill out the things."
+    },
+    {
+      "end_seconds" : 186.52,
+      "id" : 3,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 2,
+      "speaker_label" : "S0",
+      "start_seconds" : 163.92000000000002,
+      "text" : " And so you have to be sure to pause between each line  since we're going to be segmenting it.  Right.  Okay, so this is Morgan.  I'm going to read some numbers now.  1, 2, 3082, 52109, 6375, 8601162,"
+    },
+    {
+      "end_seconds" : 194.82,
+      "id" : 4,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 3,
+      "speaker_label" : "S0",
+      "start_seconds" : 189.42000000000002,
+      "text" : " 9, 00206, whoops, that's a mistake.  Just from scratch, start over."
+    },
+    {
+      "end_seconds" : 215.68,
+      "id" : 5,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 4,
+      "speaker_label" : "S0",
+      "start_seconds" : 199.02000000000004,
+      "text" : " 0021641 00704.  That's my group.  Okay, so Adam Jannon next.  Transcript number two on a wireless headset number two.  270-367-457190."
+    },
+    {
+      "end_seconds" : 220.3,
+      "id" : 6,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 5,
+      "speaker_label" : "S0",
+      "start_seconds" : 219.02000000000004,
+      "text" : " 85980-7437."
+    },
+    {
+      "end_seconds" : 255.78,
+      "id" : 7,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 6,
+      "speaker_label" : "S0",
+      "start_seconds" : 223.95999999999998,
+      "text" : " 09951.  Okay, and this is Dan on the wired headset,  transcript number 1.  2148-388-430-6571-5527-678-030-02-1518.  So I definitely wasn't pausing enough between them.  These are the things that we'll find out.  I don't know if I said mine was transcript zero, but it was."
+    },
+    {
+      "end_seconds" : 261.72,
+      "id" : 8,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 7,
+      "speaker_label" : "S0",
+      "start_seconds" : 258.62,
+      "text" : " Oh, good.  Okay.  That's a little bit."
+    },
+    {
+      "end_seconds" : 297.92,
+      "id" : 9,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 8,
+      "speaker_label" : "S0",
+      "start_seconds" : 264.42,
+      "text" : " So where are we in this?  Let's see.  So we now have a few mics that work.  How long did it take you to set this up?  Oh, it doesn't take long.  I mean, as you say, we haven't really set it up that well, but it doesn't take long to set up.  I mean, we just came up here after I called you, so it took like 20 minutes, something like that.  That included a fair amount of fiddling around.  Yeah.  I mean, the equipment...  It's more or less the first time we've tried to do it.  Right.  Me and Adam went through it yesterday, just looked at everything, but it's all kind of here and set up, so it's just a question turning it all on.  And... Yeah, eventually we'll want to, like,"
+    },
+    {
+      "end_seconds" : 299.72,
+      "id" : 10,
+      "meeting_id" : "01KV43R3VG85Q2MTMX9WAZQ1PB",
+      "ord" : 9,
+      "speaker_label" : "S1",
+      "start_seconds" : 298.96,
+      "text" : "tape that over."
+    }
+  ]
+}

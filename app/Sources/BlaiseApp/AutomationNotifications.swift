@@ -1,0 +1,270 @@
+import BlaiseCore
+import Foundation
+import UserNotifications
+import os
+
+// C14: the UNUserNotificationCenter adapter behind BlaiseCore's
+// `AutomationNotifying` seam (the tracker/scheduler never touch UN* —
+// fully mockable in tests). Categories: `meetStart` (Record),
+// `calendarUpcoming` (Launch & Record), `graceResume` (Resume — the
+// watchdog-stop recovery; registered as its own category because action
+// titles are fixed per category). Interruption level `.active` —
+// `.timeSensitive` needs a provisioned entitlement the Apple Development
+// signing flow does not carry (deliberate non-goal). No custom sounds.
+
+enum AutomationNotificationCategory {
+    static let meetStart = "meetStart"
+    static let calendarUpcoming = "calendarUpcoming"
+    static let graceResume = "graceResume"
+    static let handoffWarning = "handoffWarning"
+
+    static let recordAction = "record"
+    static let launchRecordAction = "launchRecord"
+    static let resumeAction = "resume"
+}
+
+/// Routed actions (default body-click and the single button behave the
+/// same — benchmark: one click anywhere).
+enum AutomationNotificationAction: Sendable {
+    case record(code: String)
+    case launchRecord(eventKey: String, code: String, title: String, urlString: String)
+    case resume(meetingID: MeetingID)
+    /// Handoff-warning click (L-3): activate the app and open the main window
+    /// (where the queue banner and the Settings → handoff panel live).
+    case openMainWindow
+}
+
+/// Mirrors every posted/withdrawn notification to the menu-bar surfaces
+/// (the load-bearing equivalents when notifications are denied).
+@MainActor protocol AutomationNotificationMirroring: AnyObject {
+    func calendarReminderPosted(eventKey: String, title: String, code: String, urlString: String)
+    func calendarReminderWithdrawn(eventKey: String)
+}
+
+final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
+    UNUserNotificationCenterDelegate, @unchecked Sendable
+{
+    private let logger = Logger(subsystem: BlaiseBundle.identifier, category: "automation.notify")
+    /// Set by the composition root; actions route here.
+    var onAction: (@Sendable (AutomationNotificationAction) async -> Void)?
+    weak var mirror: (any AutomationNotificationMirroring)?
+    /// Test/headless seam: the real center requires a bundle identity.
+    private var center: UNUserNotificationCenter { UNUserNotificationCenter.current() }
+
+    func activate() {
+        center.delegate = self
+        let record = UNNotificationAction(
+            identifier: AutomationNotificationCategory.recordAction, title: "Record",
+            options: [.foreground])
+        let launch = UNNotificationAction(
+            identifier: AutomationNotificationCategory.launchRecordAction, title: "Launch & Record",
+            options: [.foreground])
+        let resume = UNNotificationAction(
+            identifier: AutomationNotificationCategory.resumeAction, title: "Resume",
+            options: [])
+        center.setNotificationCategories([
+            UNNotificationCategory(
+                identifier: AutomationNotificationCategory.meetStart, actions: [record],
+                intentIdentifiers: []),
+            UNNotificationCategory(
+                identifier: AutomationNotificationCategory.calendarUpcoming, actions: [launch],
+                intentIdentifiers: []),
+            UNNotificationCategory(
+                identifier: AutomationNotificationCategory.graceResume, actions: [resume],
+                intentIdentifiers: []),
+            // No button — a body click activates Blaise and opens the queue.
+            UNNotificationCategory(
+                identifier: AutomationNotificationCategory.handoffWarning, actions: [],
+                intentIdentifiers: []),
+        ])
+    }
+
+    /// Human Touchpoint: fired at the first launch with automation enabled
+    /// (docs/touchpoint_capture.md, Notifications section).
+    func requestAuthorization() async {
+        do {
+            let granted = try await center.requestAuthorization(options: [.alert, .sound])
+            logger.notice("notification authorization: \(granted ? "granted" : "denied")")
+        } catch {
+            logger.error("notification authorization request failed: \(error)")
+        }
+    }
+
+    func authorizationDenied() async -> Bool {
+        let settings = await center.notificationSettings()
+        return settings.authorizationStatus == .denied
+    }
+
+    // MARK: - AutomationNotifying
+
+    func postMeetStart(code: String, title: String?) async {
+        let content = UNMutableNotificationContent()
+        content.title = "Meeting in progress"
+        content.body = title.map { "\(code) — \($0)" } ?? code
+        content.categoryIdentifier = AutomationNotificationCategory.meetStart
+        content.interruptionLevel = .active
+        content.userInfo = ["meetingCode": code]
+        await post(id: meetStartID(code), content: content)
+    }
+
+    func withdrawMeetStart(code: String) async {
+        withdraw(ids: [meetStartID(code)])
+    }
+
+    func postWatchdogStop(meetingID: MeetingID, title: String, canResume: Bool) async {
+        let content = UNMutableNotificationContent()
+        if canResume {
+            content.title = "Recording stopped — meeting appears to have ended"
+            content.body = "\(title) — click to resume if the meeting is still going."
+            content.categoryIdentifier = AutomationNotificationCategory.graceResume
+        } else {
+            // Off means Off: no grace exists, a dead Resume button would be
+            // worse than honesty.
+            content.title = "Recording ended — uncertain signal"
+            content.body = title
+        }
+        content.interruptionLevel = .active
+        content.userInfo = ["meetingID": meetingID]
+        await post(id: "blaise.watchdog.\(meetingID)", content: content)
+    }
+
+    func withdrawWatchdogStop(meetingID: MeetingID) async {
+        // Grace ended (resume / expiry / Finalize now / manual stop): a
+        // stale "click to resume" hours later would be a dead surface.
+        withdraw(ids: ["blaise.watchdog.\(meetingID)"])
+    }
+
+    func postNudge(meetingID: MeetingID, title: String) async {
+        let content = UNMutableNotificationContent()
+        content.title = "Recording running — no Meet signals yet"
+        content.body = "\(title) — check that the meeting was joined in Chrome with the extension."
+        content.interruptionLevel = .active
+        content.userInfo = ["meetingID": meetingID]
+        await post(id: "blaise.nudge.\(meetingID)", content: content)
+    }
+
+    func postCalendarUpcoming(
+        eventKey: String, title: String, start: Date, code: String, urlString: String?
+    ) async {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm"
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = "Starts at \(formatter.string(from: start)) — opens in Google Chrome"
+        content.categoryIdentifier = AutomationNotificationCategory.calendarUpcoming
+        content.interruptionLevel = .active
+        let url = urlString ?? "https://meet.google.com/\(code)"
+        content.userInfo = [
+            "eventKey": eventKey, "meetingCode": code, "title": title, "url": url,
+        ]
+        await post(id: calendarID(eventKey), content: content)
+        let mirror = self.mirror
+        await MainActor.run {
+            mirror?.calendarReminderPosted(eventKey: eventKey, title: title, code: code, urlString: url)
+        }
+    }
+
+    func withdrawCalendarUpcoming(eventKey: String) async {
+        withdraw(ids: [calendarID(eventKey)])
+        let mirror = self.mirror
+        await MainActor.run { mirror?.calendarReminderWithdrawn(eventKey: eventKey) }
+    }
+
+    /// Handoff persistent-failure warning: ONE notification per failure
+    /// episode (the HandoffStatusHolder dedupes on episode key — never one
+    /// per attempt). A fixed identifier keeps at most one in Notification
+    /// Center (a newer episode replaces the older). Denied permission falls
+    /// through `post`'s quiet failure — the banner and menu badge carry the
+    /// load, same as every C14 surface.
+    func postHandoffWarning(_ warning: HandoffWarning) async {
+        let content = UNMutableNotificationContent()
+        content.title = "Evidence Store unreachable"
+        let plural = warning.meetingsWaiting == 1 ? "meeting" : "meetings"
+        content.body = "\(warning.meetingsWaiting) \(plural) waiting since "
+            + "\(warning.sinceLabel()). Last error: \(warning.shortReason)"
+        content.categoryIdentifier = AutomationNotificationCategory.handoffWarning
+        content.interruptionLevel = .active
+        await post(id: Self.handoffWarningID, content: content)
+    }
+
+    /// Delivery succeeded: the standing warning would be a stale dead
+    /// surface — withdraw it silently (no success notification).
+    func withdrawHandoffWarning() {
+        withdraw(ids: [Self.handoffWarningID])
+    }
+
+    private static let handoffWarningID = "blaise.handoffwarning"
+
+    /// Chrome missing / launch failure: no recording start (recording an
+    /// unjoined meeting is empty audio, worse than nothing).
+    func postChromeLaunchFailure(title: String) async {
+        let content = UNMutableNotificationContent()
+        content.title = "Couldn't open Google Chrome"
+        content.body = "\(title) — open the Meet link in Chrome manually, then click Record."
+        content.interruptionLevel = .active
+        await post(id: "blaise.chromefail.\(UUID().uuidString)", content: content)
+    }
+
+    private func meetStartID(_ code: String) -> String { "blaise.meetstart.\(code)" }
+    private func calendarID(_ key: String) -> String { "blaise.calendar.\(key)" }
+
+    private func post(id: String, content: UNNotificationContent) async {
+        do {
+            try await center.add(
+                UNNotificationRequest(identifier: id, content: content, trigger: nil))
+        } catch {
+            // Denied / restricted: the menu-bar surfaces carry the load.
+            logger.notice("notification post failed (\(id, privacy: .public)): \(error)")
+        }
+    }
+
+    private func withdraw(ids: [String]) {
+        center.removeDeliveredNotifications(withIdentifiers: ids)
+        center.removePendingNotificationRequests(withIdentifiers: ids)
+    }
+
+    // MARK: - UNUserNotificationCenterDelegate
+
+    /// Banners show while the menu-bar agent is frontmost too.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .list]
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let content = response.notification.request.content
+        let info = content.userInfo
+        let actionID = response.actionIdentifier
+        // Default (body click) and the single button behave the same;
+        // dismiss = decline (the suppression record stands).
+        guard actionID != UNNotificationDismissActionIdentifier else { return }
+        let action: AutomationNotificationAction?
+        switch content.categoryIdentifier {
+        case AutomationNotificationCategory.meetStart:
+            action = (info["meetingCode"] as? String).map { .record(code: $0) }
+        case AutomationNotificationCategory.calendarUpcoming:
+            if let key = info["eventKey"] as? String, let code = info["meetingCode"] as? String,
+                let title = info["title"] as? String, let url = info["url"] as? String
+            {
+                action = .launchRecord(eventKey: key, code: code, title: title, urlString: url)
+            } else {
+                action = nil
+            }
+        case AutomationNotificationCategory.graceResume:
+            action = (info["meetingID"] as? String).map { .resume(meetingID: $0) }
+        case AutomationNotificationCategory.handoffWarning:
+            action = .openMainWindow
+        default:
+            action = nil
+        }
+        if let action, let onAction {
+            await onAction(action)
+        }
+    }
+}

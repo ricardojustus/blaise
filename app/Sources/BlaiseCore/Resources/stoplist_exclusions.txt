@@ -1,0 +1,15 @@
+# stoplist_exclusions.txt — words that must NOT act as suppression stop-words,
+# regardless of vendored frequency-list membership (C5 spec input 4, defensive
+# override). Effective suppression set = top-3000(pt) ∪ top-3000(en) ∪ project − exclusions.
+# Each exclusion carries a justification; lookups are diacritic-folded + lowercased.
+#
+# quest — behaviorally asserted by AC1: the mixed window "nexus quest" must fire to
+#   "Nexus Quest" whatever rank "quest" holds in the vendored lists (en_50k rank 5850,
+#   outside top-3000 today; the exclusion pins the behavior against list re-vendoring).
+quest
+# renato — a name-shaped subtitle-corpus token that lands inside both top-3000 cuts
+#   purely as a PROPER NAME (subtitle corpora are full of names), not as a word.
+#   Suppressing it would neuter a standalone name entry, so it is excluded. The
+#   spelling is name-shaped and case-restoring it corrupts no PT/EN word in either
+#   language.
+renato

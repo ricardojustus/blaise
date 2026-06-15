@@ -1,0 +1,52 @@
+# c5_golden_clauses.tsv — AC2 golden fixture for the C5 vocabulary corrector.
+# Format: source<TAB>input<TAB>expected (one clause per line; no tabs inside clauses).
+# Provenance: fully SYNTHETIC. Every clause is hand-authored in the fictional
+# Vexatron Labs / Quoll Harbour universe
+# and carries NO content from any real meeting. Each `input` is a plausible PT/EN
+# meeting clause; each `expected` is exactly what the corrector produces, verified
+# by the goldenClauses() test.
+# Three shapes are covered:
+#   (a) alias mishearings the corrector rewrites to the curated canonical
+#       (Tobes→Toban Vane, Quol Harbour→Quoll Harbour, Nira→Elena Marquez, ...);
+#   (b) exact-stage case/diacritic restores of distinctive canonicals
+#       (blaise→Blaise, petball→Petball, koru→KORU, ...);
+#   (c) collision/no-op rows where a project codename equals an everyday PT
+#       (nautical) word — vela, barco, maré, ponte, leme, proa, pedra, cais — and
+#       must be left UNCHANGED (expected == input, corrections empty), per
+#       stoplist_project.txt. Casing of the real codename is delegated to C6.
+# Rows where input == expected assert a byte-identical pass-through (no
+# corrections); all other rows assert a non-empty correction set.
+script	Eu acho que os recados estão dados. Eu concordo com o Tobes	Eu acho que os recados estão dados. Eu concordo com o Toban Vane
+script	a equipe foi pra Quol Harbour antes do offsite	a equipe foi pra Quoll Harbour antes do offsite
+script	o time de quol harbour pediu mais dois dias pro polish	o time de Quoll Harbour pediu mais dois dias pro polish
+script	Fala com a Nira sobre o cronograma	Fala com a Elena Marquez sobre o cronograma
+script	Fala, Larso.	Fala, Leo Marston.
+script	a hora que o Saltmarsh começar daqui a três meses	a hora que o Project Saltmarsh começar daqui a três meses
+script	Vou alinhar esse ponto com o Marsa amanhã	Vou alinhar esse ponto com o Fernando Marsh amanhã
+script	o Vido confirmou o número do orçamento	o Marco Vidal confirmou o número do orçamento
+script	o Vidau ficou de mandar o status pro board	o Marco Vidal ficou de mandar o status pro board
+script	o Zandi entrou no time de engine essa semana	o Luca Zander entrou no time de engine essa semana
+script	o Ed mandou o breakdown por evento	o Eduardo Nolan mandou o breakdown por evento
+script	a versão de Nexus Quest vem depois do anúncio	a versão de Nexus vem depois do anúncio
+script	a gente jogou aurora tales the last confession ontem	a gente jogou Aurora Tales ontem
+script	o blaise transcreveu errado de novo	o Blaise transcreveu errado de novo
+script	vou aprovar o orçamento de petball hoje	vou aprovar o orçamento de Petball hoje
+script	a cerebros assume o contrato de suporte	a Cerebros assume o contrato de suporte
+script	o astrari fica com o suporte de servidores	o Astrari fica com o suporte de servidores
+script	trouxe o lance quoll para testar a cert	trouxe o Lance Quoll para testar a cert
+script	o a.j. stone confirmou a fala da abertura	o A.J. Stone confirmou a fala da abertura
+script	o frank d’avlin aprovou a arte final	o Frank D'avlin aprovou a arte final
+script	a vexatron labs fechou o trimestre adiantada	a Vexatron Labs fechou o trimestre adiantada
+script	a anna reyes revisou o review build	a Anna Reyes revisou o review build
+script	falei com o silas yarrow na sexta passada	falei com o Silas Yarrow na sexta passada
+script	a tidewell review build precisa sair esse mês	a Tidewell review build precisa sair esse mês
+script	a solitaire pictures confirma se o trailer entra junto	a Solitaire Pictures confirma se o trailer entra junto
+script	o koru entra no roadmap do próximo trimestre	o KORU entra no roadmap do próximo trimestre
+script	acendemos uma vela no jantar de encerramento	acendemos uma vela no jantar de encerramento
+script	o barco saiu do porto antes da maré virar	o barco saiu do porto antes da maré virar
+script	a maré subiu mais que o previsto na sexta	a maré subiu mais que o previsto na sexta
+script	atravessamos a ponte velha pra chegar no cais	atravessamos a ponte velha pra chegar no cais
+script	ele assumiu o leme do projeto sem combinar	ele assumiu o leme do projeto sem combinar
+script	a proa do barco quebrou na tempestade	a proa do barco quebrou na tempestade
+script	a pedra rolou morro abaixo durante a chuva	a pedra rolou morro abaixo durante a chuva
+script	o cais estava cheio de gente no fim de semana	o cais estava cheio de gente no fim de semana

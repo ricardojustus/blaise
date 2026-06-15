@@ -1,0 +1,94 @@
+{
+  "provenance": {
+    "engine": "synthetic-codeswitch-fixture",
+    "model": "hand-authored",
+    "runtime": "none",
+    "engine_version": "1",
+    "transcribed_at": "2026-01-01T00:00:00Z",
+    "vocabulary_hints_applied": false,
+    "language_hint": "pt"
+  },
+  "payload": {
+    "text": " Bom dia a todos, vamos começar a reunião do Project Saltmarsh.",
+    "language": "pt",
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 4.2,
+        "text": " Bom dia a todos, então vamos começar a reunião do Project Saltmarsh aqui na Quoll Harbour.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.20
+      },
+      {
+        "start": 4.5,
+        "end": 9.0,
+        "text": " Okay, so the build is green and we are ready to ship, but I want to confirm the timeline first.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.18
+      },
+      {
+        "start": 9.3,
+        "end": 13.6,
+        "text": " Então eu acho que a gente precisa muito alinhar isso com a Nira antes de fechar o cronograma.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.22
+      },
+      {
+        "start": 13.9,
+        "end": 18.4,
+        "text": " Right, e o Zandi entrou no time de engine essa semana, então ele também vai dar suporte pra gente.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.19
+      },
+      {
+        "start": 18.7,
+        "end": 23.1,
+        "text": " Perfeito, mas não esquece que o Tobes ainda precisa revisar a parte de áudio do Petball.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.21
+      },
+      {
+        "start": 23.4,
+        "end": 27.5,
+        "text": " I think we can do that tomorrow, the audio review is not blocking the release for now.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.17
+      },
+      {
+        "start": 27.8,
+        "end": 32.3,
+        "text": " Tá bom, mas vamos marcar uma call com a Nira ainda hoje pra ela aprovar o escopo, é importante.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.20
+      },
+      {
+        "start": 32.6,
+        "end": 37.0,
+        "text": " Sure, and after that I will sync with the Nexus team about the engine integration.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.18
+      },
+      {
+        "start": 37.3,
+        "end": 41.8,
+        "text": " Então combinado, eu falo com o Zandi e com o Tobes pra eles começarem a tarefa amanhã de manhã.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.22
+      },
+      {
+        "start": 42.1,
+        "end": 46.4,
+        "text": " Great, let us wrap up here, mas por favor não esquece de mandar o resumo pra todo mundo.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.19
+      },
+      {
+        "start": 46.7,
+        "end": 50.9,
+        "text": " Pode deixar, eu mando o resumo da reunião agora e a gente se fala depois, valeu pessoal.",
+        "no_speech_prob": 0.01,
+        "avg_logprob": -0.21
+      }
+    ]
+  }
+}

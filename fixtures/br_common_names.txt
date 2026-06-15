@@ -1,0 +1,134 @@
+# br_common_names.txt — common Brazilian given names (C5 spec input, authored FIRST
+# in the derivation order). Membership rule: "would this name plausibly refer to a
+# non-glossary person in a meeting?" A name listed here blocks (a) standalone
+# first-name vocabulary additions and (b) mishearing-alias admission, because a bare
+# occurrence cannot be assumed to mean the glossary person (and the diacritic-restore
+# direction would rewrite real people, e.g. Tomas -> Tomás).
+# Lookups are diacritic-folded and lowercased on both sides; accented spellings are
+# kept for the reviewer, folded duplicates are deduplicated by the loader.
+# Spec seed (C5 v5.1 §Inputs 5) first, then reviewed extensions.
+Fábio
+Fabiana
+Fabiano
+Roberto
+Roberta
+Bruno
+Bruna
+Gabriel
+Gabriela
+Eduardo
+Eduarda
+Rafael
+Rafaela
+Marcelo
+Marcela
+Carlos
+Paulo
+Paula
+Pedro
+João
+Maria
+Ana
+Lucas
+Mateus
+Matheus
+Tomás
+Tomas
+Kiko
+Caco
+Léo
+Leo
+Marcos
+Felipe
+Fernanda
+Fernando
+Juliana
+Camila
+Renato
+Renata
+Rodrigo
+Thiago
+Tiago
+Vinícius
+Gustavo
+Daniel
+Daniela
+André
+Adriana
+Patrícia
+Sandra
+Sérgio
+# Extensions (reviewed at C5 implementation; same membership rule).
+# Glossary staff first names that are common BR names (full-name entries stay in the
+# vocabulary; the bare first name is too ambiguous to claim):
+Ricardo
+Guilherme
+Luiz
+Luiza
+Barbara
+Bárbara
+Adriano
+Silvio
+Sílvio
+Orlando
+Lia
+Erika
+Erica
+Érica
+Danilo
+Caio
+Jairo
+Elias
+Alessandra
+Matias
+Stella
+Arthur
+Magali
+Rafaella
+# Other very common BR given names a meeting could plausibly reference:
+Aline
+Amanda
+Beatriz
+Bianca
+Carla
+Carolina
+Cláudia
+Claudia
+Cristina
+Diego
+Diogo
+Gabrielly
+Giovanna
+Henrique
+Igor
+Isabela
+Isabella
+Larissa
+Leandro
+Leonardo
+Letícia
+Leticia
+Luana
+Luciana
+Luciano
+Marcio
+Márcio
+Mariana
+Mônica
+Monica
+Natália
+Natalia
+Otávio
+Patricia
+Priscila
+Rogério
+Rogerio
+Ronaldo
+Sabrina
+Simone
+Tatiana
+Vanessa
+Vitor
+Victor
+Wagner
+William

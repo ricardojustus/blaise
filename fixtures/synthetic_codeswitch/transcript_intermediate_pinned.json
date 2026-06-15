@@ -1,0 +1,79 @@
+[
+  {
+    "end_seconds" : 4.2,
+    "ord" : 0,
+    "speaker_label" : "S0",
+    "start_seconds" : 0,
+    "text" : " Bom dia a todos, então vamos começar a reunião do Project Saltmarsh aqui na Quoll Harbour."
+  },
+  {
+    "end_seconds" : 9,
+    "ord" : 1,
+    "speaker_label" : "S1",
+    "start_seconds" : 4.5,
+    "text" : " Okay, so the build is green and we are ready to ship, but I want to confirm the timeline first."
+  },
+  {
+    "end_seconds" : 13.6,
+    "ord" : 2,
+    "speaker_label" : "S0",
+    "start_seconds" : 9.3,
+    "text" : " Então eu acho que a gente precisa muito alinhar isso com a Elena Marquez antes de fechar o cronograma."
+  },
+  {
+    "end_seconds" : 18.4,
+    "ord" : 3,
+    "speaker_label" : "S1",
+    "start_seconds" : 13.9,
+    "text" : " Right, e o Luca Zander entrou no time de engine essa semana, então ele também vai dar suporte pra gente."
+  },
+  {
+    "end_seconds" : 23.1,
+    "ord" : 4,
+    "speaker_label" : "S0",
+    "start_seconds" : 18.7,
+    "text" : " Perfeito, mas não esquece que o Toban Vane ainda precisa revisar a parte de áudio do Petball."
+  },
+  {
+    "end_seconds" : 27.5,
+    "ord" : 5,
+    "speaker_label" : "S1",
+    "start_seconds" : 23.4,
+    "text" : " I think we can do that tomorrow, the audio review is not blocking the release for now."
+  },
+  {
+    "end_seconds" : 32.3,
+    "ord" : 6,
+    "speaker_label" : "S0",
+    "start_seconds" : 27.8,
+    "text" : " Tá bom, mas vamos marcar uma call com a Elena Marquez ainda hoje pra ela aprovar o escopo, é importante."
+  },
+  {
+    "end_seconds" : 37,
+    "ord" : 7,
+    "speaker_label" : "S1",
+    "start_seconds" : 32.6,
+    "text" : " Sure, and after that I will sync with the Nexus team about the engine integration."
+  },
+  {
+    "end_seconds" : 41.8,
+    "ord" : 8,
+    "speaker_label" : "S0",
+    "start_seconds" : 37.3,
+    "text" : " Então combinado, eu falo com o Luca Zander e com o Toban Vane pra eles começarem a tarefa amanhã de manhã."
+  },
+  {
+    "end_seconds" : 46.4,
+    "ord" : 9,
+    "speaker_label" : "S1",
+    "start_seconds" : 42.1,
+    "text" : " Great, let us wrap up here, mas por favor não esquece de mandar o resumo pra todo mundo."
+  },
+  {
+    "end_seconds" : 50.9,
+    "ord" : 10,
+    "speaker_label" : "S0",
+    "start_seconds" : 46.7,
+    "text" : " Pode deixar, eu mando o resumo da reunião agora e a gente se fala depois, valeu pessoal."
+  }
+]
