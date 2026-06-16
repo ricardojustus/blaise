@@ -502,3 +502,53 @@ struct UpcomingMeetingsTests {
         #expect(UpcomingMeetings.rows(from: [], now: noonSP, userEmail: "me@example.test").isEmpty)
     }
 }
+
+@Suite("Calendar provider merge")
+struct CalendarEventMergerTests {
+    @Test("EventKit and Google copies of the same Meet event collapse and keep richer fields")
+    func meetCopiesCollapse() {
+        let eventKit = CalendarEventSnapshot(
+            eventIdentifier: "eventkit:1",
+            title: "Roadmap Review",
+            start: at(3600),
+            end: at(5400),
+            location: "Conference Room",
+            attendees: [.init(name: "Ana Lima", email: "ana@example.test")])
+        let google = CalendarEventSnapshot(
+            eventIdentifier: "google:primary:abc",
+            title: "Roadmap Review",
+            start: at(3600),
+            end: at(5400),
+            notes: "https://meet.google.com/abc-defg-hij",
+            attendees: [
+                .init(name: "Ana Lima", email: "ana@example.test"),
+                .init(name: "Robin Cole", email: "robin@example.test"),
+            ])
+
+        let merged = CalendarEventMerger.merged([eventKit, google])
+
+        let row = try! #require(merged.first)
+        #expect(merged.count == 1)
+        #expect(row.eventIdentifier == "eventkit:1")
+        #expect(row.location == "Conference Room")
+        #expect(row.notes == "https://meet.google.com/abc-defg-hij")
+        #expect(row.attendees.map(\.email) == ["ana@example.test", "robin@example.test"])
+    }
+
+    @Test("non-Meet events dedupe by title and scheduled span")
+    func nonMeetCopiesCollapse() {
+        let first = CalendarEventSnapshot(
+            eventIdentifier: "eventkit:2", title: "Design Crit",
+            start: at(600), end: at(1800),
+            attendees: [.init(name: "Morgan")])
+        let second = CalendarEventSnapshot(
+            eventIdentifier: "google:primary:2", title: "Design Crit",
+            start: at(600), end: at(1800),
+            attendees: [.init(name: "Jordan")])
+
+        let merged = CalendarEventMerger.merged([first, second])
+
+        #expect(merged.count == 1)
+        #expect(merged.first?.attendees.map(\.name) == ["Morgan", "Jordan"])
+    }
+}

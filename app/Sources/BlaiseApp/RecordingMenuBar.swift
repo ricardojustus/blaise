@@ -96,8 +96,14 @@ final class CalendarSuggestionProvider {
         case notDetermined, granted, denied
     }
 
+    private let google: GoogleCalendarModel
     private var store: EKEventStore?
     private(set) var suggestions: [MeetingSuggestion] = []
+    private(set) var upcomingRows: [UpcomingMeetingRow] = []
+
+    init(google: GoogleCalendarModel) {
+        self.google = google
+    }
 
     var access: Access {
         switch EKEventStore.authorizationStatus(for: .event) {
@@ -113,32 +119,50 @@ final class CalendarSuggestionProvider {
         let store = store ?? EKEventStore()
         self.store = store
         let granted = (try? await store.requestFullAccessToEvents()) ?? false
-        if granted { load(userEmail: userEmail) }
+        if granted {
+            await refresh(userEmail: userEmail)
+        }
     }
 
-    /// Loads events ±15 min from now (no prompt; call only when granted).
-    func load(userEmail: String, now: Date = Date()) {
-        guard access == .granted else {
-            suggestions = []
-            return
-        }
+    /// Refreshes the menu suggestions plus the main-window/menu upcoming rows.
+    /// EventKit is read only when already granted; Google Calendar is read only
+    /// when the user has connected and enabled it in Settings.
+    func refresh(
+        userEmail: String, recordedCodes: Set<String> = [], now: Date = Date()
+    ) async {
         let window = CalendarSuggestionBuilder.windowSeconds
-        let snapshots = eventSnapshots(
+        let suggestionSnapshots = await eventSnapshots(
             from: now.addingTimeInterval(-window), to: now.addingTimeInterval(window))
         suggestions = CalendarSuggestionBuilder.suggestions(
-            from: snapshots, now: now, userEmail: userEmail)
+            from: suggestionSnapshots, now: now, userEmail: userEmail)
+
+        let calendar = UpcomingMeetings.saoPauloCalendar
+        let startOfDay = calendar.startOfDay(for: now)
+        let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)
+            ?? now.addingTimeInterval(24 * 3600)
+        let upcomingSnapshots = await eventSnapshots(from: startOfDay, to: endOfDay)
+        upcomingRows = UpcomingMeetings.rows(
+            from: upcomingSnapshots, now: now, recordedCodes: recordedCodes,
+            userEmail: userEmail, calendar: calendar)
     }
 
     /// Raw snapshots over an arbitrary window (C14 `PreMeetingScheduler`
-    /// input: a rolling 24 h fetch). No prompt; empty when not granted.
-    func eventSnapshots(from start: Date, to end: Date) -> [CalendarEventSnapshot] {
+    /// input: a rolling 24 h fetch). No prompt; empty when no source is enabled.
+    func eventSnapshots(from start: Date, to end: Date) async -> [CalendarEventSnapshot] {
+        var snapshots: [CalendarEventSnapshot] = []
+        snapshots.append(contentsOf: eventKitSnapshots(from: start, to: end))
+        snapshots.append(contentsOf: await google.snapshots(from: start, to: end))
+        return CalendarEventMerger.merged(snapshots)
+    }
+
+    private func eventKitSnapshots(from start: Date, to end: Date) -> [CalendarEventSnapshot] {
         guard access == .granted else { return [] }
         let store = store ?? EKEventStore()
         self.store = store
         let predicate = store.predicateForEvents(withStart: start, end: end, calendars: nil)
         return store.events(matching: predicate).map { event in
             CalendarEventSnapshot(
-                eventIdentifier: event.eventIdentifier ?? "",
+                eventIdentifier: "eventkit:\(event.eventIdentifier ?? "")",
                 title: event.title ?? "Meeting",
                 start: event.startDate,
                 end: event.endDate,
@@ -374,9 +398,9 @@ struct RecordingMenuView: View {
             }
         }
         .onAppear {
-            // Refresh suggestions when the menu opens (granted = no prompt).
-            if calendar.access == .granted {
-                calendar.load(userEmail: appEnv.userEmail)
+            // Refresh suggestions/upcoming rows when the menu opens (no prompt).
+            Task {
+                await appEnv.refreshCalendarSurfaces()
             }
         }
     }
@@ -469,6 +493,21 @@ struct RecordingMenuView: View {
             Button("In Person") { Task { await appEnv.startRecording(source: .inPerson) } }
         }
 
+        if !calendar.upcomingRows.isEmpty {
+            Divider()
+            Text("Upcoming")
+            ForEach(calendar.upcomingRows.prefix(4)) { row in
+                Button("\(Self.time(row.start)) Record: \(Self.menuTitle(row.title))") {
+                    Task { await appEnv.startRecording(upcoming: row) }
+                }
+                if row.offersLaunchAndRecord {
+                    Button("\(Self.time(row.start)) Launch: \(Self.menuTitle(row.title))") {
+                        Task { await appEnv.launchAndRecord(upcoming: row) }
+                    }
+                }
+            }
+        }
+
         switch calendar.access {
         case .granted:
             if calendar.suggestions.isEmpty {
@@ -481,11 +520,11 @@ struct RecordingMenuView: View {
                 }
             }
         case .notDetermined:
-            Button("Show Calendar Suggestions…") {
+            Button("Enable Apple Calendar…") {
                 Task { await calendar.requestAccessAndLoad(userEmail: appEnv.userEmail) }
             }
         case .denied:
-            Text("Calendar access off (System Settings → Privacy)")
+            Text("Apple Calendar off (System Settings → Privacy)")
         }
     }
 
@@ -503,6 +542,12 @@ struct RecordingMenuView: View {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm"
         return formatter.string(from: date)
+    }
+
+    private static func menuTitle(_ title: String) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 16 else { return trimmed.isEmpty ? "Meeting" : trimmed }
+        return String(trimmed.prefix(15)) + "…"
     }
 
     /// G9 accumulated recorded time (sum of part durations) for the paused

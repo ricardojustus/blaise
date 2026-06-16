@@ -44,6 +44,10 @@ never leaves the machine.
   Blaise for speaker naming. It captures display names and speaking times only — no
   audio, no captions, no chat — and delivers them encrypted to the app on
   localhost. It is entirely optional; Blaise works without it.
+- **Optional direct Google Calendar.** If macOS Calendar is not a reliable view of
+  your Google calendars, Blaise can connect to Google Calendar directly using a
+  read-only OAuth grant. Upcoming meetings feed the menu bar, the top of the
+  meeting list, one-click recording, and calendar-aware end detection.
 - **Search and library.** Full-text search across every transcript and note, with
   accent-insensitive matching.
 
@@ -109,13 +113,22 @@ It reads only participant display names and speaking times from the Meet page an
 delivers them encrypted to Blaise on `127.0.0.1` — no audio, captions, or chat,
 and nothing leaves your machine. Entirely optional.
 
+### Optional Google Calendar
+
+Apple Calendar access remains the zero-network path. For a direct Google Calendar
+connection, create a Google OAuth **Desktop app** client ID, paste it in Settings
+→ Automation → Calendars, and press Connect. Blaise requests
+`https://www.googleapis.com/auth/calendar.readonly`, stores the refresh token in
+the macOS Keychain, and reads calendar events only.
+
 ## First-run setup
 
 On first launch Blaise walks you through:
 
 1. **Permissions.** macOS prompts for Microphone, System Audio Recording,
    Calendar (for one-click recording suggestions from upcoming events), and
-   Notifications. Grant them once.
+   Notifications. Grant them once. Direct Google Calendar can be connected later
+   from Settings and does not replace the local Calendar permission.
 2. **Identity.** Your name, the nicknames people call you in meetings, and your
    email (used to match you against calendar attendees). Your name is what the
    action-items section is rendered with.

@@ -69,10 +69,17 @@ final class StatusBarController: NSObject {
 
         switch RecordingTimerModel.display(for: state, now: Date()) {
         case .glyph:
-            button.title = ""
+            if case .idle = state, !warning,
+                let upcoming = Self.upcomingTitle(environment.calendarSuggestions.upcomingRows)
+            {
+                button.title = " \(upcoming)"
+            } else {
+                button.title = ""
+            }
         case .recording(let formatted), .paused(let formatted):
             button.title = " \(formatted)"
         }
+        button.toolTip = Self.upcomingTooltip(environment.calendarSuggestions.upcomingRows)
 
         // Tick only while the elapsed readout actually advances.
         switch state {
@@ -108,6 +115,7 @@ final class StatusBarController: NSObject {
         withObservationTracking {
             _ = environment.captureStatus.state
             _ = environment.handoffStatus.snapshot.warning
+            _ = environment.calendarSuggestions.upcomingRows
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -208,6 +216,27 @@ final class StatusBarController: NSObject {
         }
         image?.isTemplate = true
         return image
+    }
+
+    static func upcomingTitle(_ rows: [UpcomingMeetingRow], now: Date = Date()) -> String? {
+        guard let row = rows.first(where: { $0.end > now }) else { return nil }
+        let title = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayTitle = title.isEmpty ? "Meeting" : title
+        let compactTitle = displayTitle.count > 18 ? String(displayTitle.prefix(17)) + "…" : displayTitle
+        return "\(time(row.start)) \(compactTitle)"
+    }
+
+    static func upcomingTooltip(_ rows: [UpcomingMeetingRow], now: Date = Date()) -> String? {
+        guard let row = rows.first(where: { $0.end > now }) else { return "Blaise" }
+        let title = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "Next meeting: \(title.isEmpty ? "Meeting" : title) at \(time(row.start))"
+    }
+
+    private static func time(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: date)
     }
 }
 

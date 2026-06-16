@@ -90,6 +90,7 @@ final class AppEnvironment {
     // by the meter view (leaf observation) so a ≤ 10 Hz level publish never
     // invalidates the scene root.
     let levelMeter = LevelMeterHolder()
+    let googleCalendar: GoogleCalendarModel
     let calendarSuggestions: CalendarSuggestionProvider
     // C14: recording automation.
     let tracker: MeetCallTracker
@@ -199,7 +200,9 @@ final class AppEnvironment {
 
         // C14: the automation tracker + calendar pre-meeting scheduler.
         // Closures capture locals (not self — the boxes close the cycles).
-        let calendar = CalendarSuggestionProvider()
+        let googleCalendar = GoogleCalendarModel(settings: settings, secrets: secrets)
+        self.googleCalendar = googleCalendar
+        let calendar = CalendarSuggestionProvider(google: googleCalendar)
         self.calendarSuggestions = calendar
         let notifier = self.notificationAdapter
         let schedulerRef = Mutex<PreMeetingScheduler?>(nil)
@@ -212,12 +215,8 @@ final class AppEnvironment {
                 let identity =
                     (try? await settings.get(UserIdentity.settingsKey, as: UserIdentity.self))
                     ?? nil ?? .shippedDefault
-                return await MainActor.run {
-                    if calendar.access == .granted {
-                        calendar.load(userEmail: identity.email)
-                    }
-                    return calendar.suggestions
-                }
+                await calendar.refresh(userEmail: identity.email)
+                return await MainActor.run { calendar.suggestions }
             },
             calendarHook: { code in
                 let scheduler = schedulerRef.withLock { $0 }
@@ -427,6 +426,7 @@ final class AppEnvironment {
             let denied = await notificationAdapter.authorizationDenied()
             await MainActor.run { captureStatus.notificationsDenied = denied }
         }
+        await googleCalendar.load()
         // Handoff persistent-failure warning → Notification Center: the
         // holder fires once per failure episode (never per attempt); clearing
         // withdraws the standing notification silently — no success spam.
@@ -473,6 +473,7 @@ final class AppEnvironment {
             ?? nil ?? .shippedDefault
         userEmail = startupIdentity.email
         userName = startupIdentity.name
+        await refreshCalendarSurfaces()
         Task { [database, pipeline, captureStatus] in
             let kick: @Sendable (MeetingID) async -> Void = { meetingID in
                 // G10 §1: launch auto re-dispatch refuses a cancelled meeting.
@@ -612,12 +613,29 @@ final class AppEnvironment {
     }
 
     private func refreshSchedulerSnapshots() async {
-        guard calendarSuggestions.access == .granted else { return }
         let now = Date()
-        let snapshots = calendarSuggestions.eventSnapshots(
+        let snapshots = await calendarSuggestions.eventSnapshots(
             from: now.addingTimeInterval(-PreMeetingScheduler.validitySeconds),
             to: now.addingTimeInterval(24 * 3600))
         await scheduler.update(snapshots: snapshots)
+        await refreshCalendarSurfaces(now: now)
+    }
+
+    func refreshCalendarSurfaces(now: Date = Date()) async {
+        await calendarSuggestions.refresh(
+            userEmail: userEmail, recordedCodes: recordedMeetingCodes(), now: now)
+    }
+
+    private func recordedMeetingCodes() -> Set<String> {
+        (try? database.pool.read { db in
+            try Set(String.fetchAll(
+                db,
+                sql: """
+                    SELECT DISTINCT meeting_code FROM meeting
+                    WHERE meeting_code IS NOT NULL
+                      AND status IN ('recording', 'processing', 'ready', 'failed', 'paused')
+                    """))
+        }) ?? []
     }
 
     // MARK: - Recording actions (menu bar + ⌥⌘R command)
@@ -633,7 +651,12 @@ final class AppEnvironment {
         // joined mid-way got no `scheduled_end_ms` and the §2 classifier could
         // never Rule-1 it. The supplied anchor (a surfaced suggestion) always
         // wins — §1 "written once at start when matched", no retroactive rebind.
-        let resolvedAnchor = anchor ?? coveringCalendarAnchor(code: meetingCode)
+        let resolvedAnchor: CalendarAnchor?
+        if let anchor {
+            resolvedAnchor = anchor
+        } else {
+            resolvedAnchor = await coveringCalendarAnchor(code: meetingCode)
+        }
         do {
             let meeting = try await recordingController.start(
                 source: source, title: title, meetingCode: meetingCode, attendees: attendees,
@@ -654,19 +677,26 @@ final class AppEnvironment {
             anchor: CalendarAnchor(suggestion: suggestion))
     }
 
+    func startRecording(upcoming row: UpcomingMeetingRow) async {
+        await startRecording(
+            source: row.source, title: row.title,
+            meetingCode: row.meetingCode, attendees: row.attendees,
+            anchor: row.anchor)
+        await refreshCalendarSurfaces()
+    }
+
     /// G11 §4 (v3.2): the calendar anchor for a quick-start with no surfaced
     /// suggestion — the late-join / undetected-Zoom anchor source. Reads the
     /// EventKit snapshots over the bind window [now − 15 min, now + buffer] and
     /// anchors to a covering event (`quickStartAnchor`). nil when access is
     /// not granted or no event covers now (the start stays ad-hoc → §1 columns
     /// NULL). EventKit reads only; never prompts (the prompt is its own opt-in).
-    private func coveringCalendarAnchor(code: String?) -> CalendarAnchor? {
-        guard calendarSuggestions.access == .granted else { return nil }
+    private func coveringCalendarAnchor(code: String?) async -> CalendarAnchor? {
         let now = Date()
         // The fetch must span any event that could COVER now: it can have
         // started up to its full duration ago, so reach back generously and
         // forward past the bind lead; quickStartAnchor enforces actual coverage.
-        let snapshots = calendarSuggestions.eventSnapshots(
+        let snapshots = await calendarSuggestions.eventSnapshots(
             from: now.addingTimeInterval(-12 * 3600),
             to: now.addingTimeInterval(CalendarSuggestionBuilder.bindLeadSeconds))
         return CalendarSuggestionBuilder.quickStartAnchor(for: now, code: code, in: snapshots)
@@ -879,13 +909,24 @@ final class AppEnvironment {
         }
         // Attendees from the matching current suggestion (user excluded as
         // today); the extension's first batch correlates live via the code.
-        if calendarSuggestions.access == .granted {
-            calendarSuggestions.load(userEmail: userEmail)
+        await refreshCalendarSurfaces()
+        let row = calendarSuggestions.upcomingRows.first {
+            $0.id == eventKey || $0.meetingCode == code
         }
         let suggestion = calendarSuggestions.suggestions.first { $0.meetingCode == code }
         await tracker.startCorrelated(
-            code: code, title: title, attendees: suggestion?.attendees ?? [],
-            anchor: suggestion.flatMap(CalendarAnchor.init(suggestion:)))
+            code: code, title: title,
+            attendees: row?.attendees ?? suggestion?.attendees ?? [],
+            anchor: row?.anchor ?? suggestion.flatMap(CalendarAnchor.init(suggestion:)))
+        await refreshCalendarSurfaces()
+    }
+
+    func launchAndRecord(upcoming row: UpcomingMeetingRow) async {
+        guard let code = row.meetingCode, let urlString = row.urlString else {
+            await startRecording(upcoming: row)
+            return
+        }
+        await launchAndRecord(eventKey: row.id, code: code, title: row.title, urlString: urlString)
     }
 
     /// ⌥⌘R: toggle. Not recording → quick-start (Meet, clipboard code if
@@ -926,10 +967,8 @@ final class AppEnvironment {
             await MainActor.run {
                 userEmail = identity.email
                 userName = identity.name
-                if calendarSuggestions.access == .granted {
-                    calendarSuggestions.load(userEmail: userEmail)
-                }
             }
+            await refreshCalendarSurfaces()
         }
     }
 

@@ -50,6 +50,7 @@ struct AutomationTab: View {
     private static let deniedBannerKey = "automation.deniedBannerDismissed"
 
     var body: some View {
+        @Bindable var google = appEnv.googleCalendar
         Form {
             Section("Meeting automation") {
                 Toggle("Meeting automation (notifications, auto-stop)", isOn: $enabled)
@@ -85,6 +86,74 @@ struct AutomationTab: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
+            Section("Calendars") {
+                LabeledContent("Apple Calendar") {
+                    switch appEnv.calendarSuggestions.access {
+                    case .granted:
+                        Text("Connected").foregroundStyle(.secondary)
+                    case .notDetermined:
+                        Button("Enable") {
+                            Task {
+                                await appEnv.calendarSuggestions.requestAccessAndLoad(
+                                    userEmail: appEnv.userEmail)
+                                await appEnv.refreshCalendarSurfaces()
+                            }
+                        }
+                    case .denied:
+                        Text("Off").foregroundStyle(.orange)
+                    }
+                }
+
+                Toggle(
+                    "Google Calendar",
+                    isOn: Binding(
+                        get: { google.enabled },
+                        set: { google.setEnabled($0) }))
+                TextField("OAuth desktop client ID", text: $google.clientID)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        Task {
+                            await google.saveSettings()
+                            await appEnv.refreshCalendarSurfaces()
+                        }
+                    }
+                HStack {
+                    Button("Save") {
+                        Task {
+                            await google.saveSettings()
+                            await appEnv.refreshCalendarSurfaces()
+                        }
+                    }
+                    Button(google.connected ? "Reconnect" : "Connect") {
+                        Task {
+                            await google.connect()
+                            await appEnv.refreshCalendarSurfaces()
+                        }
+                    }
+                    .disabled(google.authorizing)
+                    if google.connected {
+                        Button("Disconnect") {
+                            Task {
+                                await google.disconnect()
+                                await appEnv.refreshCalendarSurfaces()
+                            }
+                        }
+                    }
+                    if google.refreshing || google.authorizing {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+                if google.connected {
+                    Label("Connected", systemImage: "checkmark.circle")
+                        .foregroundStyle(Theme.accent)
+                }
+                if let error = google.lastError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+            }
             if appEnv.captureStatus.notificationsDenied && !deniedBannerDismissed {
                 Section {
                     QuietBanner(
@@ -103,6 +172,7 @@ struct AutomationTab: View {
         }
         .formStyle(.grouped)
         .task {
+            await appEnv.googleCalendar.load()
             enabled = await AutomationSettings.enabled(from: appEnv.settings)
             resumeWindowMinutes =
                 await AutomationSettings.resumeWindowSeconds(from: appEnv.settings) / 60

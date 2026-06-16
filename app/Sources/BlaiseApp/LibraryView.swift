@@ -13,6 +13,7 @@ enum Theme {
 }
 
 struct LibraryView: View {
+    @Environment(AppEnvironment.self) private var appEnv
     @Environment(AppUIState.self) private var uiState
     @Environment(LibraryModel.self) private var library
     @Environment(PipelineActivityHolder.self) private var activity
@@ -179,6 +180,11 @@ struct LibraryView: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: Design.direction == .fluido ? 9 : 2) {
+                    if !appEnv.calendarSuggestions.upcomingRows.isEmpty {
+                        UpcomingMeetingsSection(rows: appEnv.calendarSuggestions.upcomingRows)
+                            .padding(.top, 12)
+                            .padding(.bottom, 8)
+                    }
                     ForEach(groups) { group in
                         DayGroupHeader(label: group.label, items: group.items)
                             .padding(.top, 16)
@@ -220,11 +226,14 @@ struct LibraryView: View {
                 listFocused = true
             }
         }
+        .task {
+            await appEnv.refreshCalendarSurfaces()
+        }
         .scrollEdgeEffectStyle(.soft, for: .top)
         .background(Design.listColumn.ignoresSafeArea())
         .navigationTitle(uiState.selectedGroup == .thisWeek ? "This Week" : "All Meetings")
         .overlay {
-            if library.items.isEmpty {
+            if library.items.isEmpty && appEnv.calendarSuggestions.upcomingRows.isEmpty {
                 ContentUnavailableView(
                     "No Meetings Yet", systemImage: "rectangle.stack",
                     description: Text("Import audio via File → Import Meeting Audio…"))
@@ -293,6 +302,122 @@ struct LibraryView: View {
             guard !Task.isCancelled else { return }
             searchResults = results
         }
+    }
+}
+
+// MARK: - Upcoming meetings
+
+struct UpcomingMeetingsSection: View {
+    @Environment(AppEnvironment.self) private var appEnv
+    let rows: [UpcomingMeetingRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Image(systemName: "calendar.badge.clock")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                    .accessibilityHidden(true)
+                Text("Upcoming")
+                    .font(.system(size: 11, weight: .bold))
+                    .textCase(.uppercase)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(rows.count)")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityLabel("\(rows.count) upcoming meetings")
+            }
+            .padding(.horizontal, 6)
+
+            ForEach(Array(rows.prefix(5))) { row in
+                UpcomingMeetingRowView(row: row)
+            }
+        }
+    }
+}
+
+private struct UpcomingMeetingRowView: View {
+    @Environment(AppEnvironment.self) private var appEnv
+    let row: UpcomingMeetingRow
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: sourceIcon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.accent)
+                .frame(width: 16)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(row.title.isEmpty ? "Meeting" : row.title)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(Self.time(row.start))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Theme.accent)
+                }
+                Text(detailLine)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+
+            Button {
+                Task { await appEnv.startRecording(upcoming: row) }
+            } label: {
+                Image(systemName: "record.circle")
+                    .font(.system(size: 15, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .help("Record")
+            .accessibilityLabel("Record \(row.title)")
+
+            if row.offersLaunchAndRecord {
+                Button {
+                    Task { await appEnv.launchAndRecord(upcoming: row) }
+                } label: {
+                    Image(systemName: "play.circle")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .help("Launch and record")
+                .accessibilityLabel("Launch and record \(row.title)")
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .strokeBorder(Theme.accent.opacity(0.16), lineWidth: 1)
+        )
+    }
+
+    private var sourceIcon: String {
+        switch row.source {
+        case .meet: return "video"
+        case .zoom, .teams: return "person.2.wave.2"
+        case .inPerson: return "person.2"
+        case .imported: return "waveform"
+        }
+    }
+
+    private var detailLine: String {
+        let attendees = row.attendeeCount == 1 ? "1 attendee" : "\(row.attendeeCount) attendees"
+        if let code = row.meetingCode {
+            return "\(attendees) · \(code)"
+        }
+        return attendees
+    }
+
+    private static func time(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: date)
     }
 }
 
