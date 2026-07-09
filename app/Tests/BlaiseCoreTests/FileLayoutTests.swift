@@ -105,7 +105,7 @@ import Testing
     }
 }
 
-// Impl-audit round-1 regression tests (audits/c1/impl_audit_round1.md)
+// Impl-audit round-1 regression tests
 @Suite struct ImmutableWriterConcurrencyTests {
     /// F1: two writers racing the exists-check must never both succeed with
     /// different bytes — RENAME_EXCL makes check-and-rename atomic.

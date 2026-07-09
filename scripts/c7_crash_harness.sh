@@ -6,7 +6,6 @@
 # stub engines — the only honest way to assert byte-level no-ops — plus ONE
 # real-engine mid-ASR kill -9 (pass --real; needs the research venv + HF
 # cache). Asserts the relaunch invariants from OUTSIDE the killed process.
-# Evidence narrative: audits/c7/crash_evidence.md.
 #
 # CrashRunner is built by `swift test` (scripts/test.sh); this script does
 # not build.
@@ -116,7 +115,7 @@ run_deterministic_point() { # <point>
 
 run_real_asr_kill() {
     echo "== real-engine timing kill: kill -9 mid-ASR (seg_a, MLX whisper) =="
-    local VENV="$ROOT/research/asr/.venv"
+    local VENV="$ROOT/${BLAISE_ASR_VENV:-.asr-venv}"
     local HF="$HOME/.cache/huggingface"
     [[ -x "$VENV/bin/python" ]] || { echo "  SKIP: research venv missing"; return; }
 

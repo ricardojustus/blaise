@@ -418,6 +418,19 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
     /// change ONLY when the pipeline genuinely re-runs the digest call or a
     /// deterministic name-edit rewrites them in place.
     public var memoryDigest: String?
+    /// T3.1 (md-v3) AC2: the FIRST-run scoped alias bindings (alias→canonical,
+    /// admitted on actual alias evidence) persisted with the meeting so the bare
+    /// digest-resume path (`digestOnlyBody`) — which reloads only the corrected
+    /// transcript and CANNOT reconstruct the `AppliedCorrection` records — scopes
+    /// IDENTICALLY to the first run. Without this, a correction-LIMITED alias
+    /// (admitted via path (ii): an applied `.alias` correction whose canonical is
+    /// never injected into the transcript) would silently vanish on resume.
+    /// Stored in its OWN nullable JSON column (`scoped_alias_bindings`);
+    /// presence-preserving like `memoryDigest` (a null/absent column → `[]`, so a
+    /// pre-md-v3 row round-trips WITHOUT the key and the payload re-materializes
+    /// byte-identically). NOT in the payload (the builder reads explicit fields
+    /// only — `EvidencePayloadBuilder`), so `versionHash` is unaffected (AC7).
+    public var scopedAliasBindings: [AliasPair]
 
     public init(
         meetingID: MeetingID,
@@ -426,7 +439,8 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         language: String,
         generatedAt: Date,
         provenance: NotesProvenance,
-        memoryDigest: String? = nil
+        memoryDigest: String? = nil,
+        scopedAliasBindings: [AliasPair] = []
     ) {
         self.meetingID = meetingID
         self.markdown = markdown
@@ -435,6 +449,7 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         self.generatedAt = generatedAt
         self.provenance = provenance
         self.memoryDigest = memoryDigest
+        self.scopedAliasBindings = scopedAliasBindings
     }
 
     enum CodingKeys: String, CodingKey {
@@ -442,6 +457,7 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         case meetingID = "meeting_id"
         case generatedAt = "generated_at"
         case memoryDigest = "memory_digest"
+        case scopedAliasBindings = "scoped_alias_bindings"
     }
 
     public init(from decoder: Decoder) throws {
@@ -453,6 +469,9 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         self.generatedAt = try container.decode(Date.self, forKey: .generatedAt)
         self.provenance = try container.decode(NotesProvenance.self, forKey: .provenance)
         self.memoryDigest = try container.decodeIfPresent(String.self, forKey: .memoryDigest)
+        // A null/absent column (legacy / pre-md-v3 / digest-off row) → empty set.
+        self.scopedAliasBindings =
+            try container.decodeIfPresent([AliasPair].self, forKey: .scopedAliasBindings) ?? []
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -472,6 +491,14 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         // protected at the PAYLOAD builder (the `memory_digest` field is
         // presence-gated on a non-null column), not here.
         try container.encode(memoryDigest, forKey: .memoryDigest)
+        // `scoped_alias_bindings`: an EMPTY set writes SQL NULL (so a digest-off
+        // / no-alias row carries no column value and a pre-md-v3 row stays
+        // null), a non-empty set writes a JSON array. Always encoded (like
+        // `memory_digest`) so a re-persist that scopes to no aliases actively
+        // CLEARS a previously-stored set rather than silently retaining it.
+        try container.encode(
+            scopedAliasBindings.isEmpty ? nil : scopedAliasBindings,
+            forKey: .scopedAliasBindings)
     }
 }
 
@@ -494,6 +521,20 @@ public struct SearchHit: Codable, Sendable, Equatable {
         self.segmentID = segmentID
         self.ord = ord
         self.startSeconds = startSeconds
+        self.snippet = snippet
+    }
+}
+
+/// A full-text hit in a meeting's NOTES (F2). Notes are one row per meeting,
+/// so a hit IS a meeting; it carries no segment/offset. The snippet uses the
+/// same `SearchHit.match{Start,End}Delimiter` convention as transcript hits,
+/// so the snippet-bolding formatter is shared.
+public struct NotesSearchHit: Codable, Sendable, Equatable {
+    public var meetingID: MeetingID
+    public var snippet: String
+
+    public init(meetingID: MeetingID, snippet: String) {
+        self.meetingID = meetingID
         self.snippet = snippet
     }
 }
@@ -558,6 +599,68 @@ public struct HandoffItem: Codable, Sendable, Equatable {
         case createdAt = "created_at"
         case lastAttemptAt = "last_attempt_at"
         case deliveredAt = "delivered_at"
+        case lastError = "last_error"
+    }
+}
+
+// MARK: - F1 processing queue
+
+public enum ProcessingJobState: String, Codable, Sendable, CaseIterable {
+    case pending, running, done, failed, cancelled
+}
+
+public enum ProcessingJobOrigin: String, Codable, Sendable, CaseIterable {
+    case user, auto
+    case reprocessAll = "reprocess_all"
+}
+
+/// A durable processing-queue job (F1). The queue is the always-on substrate;
+/// the worker drives the unchanged `ProcessingPipeline.dispatchProcessing`, which
+/// self-selects process-vs-regenerate at run time — so there is no `kind` here.
+public struct ProcessingJob: Codable, Sendable, Equatable {
+    public var id: String
+    public var meetingID: MeetingID
+    public var state: ProcessingJobState
+    public var origin: ProcessingJobOrigin
+    public var attempts: Int
+    /// Durable, VACUUM-stable, clock-independent FIFO order (the handoff pattern).
+    public var createdSeq: Int64
+    public var enqueuedAt: Date
+    public var startedAt: Date?
+    public var finishedAt: Date?
+    public var lastError: String?
+
+    public init(
+        id: String,
+        meetingID: MeetingID,
+        state: ProcessingJobState,
+        origin: ProcessingJobOrigin,
+        attempts: Int,
+        createdSeq: Int64,
+        enqueuedAt: Date,
+        startedAt: Date? = nil,
+        finishedAt: Date? = nil,
+        lastError: String? = nil
+    ) {
+        self.id = id
+        self.meetingID = meetingID
+        self.state = state
+        self.origin = origin
+        self.attempts = attempts
+        self.createdSeq = createdSeq
+        self.enqueuedAt = enqueuedAt
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+        self.lastError = lastError
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, state, origin, attempts
+        case meetingID = "meeting_id"
+        case createdSeq = "created_seq"
+        case enqueuedAt = "enqueued_at"
+        case startedAt = "started_at"
+        case finishedAt = "finished_at"
         case lastError = "last_error"
     }
 }

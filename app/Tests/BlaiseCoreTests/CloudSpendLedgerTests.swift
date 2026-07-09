@@ -27,12 +27,16 @@ private final class ClockBox: @unchecked Sendable {
 }
 
 @Suite struct CloudSpendLedgerTests {
-    @Test func monthKeyUsesSaoPauloTime() {
-        // 2026-01-01T01:00:00Z is still 31/12/2025 22:00 in São Paulo (UTC-3).
+    @Test func monthKeyRespectsTimeZone() {
+        // A fixed UTC-3 zone (no locality): 2026-01-01T01:00:00Z is still
+        // 31/12/2025 22:00 there, so the billing month is December.
+        let utcMinus3 = TimeZone(secondsFromGMT: -3 * 3600)!
         let utcNewYear = Date(timeIntervalSince1970: 1_767_229_200)
-        #expect(CloudSpendLedger.monthKey(for: utcNewYear) == "2025-12")
-        // Noon UTC the same day is 09:00 in São Paulo → January.
-        #expect(CloudSpendLedger.monthKey(for: utcNewYear.addingTimeInterval(11 * 3600)) == "2026-01")
+        #expect(CloudSpendLedger.monthKey(for: utcNewYear, timeZone: utcMinus3) == "2025-12")
+        // +11h is 09:00 the next day in UTC-3 → January.
+        #expect(
+            CloudSpendLedger.monthKey(
+                for: utcNewYear.addingTimeInterval(11 * 3600), timeZone: utcMinus3) == "2026-01")
     }
 
     @Test func accumulatesAcrossCalls() async throws {

@@ -192,6 +192,10 @@ public struct PipelineRunRecord: Codable, Sendable {
     /// text under the user's label). Counts raw ASR segments, NOT merged
     /// turns. nil when none dropped or not a two-track run.
     public var echoDroppedSegments: Int?
+    /// #101 (D10): how many grounded person-mention hints the digest run carried
+    /// (presence-gated; 0 means no hint block was rendered). Provenance only —
+    /// the hint text lives in the LLM USER MESSAGE, never in the artifact.
+    public var groundedPersonHintCount = 0
 
     init(meetingID: MeetingID, regeneration: Bool) {
         self.meetingID = meetingID
@@ -991,6 +995,13 @@ public actor ProcessingPipeline {
         /// `CancellationToken.current` around the cloud engine call so the
         /// engine binds the cancel at its attempt boundaries.
         var cancelToken: CancellationToken?
+        /// T3.1 (md-v3) AC2: the scoped alias bindings RESOLVED by this run's
+        /// digest call (`generateMemoryDigest` sets it). `persistNotesAndFinalize`
+        /// writes them onto the `meeting_notes` row so the bare digest-resume
+        /// path can replay them and scope identically. nil ⇒ no digest call ran
+        /// (toggle off / failed before derivation); the persist step then keeps
+        /// the empty default.
+        var resolvedScopedAliasBindings: [AliasPair]?
 
         init(meetingID: MeetingID, regeneration: Bool) {
             self.currentStage = regeneration ? .transcode : .ingest
@@ -1077,6 +1088,16 @@ public actor ProcessingPipeline {
             await recordFailure(
                 meetingID: meetingID, regeneration: regeneration, stage: stage, message: message)
             emit(.runFailed(meetingID, stage: stage, message: message))
+            // C1 (F1 Inc2): a CANCELLATION must surface as the TYPED
+            // `EngineError.cancelled`, not be wrapped in a generic
+            // `PipelineError` — the processing-queue worker classifies a job
+            // `cancelled` (vs `failed`) on this type. Detect it via the cancel
+            // token (set by `cancel`) or the thrown `EngineError.cancelled`. The
+            // status/event behavior above is unchanged (the meeting-status write
+            // stays owned by `cancel`); only the propagated error TYPE narrows.
+            var wasCancelled = context.cancelToken?.isCancelled == true
+            if case EngineError.cancelled = error { wasCancelled = true }
+            if wasCancelled { throw EngineError.cancelled }
             throw PipelineError(stage: stage, message: message)
         }
     }
@@ -1157,6 +1178,14 @@ public actor ProcessingPipeline {
                 userName: user.name,
                 suppression: vocabulary.suppression,
                 commonNames: vocabulary.commonNames)
+            // C4 v6: per-segment refinement over the same timeline — corrects
+            // cluster bleed (one acoustic cluster spanning two people) and names
+            // multi-speaker blobs the cluster pass left unresolved. No-op without
+            // events; never invents a name; clears a contradicted name rather
+            // than keeping a wrong one (policy b).
+            segments = SpeakerResolver.refineWithPerSegmentTimeline(
+                segments: segments, diarization: diarization.segments, hints: hints,
+                audioDuration: audioDuration, eventNames: eventNames)
         }
 
         // 9. notes — NO availability pre-gate (C2 amendment for this slot):
@@ -1168,7 +1197,12 @@ public actor ProcessingPipeline {
             transcript: segments,
             dominantLanguage: dominantLanguage,
             vocabulary: vocabulary.canonicalTerms,
-            user: user)
+            user: user,
+            // #101: grounded person-mention hints — derived IDENTICALLY here and
+            // on the notes-only resume (same vocabulary, attendees, segments), so
+            // the resume request stays byte-equal to this stage-9 request.
+            groundedPersonHints: GroundedPersonHints.groundedPersonHints(
+                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments))
         let notesOutcome = try await stage(.notes, context, meetingID) {
             try await self.generateNotesWithFallback(notesRequest, context: context)
         }
@@ -1265,7 +1299,8 @@ public actor ProcessingPipeline {
         let digestOutcome = await generateMemoryDigest(
             meetingID: meetingID, meeting: meeting, notes: substituted.structured,
             segments: segments, dominantLanguage: dominantLanguage,
-            vocabulary: vocabulary, user: user, context: context)
+            vocabulary: vocabulary, user: user, context: context,
+            corrections: context.record.corrections)
         let digest = Self.digestStringOrNil(digestOutcome)
 
         // 12+13. persistNotes + finalize (shared with the notes-only resume).
@@ -1779,6 +1814,18 @@ public actor ProcessingPipeline {
         } catch let primaryError as EngineError
         where EngineFallbackReason.isFallbackTrigger(primaryError) {
             let primaryReason = Self.describe(primaryError)
+            // Decision B ("stay free, but not silent"): when the user SELECTED an
+            // engine that suppresses auto-fallback (the subscription `claude -p`
+            // Account engine), a fallback-trigger failure must NOT silently route
+            // to the metered API (or any other) engine — leave the notes PENDING
+            // with a user-visible warning so the user can retry on their chosen
+            // free engine. This is checked BEFORE any fallback-engine lookup.
+            if primary.suppressesAutoFallback {
+                logger.warning(
+                    "notes pending: selected engine \(primary.id) failed (\(primaryReason)); not auto-falling back — user-selected subscription engine stays free, retry on the same engine"
+                )
+                return .pending(reason: "\(primary.id) failed: \(primaryReason)")
+            }
             guard
                 let fallback = registry.summarizationEngines.first(where: { $0.id != primary.id })
             else {
@@ -2010,12 +2057,66 @@ public actor ProcessingPipeline {
     /// (non-fatal — the caller writes the digest-pending marker and the run
     /// still completes). `notes` is the name-substituted `NotesStructured`
     /// salience guide; the digest re-derives facts from `segments`.
+    ///
+    /// T3.1 (md-v3): the digest request also carries the app-derived structured
+    /// inputs — `scopedAliasBindings` (alias→canonical, admitted ONLY on actual
+    /// alias evidence: a corrected-transcript alias surface OR an applied
+    /// `.alias` correction; never on canonical-presence alone) and `hostBinding`
+    /// (the `user`-track owner). `corrections` carries the applied corrections so
+    /// the correction-limited path is reachable on the first run.
+    ///
+    /// T3.1 AC2 — RESUME PARITY: the first run's RESOLVED scoped set is persisted
+    /// on the `meeting_notes` row; the bare digest-resume path (`digestOnlyBody`)
+    /// reloads it and passes `scopedAliasBindingsOverride`, so a correction-
+    /// limited alias (path (ii) — never reconstructable on resume because the
+    /// `AppliedCorrection` records are gone) survives. The override, when
+    /// present, REPLACES derivation entirely; the resolved set is stashed on the
+    /// context so the persist step records it for the next resume.
     private func generateMemoryDigest(
         meetingID: MeetingID, meeting: Meeting, notes: NotesStructured,
         segments: [TranscriptSegment], dominantLanguage: String,
-        vocabulary: PipelineVocabulary, user: UserIdentity, context: RunContext
+        vocabulary: PipelineVocabulary, user: UserIdentity, context: RunContext,
+        corrections: [AppliedCorrection] = [],
+        scopedAliasBindingsOverride: [AliasPair]? = nil
     ) async -> DigestOutcome {
         guard await MemoryDigestSettings.isEnabled(in: settings) else { return .disabled }
+
+        // The override (digest-resume: the persisted first-run set) REPLACES
+        // derivation — path (ii) is unreachable on resume (the records are gone),
+        // so deriving here would silently drop a correction-limited alias.
+        let scopedAliasBindings = scopedAliasBindingsOverride
+            ?? DigestStructuredInputs.scopedAliasBindings(
+                dictionary: vocabulary.dictionary,
+                correctedSegments: segments,
+                corrections: corrections)
+        // Record the resolved set so the persist step writes it for the next
+        // resume (a no-op when the resume itself just replayed a persisted set).
+        context.resolvedScopedAliasBindings = scopedAliasBindings
+        let hostBinding = DigestStructuredInputs.hostBinding(user: user)
+        // #101: grounded person-mention hints — derived inside the shared digest
+        // entry so ALL THREE digest call sites (full-run, notes-only resume,
+        // digest-only resume) carry them identically. The everyday-rejected
+        // aliases come from the per-run vocabulary load; attendees + the corrected
+        // segments are the grounding inputs.
+        let groundedPersonHints = GroundedPersonHints.groundedPersonHints(
+            vocabulary: vocabulary, attendees: meeting.attendees, segments: segments)
+        context.record.groundedPersonHintCount = groundedPersonHints.count
+
+        // Optional knowledge glossary — load the user-configured file gracefully
+        // (default-empty path → nil → no block, byte-identical to before). It
+        // carries on the SINGLE `request` below, so ALL passes that share it
+        // (synthesis + combined-audit + the md-v5 verify/reconcile) see it. Loaded
+        // HERE, before the synthesis call, not at the post-call exclude-projects
+        // read. Missing / empty / unreadable file → skipped, no block.
+        let kgPath = await MemoryDigestSettings.knowledgeGlossaryPath(in: settings)
+        var knowledgeGlossary: String? = nil
+        if !kgPath.isEmpty {
+            let expanded = (kgPath as NSString).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: expanded),
+                let s = try? String(contentsOfFile: expanded, encoding: .utf8), !s.isEmpty {
+                knowledgeGlossary = s
+            }
+        }
 
         let request = DigestRequest(
             meeting: meeting,
@@ -2023,7 +2124,32 @@ public actor ProcessingPipeline {
             notes: notes,
             dominantLanguage: dominantLanguage,
             vocabulary: vocabulary.canonicalTerms,
-            user: user)
+            user: user,
+            scopedAliasBindings: scopedAliasBindings,
+            hostBinding: hostBinding,
+            groundedPersonHints: groundedPersonHints,
+            knowledgeGlossary: knowledgeGlossary)
+
+        // DEV-ONLY recall-gate capture (env-gated; OFF by default; NEVER alters
+        // the digest, the payload, or any persisted state). When
+        // BLAISE_DUMP_DIGEST_INPUT=1, write the byte-exact rendered user message
+        // the model is about to receive — CANONICAL VOCABULARY + ALIAS
+        // RESOLUTION + MEETING/HOST + TRANSCRIPT with provenance markers — to the
+        // MEETING'S OWN directory at `<meetingDir>/.digest_input.txt`, so the
+        // recall-gate judge sees EXACTLY what the model saw AND the dump (which
+        // carries the same PII as the transcript) is REAPED with the meeting on
+        // delete (it no longer survives in a sibling `_recall_gate` dir).
+        // `userMessage(for:)` is a pure re-render of the SAME `request` the engine
+        // renders, so the dump is byte-identical to the model input; this is a
+        // read-only side effect captured before the call so it lands even if the
+        // digest call later fails.
+        if ProcessInfo.processInfo.environment["BLAISE_DUMP_DIGEST_INPUT"] == "1" {
+            let dumpURL = database.paths.meetingDirectory(meetingID)
+                .appendingPathComponent(".digest_input.txt")
+            try? Data(DigestPromptBuilder.userMessage(for: request).utf8).write(
+                to: dumpURL, options: .atomic)
+            logger.notice("recall-gate: dumped digest input for \(meetingID, privacy: .public)")
+        }
         // The digest call bills under `.digest` for first-time generation; a
         // resume/regeneration re-fire bills `.regeneration` (set on the context
         // by the resume path). The MLX path spends nothing.
@@ -2044,7 +2170,141 @@ public actor ProcessingPipeline {
             let labelMap = await slabelMap(meetingID: meetingID, segments: segments)
             let clean = SLabelNeutralizer.neutralizeText(
                 result.digest, labelMap: labelMap, language: dominantLanguage)
-            return .produced(clean)
+
+            // Deterministic final-mile normalization (NOT env-gated; pure; runs as
+            // the LAST step on WHATEVER digest is ultimately returned — after the
+            // neutralizer and after every LLM pass): (1) date correction (a
+            // conservative ±3-day ISO fix); (2) md-v5 `DigestNormalizer` — strip
+            // the configured non-project/tooling terms from the HEADER `projects:`
+            // line and dedup it. The exclusion list is user settings + the
+            // recall-gate env override; EMPTY = exact no-op. Body prose untouched.
+            let settingsExclude = await MemoryDigestSettings.excludeProjects(in: settings)
+            let envExclude = (ProcessInfo.processInfo.environment["BLAISE_DIGEST_EXCLUDE_PROJECTS"] ?? "")
+                .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            let excludeProjects = settingsExclude + envExclude
+            func dateCorrected(_ digest: String) -> String {
+                DigestNormalizer.normalize(
+                    DigestDateNormalizer.normalize(digest, meetingDate: meeting.startedAt),
+                    excludeProjects: excludeProjects)
+            }
+
+            // md-v6 (combined audit — the 3-pass digest): ONE audit pass folds the
+            // md-v5 transcript-only verify AND the notes reconcile into a single
+            // call (verify STEP 1, then reconcile STEP 2). It runs AFTER synthesis
+            // and ships the audited result; the separate verify+reconcile blocks
+            // BELOW are the md-v5 rollback path (reached only if `shippedVersion`
+            // is flipped back to `.mdV5`). Gated by EITHER the "Verify & repair" or
+            // the "Reconcile against notes" toggle (both default ON) / the dev env
+            // overrides — turning EITHER on runs the combined audit; both OFF ships
+            // the bare single-call synthesis draft. Claude-only (the MLX path has
+            // no audit call and ships `clean`). ROBUSTNESS: any throw (incl. cancel)
+            // falls back to the synthesis draft `clean` — the digest is NEVER lost
+            // because the audit failed.
+            if DigestPromptBuilder.shippedVersion == .mdV6 {
+                // Hoist both async toggle reads out of the `||` chain: the `||`
+                // right-operand is an autoclosure that cannot `await`.
+                let verifyOn = await MemoryDigestSettings.isVerifyEnabled(in: settings)
+                let reconcileOn = await MemoryDigestSettings.isReconcileEnabled(in: settings)
+                let auditRequested =
+                    verifyOn
+                    || reconcileOn
+                    || ProcessInfo.processInfo.environment["BLAISE_DIGEST_VERIFY"] == "1"
+                    || ProcessInfo.processInfo.environment["BLAISE_DIGEST_RECONCILE"] == "1"
+                // #102: the cost toggle — does the COMBINED AUDIT run on Haiku?
+                // Hoisted out of the `||` (the right operand is a non-awaiting
+                // autoclosure). Settings OR the dev env override, default OFF →
+                // Sonnet. This is the ONLY call site that may pick Haiku; notes,
+                // synthesis, and the md-v5 verify/reconcile passes never read it.
+                let haikuOn = await MemoryDigestSettings.isHaikuAuditEnabled(in: settings)
+                    || ProcessInfo.processInfo.environment["BLAISE_HAIKU_AUDIT"] == "1"
+                if auditRequested, let claudeEngine = engine as? ClaudeSummarizationEngine {
+                    do {
+                        if context.cancelToken?.isCancelled == true { throw EngineError.cancelled }
+                        let audited = try await CancellationToken.$current.withValue(context.cancelToken) {
+                            // #102 (F8): when ON pass the QUALIFIED const
+                            // `ClaudeSummarizationEngine.haikuModel` (here `Self` is
+                            // ProcessingPipeline — `Self.haikuModel` would not
+                            // compile); when OFF omit the arg so the engine's
+                            // `= Self.model` default keeps it byte-identical Sonnet.
+                            if haikuOn {
+                                return try await claudeEngine.combinedAuditDigest(
+                                    request, draftDigest: clean, purpose: purpose,
+                                    model: ClaudeSummarizationEngine.haikuModel)
+                            }
+                            return try await claudeEngine.combinedAuditDigest(
+                                request, draftDigest: clean, purpose: purpose)
+                        }
+                        let auditedClean = SLabelNeutralizer.neutralizeText(
+                            audited.digest, labelMap: labelMap, language: dominantLanguage)
+                        return .produced(dateCorrected(auditedClean))
+                    } catch {
+                        logger.warning(
+                            "digest combined-audit pass failed for \(meetingID, privacy: .public): \(Self.describe(error), privacy: .public) — falling back to the unaudited synthesis draft digest")
+                        return .produced(dateCorrected(clean))
+                    }
+                }
+                return .produced(dateCorrected(clean))
+            }
+
+            // OPTIONAL second verify/repair pass (TRANSCRIPT-only). Gated by the
+            // Settings → Handoff "Verify & repair memory digest" toggle (default
+            // ON) / dev env `BLAISE_DIGEST_VERIFY=1`. When ON and the engine is the
+            // cloud Claude engine, run a focused auditor that repairs grounding
+            // errors against the transcript and neutralize its output the SAME way.
+            // The MLX path has no verify call. ROBUSTNESS: any throw (incl. cancel)
+            // falls back to the synthesis draft `clean` — the digest is NEVER lost
+            // because the audit failed.
+            var transcriptDigest = clean
+            let verifyRequested = await MemoryDigestSettings.isVerifyEnabled(in: settings)
+                || ProcessInfo.processInfo.environment["BLAISE_DIGEST_VERIFY"] == "1"
+            if verifyRequested,
+                let claudeEngine = engine as? ClaudeSummarizationEngine {
+                do {
+                    if context.cancelToken?.isCancelled == true { throw EngineError.cancelled }
+                    let verified = try await CancellationToken.$current.withValue(context.cancelToken) {
+                        try await claudeEngine.verifyDigest(
+                            request, draftDigest: clean, purpose: purpose)
+                    }
+                    transcriptDigest = SLabelNeutralizer.neutralizeText(
+                        verified.digest, labelMap: labelMap, language: dominantLanguage)
+                } catch {
+                    logger.warning(
+                        "digest verify pass failed for \(meetingID, privacy: .public): \(Self.describe(error), privacy: .public) — falling back to the unverified draft digest")
+                }
+            }
+
+            // md-v5 THIRD pass — NOTES-ANCHORED RECALL RECONCILIATION. Runs AFTER
+            // ALL transcript work (synthesis + verify). Gated by the "Reconcile
+            // against notes" toggle (default ON) / dev env
+            // `BLAISE_DIGEST_RECONCILE=1`. Claude-only (the MLX path has no
+            // reconcile call and ships `transcriptDigest`). It ADDS a human-notes
+            // item to the digest ONLY when the transcript body grounds it
+            // (additive-only, transcript-gated, never edits the notes, never
+            // launders an ungroundable note) — anchoring recall to the STABLE notes
+            // so a grounded contributor/figure can't randomly drop run-to-run.
+            // ROBUSTNESS: any throw (incl. cancel) falls back to `transcriptDigest`
+            // — reconciliation never costs the good digest.
+            let reconcileRequested = await MemoryDigestSettings.isReconcileEnabled(in: settings)
+                || ProcessInfo.processInfo.environment["BLAISE_DIGEST_RECONCILE"] == "1"
+            if reconcileRequested,
+                let claudeEngine = engine as? ClaudeSummarizationEngine {
+                do {
+                    if context.cancelToken?.isCancelled == true { throw EngineError.cancelled }
+                    let reconciled = try await CancellationToken.$current.withValue(context.cancelToken) {
+                        try await claudeEngine.reconcileDigest(
+                            request, draftDigest: transcriptDigest, purpose: purpose)
+                    }
+                    let reconciledClean = SLabelNeutralizer.neutralizeText(
+                        reconciled.digest, labelMap: labelMap, language: dominantLanguage)
+                    return .produced(dateCorrected(reconciledClean))
+                } catch {
+                    logger.warning(
+                        "digest notes-reconcile pass failed for \(meetingID, privacy: .public): \(Self.describe(error), privacy: .public) — falling back to the pre-reconcile digest")
+                    return .produced(dateCorrected(transcriptDigest))
+                }
+            }
+            return .produced(dateCorrected(transcriptDigest))
         } catch {
             let reason = Self.describe(error)
             logger.warning(
@@ -2169,6 +2429,11 @@ public actor ProcessingPipeline {
             // ALREADY-neutralized clean digest string (or nil: toggle off, or a
             // digest-call failure that fell through to digest-pending — the
             // marker is written by the caller after finalize).
+            // T3.1 AC2: persist this run's RESOLVED scoped alias bindings on the
+            // SAME row (empty when no digest call ran), so the bare digest-resume
+            // path replays them and scopes identically (a correction-limited
+            // alias survives a digest-resume). NOT a payload input (versionHash
+            // unaffected, AC7).
             let notes = MeetingNotes(
                 meetingID: meetingID,
                 markdown: markdown,
@@ -2176,7 +2441,8 @@ public actor ProcessingPipeline {
                 language: dominantLanguage,
                 generatedAt: self.now(),
                 provenance: provenance,
-                memoryDigest: memoryDigest)
+                memoryDigest: memoryDigest,
+                scopedAliasBindings: context.resolvedScopedAliasBindings ?? [])
             try await NotesRepository(database: self.database).upsert(notes)
             try Data(markdown.utf8).write(to: paths.notesURL(meetingID), options: .atomic)
         }
@@ -2274,7 +2540,14 @@ public actor ProcessingPipeline {
                         "SELECT id FROM meeting WHERE last_processing_error LIKE ? AND status != ? ORDER BY started_at, id",
                     arguments: [NotesPendingClass.prefix + "%", MeetingStatus.cancelled.rawValue])
             }) ?? []
+        let queueRepo = ProcessingQueueRepository(database: database)
         for meetingID in pending {
+            // C4 (F1 Inc2): skip a meeting that already has a live (pending/
+            // running) queued full-run job — that run produces notes anyway; a
+            // redundant notes-only cloud call here would waste budget and could
+            // overwrite newer output. (Both serialize on the chain, so it's not
+            // a correctness breach — this is the cost/freshness guard.)
+            if ((try? await queueRepo.liveJob(meetingID: meetingID)) ?? nil) != nil { continue }
             _ = try? await processNotesOnly(meetingID: meetingID)
         }
     }
@@ -2386,7 +2659,12 @@ public actor ProcessingPipeline {
             transcript: segments,
             dominantLanguage: dominantLanguage,
             vocabulary: vocabulary.canonicalTerms,
-            user: user)
+            user: user,
+            // #101: SAME derivation as the full-run stage-9 build (same
+            // vocabulary, attendees, persisted stage-9 segments) — pinned
+            // byte-equal by `resumeRebuildsTheSamePromptInputsAsStageNine`.
+            groundedPersonHints: GroundedPersonHints.groundedPersonHints(
+                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments))
 
         do {
             let outcome = try await stage(.notes, context, meetingID) {
@@ -2533,7 +2811,11 @@ public actor ProcessingPipeline {
                         "SELECT id FROM meeting WHERE last_processing_error LIKE ? AND status != ? ORDER BY started_at, id",
                     arguments: [DigestPendingClass.prefix + "%", MeetingStatus.cancelled.rawValue])
             }) ?? []
+        let queueRepo = ProcessingQueueRepository(database: database)
         for meetingID in pending {
+            // C4 (F1 Inc2): skip a meeting with a live queued full-run job (it
+            // re-mints the digest anyway) — avoids a redundant cloud call.
+            if ((try? await queueRepo.liveJob(meetingID: meetingID)) ?? nil) != nil { continue }
             _ = try? await processDigestOnly(meetingID: meetingID)
         }
     }
@@ -2578,17 +2860,45 @@ public actor ProcessingPipeline {
         defer { removeCancelToken(meetingID: meetingID, token: cancelToken) }
         context.cancelToken = cancelToken
 
+        // T3.1 AC2 — RESUME PARITY: replay the FIRST run's persisted scoped set
+        // (path (ii) is unreachable here — the `AppliedCorrection` records are
+        // gone — so a correction-limited alias would otherwise vanish). The
+        // override REPLACES derivation, making the resume scope identically.
+        //
+        // DEV-ONLY recall-gate seam (env-gated; OFF by default; unset in prod =
+        // exact resume-replay behavior, like the BLAISE_DUMP_DIGEST_INPUT seam):
+        // when BLAISE_REGATE_FRESH_ALIASES=1, pass NO override so the scoped
+        // alias set is DERIVED FRESH against the CURRENT glossary instead of the
+        // persisted first-run set. This makes a digest-only regate reflect what a
+        // full REPROCESS (which always re-derives) would produce after a glossary
+        // edit — e.g. a newly-added codename→canonical alias merging two entries.
+        // It NEVER changes a shipped resume (the env is unset there).
+        let aliasOverride: [AliasPair]? =
+            ProcessInfo.processInfo.environment["BLAISE_REGATE_FRESH_ALIASES"] == "1"
+            ? nil : notes.scopedAliasBindings
         let outcome = await generateMemoryDigest(
             meetingID: meetingID, meeting: meeting, notes: notes.structured,
             segments: segments, dominantLanguage: dominantLanguage,
-            vocabulary: vocabulary, user: user, context: context)
+            vocabulary: vocabulary, user: user, context: context,
+            scopedAliasBindingsOverride: aliasOverride)
+
+        // Cancel honored AFTER the (shielded, billed) digest/verify cloud call: a
+        // cancel that landed during the call must NOT persist + enqueue a digest on
+        // this resume path. Unlike the full run, digest-only has no later stage()
+        // checkpoint, so without this it would mint + hand off after a cancel. The
+        // status-silent token leaves the meeting `ready` + digest-pending, so it
+        // self-heals/retries later. (Covers a verify-cancel too: that returns
+        // `.produced(draft)`, but the token is still cancelled here.)
+        if cancelToken.isCancelled { return false }
 
         switch outcome {
         case .produced(let clean):
             // Deterministic re-mint with the digest stored on the EXISTING notes
             // (no notes change): re-render is unnecessary (markdown unchanged);
             // re-build the payload so `memory_digest` rides it, write it, upsert
-            // + enqueue in one transaction, clear the marker, kick.
+            // + enqueue in one transaction, clear the marker, kick. The replayed
+            // scoped set is already on `notes` (reloaded above), so the re-mint
+            // preserves it.
             notes.memoryDigest = clean
             let payload = EvidencePayloadBuilder.build(
                 meeting: meeting, segments: segments, notes: notes, user: user)
@@ -2790,12 +3100,8 @@ public actor ProcessingPipeline {
     }
 }
 
-// MARK: - ProcessingDispatching conformance (the listener's dispatch seam)
-
-extension ProcessingPipeline: ProcessingDispatching {
-    public func dispatch(meetingID: MeetingID) async {
-        // G10 §1: the listener's post-ready re-mint is an AUTO path — refuse a
-        // user-cancelled meeting (only the user's Process re-runs it).
-        _ = try? await dispatchProcessing(meetingID: meetingID, refuseCancelled: true)
-    }
-}
+// F1 Inc2 (C7): the `ProcessingDispatching` conformance was removed — the
+// Meet-listener post-ready re-mint now routes through the durable queue
+// (`QueueProcessingDispatcher`, set on the `dispatcherBox`), so the queue is the
+// SINGLE admission path for full-pipeline work. `dispatchProcessing` has exactly
+// one production caller: the worker's executor closure in AppEnvironment.

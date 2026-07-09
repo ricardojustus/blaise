@@ -67,8 +67,7 @@ chrome.runtime.onMessage.addListener((message) => {
   return false;
 });
 
-// Retry alarm: chrome.alarms minimum period is 30 s (0.5 min, Chrome 120+,
-// verified in research/c12_meet_extension.md §2).
+// Retry alarm: chrome.alarms minimum period is 30 s (0.5 min, Chrome 120+).
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(RETRY_ALARM, { periodInMinutes: 0.5 });
 });

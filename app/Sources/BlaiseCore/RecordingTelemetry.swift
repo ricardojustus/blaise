@@ -240,3 +240,96 @@ public struct LevelMeter: Equatable, Sendable {
             others: others.channelLevel(now: now, since: recordingStart))
     }
 }
+
+// MARK: - Silence auto-pause watchdog (§3)
+
+/// An orthogonal capture-path fallback to the `MeetCallTracker` end-detector:
+/// when BOTH tracks — the mic ("you") and the system ("others") — sit below the
+/// silence floor continuously for `thresholdSeconds`, fire ONCE to auto-pause
+/// the recording (resumable, crash-safe; the caller routes through the normal
+/// pause path, which never touches captured audio). Pure and clock-injected:
+/// the caller passes a MONOTONIC uptime value, so the silence timer is
+/// deterministic under test. It only SIGNALS — the caller performs the pause and
+/// `disarm()`s on a true return, so it fires at most once per recording session.
+///
+/// The clock is process uptime (`ProcessInfo.processInfo.systemUptime` at the
+/// call sites), NOT wall-clock `Date`: a sleep/wake or NTP step never advances
+/// it across an unobserved gap, so a clock jump can never make the elapsed
+/// silence reach the threshold instantly and false-fire. This matches the
+/// in-repo `MeetCallTracker` watchdog, which confirms on the same monotonic
+/// clock for exactly this reason.
+///
+/// Distinct from `LevelMeterChannel`'s per-channel UI silence glance: this is a
+/// single dual-track timer over the RAW per-buffer RMS, defaulting to a much
+/// longer threshold (10 min), and it pauses rather than tinting a bar. It reuses
+/// the SAME silence floor as the meter (one floor, never a second constant).
+public struct SilenceWatchdog: Equatable, Sendable {
+    /// The silence floor, reused from the per-channel meter logic.
+    public static let silenceFloor = LevelMeterChannel.silenceFloor
+
+    /// Master enable (Settings, default on). A disabled watchdog never fires.
+    public var enabled: Bool
+    /// Sustained dual-silence this long (s) → fire. Default 600 (10 min).
+    public var thresholdSeconds: TimeInterval
+    /// Armed between a recording start/resume and the next pause/stop, and
+    /// cleared after firing (the at-most-once-per-session guard).
+    public private(set) var armed = false
+    /// The last MONOTONIC uptime (s) EITHER track was above the floor — the
+    /// silence clock's origin. Set to the arm uptime so a recording silent from
+    /// the very start still waits the full threshold. Monotonic (process
+    /// uptime), so an unobserved sleep/wake gap does not advance it.
+    public private(set) var lastAboveFloorUptime: TimeInterval?
+
+    public init(enabled: Bool = true, thresholdSeconds: TimeInterval = 600) {
+        self.enabled = enabled
+        self.thresholdSeconds = thresholdSeconds
+    }
+
+    /// Arm for a new live session (recording start / resume): the silence clock
+    /// starts at `nowUptime` (a monotonic process-uptime value).
+    public mutating func arm(nowUptime: TimeInterval) {
+        armed = true
+        lastAboveFloorUptime = nowUptime
+    }
+
+    /// Disarm (pause / stop, or after firing). A disarmed watchdog never fires.
+    public mutating func disarm() {
+        armed = false
+    }
+
+    /// Ingest one level sample (raw per-channel RMS) observed at `nowUptime` (a
+    /// monotonic process-uptime value). Any above-floor sample on EITHER track
+    /// resets the silence clock. Returns true exactly when the recording should
+    /// auto-pause NOW: armed, enabled, and BOTH tracks below the floor
+    /// continuously for `thresholdSeconds` of uptime. The caller pauses and
+    /// `disarm()`s on a true return.
+    public mutating func note(you: Double, others: Double, nowUptime: TimeInterval) -> Bool {
+        guard enabled, armed else { return false }
+        if you > Self.silenceFloor || others > Self.silenceFloor {
+            lastAboveFloorUptime = nowUptime
+        }
+        let since = lastAboveFloorUptime ?? nowUptime
+        return nowUptime - since >= thresholdSeconds
+    }
+}
+
+/// The two settings gating the silence auto-pause watchdog, read at each arm
+/// (recording start / resume) so a change takes effect on the next session
+/// without a relaunch. Mirrors `AutomationSettings`.
+public enum SilenceAutoPauseSettings {
+    /// Master toggle, default ON.
+    public static let enabledKey = "recording.silenceAutoPause.enabled"
+    public static let defaultEnabled = true
+    /// Sustained dual-silence threshold (s), default 600 (10 min).
+    public static let thresholdSecondsKey = "recording.silenceAutoPause.thresholdSeconds"
+    public static let defaultThresholdSeconds: TimeInterval = 600
+
+    public static func enabled(from settings: SettingsStore) async -> Bool {
+        (try? await settings.get(enabledKey, as: Bool.self)) ?? nil ?? defaultEnabled
+    }
+
+    public static func thresholdSeconds(from settings: SettingsStore) async -> TimeInterval {
+        (try? await settings.get(thresholdSecondsKey, as: TimeInterval.self)) ?? nil
+            ?? defaultThresholdSeconds
+    }
+}

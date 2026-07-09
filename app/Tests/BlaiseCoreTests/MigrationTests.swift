@@ -8,7 +8,7 @@ import Testing
         let database = try makeDatabase()
         try database.pool.read { db in
             let applied = try BlaiseDatabase.migrator.appliedMigrations(db)
-            #expect(applied == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"])
+            #expect(applied == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
 
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)")
             let structured = columns.first { $0["name"] == "structured" }
@@ -131,10 +131,13 @@ import Testing
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"])
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)").map { $0["name"] as String }
             #expect(columns.contains("structured"))
             #expect(columns.contains("memory_digest"), "v14 adds the nullable memory_digest column")
+            #expect(
+                columns.contains("scoped_alias_bindings"),
+                "v17 adds the nullable scoped_alias_bindings column (T3.1 AC2 resume parity)")
             let meetingColumns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting)").map { $0["name"] as String }
             #expect(meetingColumns.contains("processing_note"))
             #expect(meetingColumns.contains("title_source"))
@@ -160,7 +163,7 @@ import Testing
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"])
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
             let note = try Row.fetchOne(db, sql: "SELECT processing_note, title, captured, title_source FROM meeting")
             #expect(note?["processing_note"] == nil)
             #expect(note?["title"] == "v2 meeting")

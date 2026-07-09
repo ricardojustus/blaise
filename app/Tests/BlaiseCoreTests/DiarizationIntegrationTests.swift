@@ -10,7 +10,7 @@ import Testing
 
 private let repoRoot = VocabFixtures.repoRoot
 private let icsiClip = VocabFixtures.fixture("icsi_sample/Bmr001_excerpt_5min.wav")
-private let researchVenv = repoRoot.appendingPathComponent("research/asr/.venv", isDirectory: true)
+private let researchVenv = RegressionPin.asrVenv
 private let realHFHome = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".cache/huggingface", isDirectory: true)
 private let fluidAudioModelsParent = FileManager.default.homeDirectoryForCurrentUser

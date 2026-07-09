@@ -10,7 +10,23 @@ import Testing
 enum RegressionPin {
     static let repoRoot = VocabFixtures.repoRoot
     static var directory: URL { repoRoot.appendingPathComponent("fixtures/icsi_sample", isDirectory: true) }
-    static var auditsDir: URL { repoRoot.appendingPathComponent("audits/c7", isDirectory: true) }
+    /// A maintainer-local path the public suite never touches: the gated
+    /// real-engine tests skip-guard when the dir is absent, so a clean clone
+    /// never reaches it. Overridable per-path via an env var (set in
+    /// scripts/blaise.env for a private real-engine run); the default is a
+    /// local, gitignored scratch dir under the repo root.
+    private static func localEnvPath(_ envVar: String, default def: String) -> URL {
+        let rel = ProcessInfo.processInfo.environment[envVar].flatMap { $0.isEmpty ? nil : $0 } ?? def
+        return repoRoot.appendingPathComponent(rel, isDirectory: true)
+    }
+    /// Output dir for the maintainer's Tier-2 real-engine run records.
+    static var auditsDir: URL { localEnvPath("BLAISE_TIER2_OUTPUT_DIR", default: ".tier2-runs") }
+    /// The maintainer's real ASR Python virtualenv (real-engine integration tests).
+    static var asrVenv: URL { localEnvPath("BLAISE_ASR_VENV", default: ".asr-venv") }
+    /// The maintainer's real ASR engine-output / oracle directory.
+    static var asrOutDir: URL { localEnvPath("BLAISE_ASR_OUT", default: ".asr-out") }
+    /// The maintainer's persistent C6 notes-engine data root (provisioned venv).
+    static var notesDataRoot: URL { localEnvPath("BLAISE_C6_DATAROOT", default: ".c6-notes-dataroot") }
 
     static var rawASRURL: URL { directory.appendingPathComponent("raw_asr.json") }
     static var diarizationURL: URL { directory.appendingPathComponent("diarization.json") }
@@ -414,13 +430,12 @@ enum NotesStructuralCheck {
 
 // MARK: - Real-engine pipeline builder (Tier-2 / mint / regeneration ACs)
 
-private let researchVenv = RegressionPin.repoRoot.appendingPathComponent("research/asr/.venv", isDirectory: true)
+private let researchVenv = RegressionPin.asrVenv
 private let realHFHome = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".cache/huggingface", isDirectory: true)
 private let fluidAudioModelsParent = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/FluidAudio/Models", isDirectory: true)
-private let c6NotesDataRoot = RegressionPin.repoRoot
-    .appendingPathComponent("research/notes/dataroot", isDirectory: true)
+private let c6NotesDataRoot = RegressionPin.notesDataRoot
 
 struct RealPipelineStack {
     let dataRoot: URL
@@ -575,6 +590,13 @@ func mintICSIRegressionPins() async throws {
     try copyOverwriting(paths.rawASRURL(meeting.id), to: RegressionPin.rawASRURL)
     try copyOverwriting(paths.diarizationURL(meeting.id), to: RegressionPin.diarizationURL)
     try copyOverwriting(paths.transcriptURL(meeting.id), to: RegressionPin.finalURL)
+    // X2: normalize the final transcript's meeting_id to the corpus id so all
+    // pins agree (the per-mint runtime ULID is synthetic; the byte-pin ignores
+    // meeting ids entirely — PinnedSegment strips them). pin_manifest already
+    // uses "Bmr001"; this keeps transcript_pinned consistent across re-mints.
+    let normalizedFinal = try String(contentsOf: RegressionPin.finalURL, encoding: .utf8)
+        .replacingOccurrences(of: meeting.id, with: "Bmr001")
+    try normalizedFinal.write(to: RegressionPin.finalURL, atomically: true, encoding: .utf8)
 
     // --- d. Byte-pin the deterministic Tier-1 transform over the FROZEN inputs ---
     let audioInfo = try WAVHeader.read(at: sampleURL)

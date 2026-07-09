@@ -197,9 +197,17 @@ final class PipelineMockNotes: SummarizationEngine, @unchecked Sendable {
     let costDescriptor: EngineCostDescriptor? = nil
     let configDescriptors: [EngineConfigDescriptor] = []
 
+    /// Decision B: read-through of the scriptable State flag (defaults to the
+    /// protocol's `false`; a test flips it to model the subscription engine).
+    var suppressesAutoFallback: Bool { state.withLock { $0.suppressesAutoFallback } }
+
     struct State {
         var error: EngineError?
         var prepareError: EngineError?
+        /// Decision B: when true, this engine reports `suppressesAutoFallback` and
+        /// the pipeline must leave a fallback-trigger failure notes-PENDING rather
+        /// than hop to the registered fallback (the subscription-engine policy).
+        var suppressesAutoFallback = false
         var summary = "Resumo da reunião de teste."
         var actionOwner = "Fábio"
         var mapping: [SpeakerNameProposal] = []

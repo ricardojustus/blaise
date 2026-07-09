@@ -7,7 +7,7 @@ import Testing
     @Test func migrationCreatesAllTables() throws {
         let database = try makeDatabase()
         let tables = try database.tableNames()
-        for expected in ["meeting", "transcript_segment", "meeting_notes", "transcript_fts", "handoff_queue", "app_setting", "action_item_state", "name_correction", "speaker_rename"] {
+        for expected in ["meeting", "transcript_segment", "meeting_notes", "transcript_fts", "handoff_queue", "app_setting", "action_item_state", "name_correction", "speaker_rename", "processing_queue", "notes_fts"] {
             #expect(tables.contains(expected), "missing table \(expected)")
         }
     }
@@ -160,8 +160,10 @@ import Testing
         // schemaVersion = COUNT of applied migrations: v1 + v2 (C2) + v3 (C6) +
         // v4/v5 (C10) + v6 (C11) + v7 (V1.1) + v8 (C14) + v9 (G7) + v10 (G2) +
         // v11 (G10) + v12 (G11) + v13 (G12: meeting.title_source) + v14 (G14:
-        // memory_digest column + the cloud_spend_receipt CHECK-rebuild) = 14.
-        #expect(health.schemaVersion == 14)
+        // memory_digest column + the cloud_spend_receipt CHECK-rebuild) + v15
+        // (F1: processing_queue substrate) + v16 (F2: notes_fts) + v17 (T3.1:
+        // scoped_alias_bindings column) = 17.
+        #expect(health.schemaVersion == 17)
         #expect(health.journalMode == "wal")
     }
 }

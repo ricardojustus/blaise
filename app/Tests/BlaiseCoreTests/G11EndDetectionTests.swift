@@ -420,8 +420,14 @@ struct CalendarReliabilityTests {
 
 @Suite("G11 AC8: Upcoming-meetings list model")
 struct UpcomingMeetingsTests {
-    private let spCal = UpcomingMeetings.saoPauloCalendar
-    /// A fixed reference noon in São Paulo so "today" scoping is deterministic.
+    // A fixed UTC-3 calendar so this suite's day-scoping is deterministic on any
+    // runner, independent of the app's now-system-zone default (X1).
+    private let spCal: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(secondsFromGMT: -3 * 3600)!
+        return c
+    }()
+    /// A fixed reference noon (UTC-3) so "today" scoping is deterministic.
     private var noonSP: Date {
         spCal.date(from: DateComponents(
             timeZone: TimeZone(identifier: "America/Sao_Paulo"),
@@ -500,5 +506,103 @@ struct UpcomingMeetingsTests {
     @Test("empty input → empty list (the section collapses, no chrome)")
     func emptyCollapses() {
         #expect(UpcomingMeetings.rows(from: [], now: noonSP, userEmail: "me@example.test").isEmpty)
+    }
+}
+
+@Suite("Calendar provider merge")
+struct CalendarEventMergerTests {
+    @Test("EventKit and Google copies of the same Meet event collapse and keep richer fields")
+    func meetCopiesCollapse() {
+        let eventKit = CalendarEventSnapshot(
+            eventIdentifier: "eventkit:1",
+            title: "Roadmap Review",
+            start: at(3600),
+            end: at(5400),
+            location: "Conference Room",
+            attendees: [.init(name: "Ana Lima", email: "ana@example.test")])
+        let google = CalendarEventSnapshot(
+            eventIdentifier: "google:primary:abc",
+            title: "Roadmap Review",
+            start: at(3600),
+            end: at(5400),
+            notes: "https://meet.google.com/abc-defg-hij",
+            attendees: [
+                .init(name: "Ana Lima", email: "ana@example.test"),
+                .init(name: "Robin Cole", email: "robin@example.test"),
+            ])
+
+        let merged = CalendarEventMerger.merged([eventKit, google])
+
+        let row = try! #require(merged.first)
+        #expect(merged.count == 1)
+        #expect(row.eventIdentifier == "eventkit:1")
+        #expect(row.location == "Conference Room")
+        #expect(row.notes == "https://meet.google.com/abc-defg-hij")
+        #expect(row.attendees.map(\.email) == ["ana@example.test", "robin@example.test"])
+    }
+
+    @Test("non-Meet events dedupe by title and scheduled span")
+    func nonMeetCopiesCollapse() {
+        let first = CalendarEventSnapshot(
+            eventIdentifier: "eventkit:2", title: "Design Crit",
+            start: at(600), end: at(1800),
+            attendees: [.init(name: "Morgan")])
+        let second = CalendarEventSnapshot(
+            eventIdentifier: "google:primary:2", title: "Design Crit",
+            start: at(600), end: at(1800),
+            attendees: [.init(name: "Jordan")])
+
+        let merged = CalendarEventMerger.merged([first, second])
+
+        #expect(merged.count == 1)
+        #expect(merged.first?.attendees.map(\.name) == ["Morgan", "Jordan"])
+    }
+
+    @Test("sub-minute start drift between providers still collapses the same Meet event")
+    func subMinuteDriftCollapses() {
+        // Same occurrence, 15 s apart — the old exact-millis key split these
+        // into duplicate rows; minute-resolution collapses them.
+        let eventKit = CalendarEventSnapshot(
+            eventIdentifier: "eventkit:drift", title: "Standup",
+            start: at(3600), end: at(5400),
+            notes: "https://meet.google.com/abc-defg-hij",
+            attendees: [.init(name: "Sam")])
+        let google = CalendarEventSnapshot(
+            eventIdentifier: "google:primary:drift", title: "Standup",
+            start: at(3615), end: at(5415),
+            notes: "https://meet.google.com/abc-defg-hij",
+            attendees: [.init(name: "Sam"), .init(name: "Pat")])
+
+        let merged = CalendarEventMerger.merged([eventKit, google])
+
+        #expect(merged.count == 1)
+        #expect(merged.first?.attendees.map(\.name) == ["Sam", "Pat"])
+    }
+
+    @Test("an event bridging two buckets unifies them — no duplicate row, no orphaned attendees")
+    func bridgingEventUnifiesBuckets() {
+        // `a` is keyed by Meet code; `b` is a distinct title-only bucket; the
+        // `bridge` shares the Meet code with `a` AND the title/span with `b`, so
+        // its two keys point at two already-distinct buckets. First-key-wins left
+        // `b` orphaned (2 rows); union-find unifies all three.
+        let a = CalendarEventSnapshot(
+            eventIdentifier: "ek:a", title: "Alpha",
+            start: at(600), end: at(1800),
+            notes: "https://meet.google.com/abc-defg-hij",
+            attendees: [.init(name: "Ann")])
+        let b = CalendarEventSnapshot(
+            eventIdentifier: "ek:b", title: "Beta",
+            start: at(600), end: at(1800),
+            attendees: [.init(name: "Bo")])
+        let bridge = CalendarEventSnapshot(
+            eventIdentifier: "google:c", title: "Beta",
+            start: at(600), end: at(1800),
+            notes: "https://meet.google.com/abc-defg-hij",
+            attendees: [.init(name: "Cy")])
+
+        let merged = CalendarEventMerger.merged([a, b, bridge])
+
+        #expect(merged.count == 1)
+        #expect(Set(merged.first?.attendees.map(\.name) ?? []) == ["Ann", "Bo", "Cy"])
     }
 }

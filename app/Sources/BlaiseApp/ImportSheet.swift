@@ -85,13 +85,12 @@ struct ImportSheet: View {
                     startedAt: started,
                     attendees: attendees,
                     meetingCode: code.isEmpty ? nil : code)
-                // The new meeting appears immediately (observation) with
-                // live stage progress; select it and kick processing
-                // (status-dependent rule: fresh import is non-ready →
-                // process()).
+                // The new meeting appears immediately (observation); select it
+                // and ENQUEUE processing (F1 Inc2; origin .user — a fresh import
+                // is non-ready so the worker runs the full process class).
                 uiState.selectedMeetingID = meeting.id
                 onDismiss()
-                _ = try? await environment.pipeline.dispatchProcessing(meetingID: meeting.id)
+                await environment.processingQueue.enqueue(meeting.id, origin: .user)
             } catch {
                 importError = "\(error)"
                 importing = false

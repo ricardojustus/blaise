@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fetches the pinned standalone uv binary into vendor/uv/ for bundling into
-# Blaise.app (research/c3_asr_engines.md §2: app-managed venv, vendored uv;
+# Blaise.app (app-managed venv, vendored uv;
 # dual MIT/Apache-2.0 — vendoring permitted with notice). Idempotent: verifies
 # and keeps an existing binary.
 #

@@ -44,12 +44,15 @@ struct AutomationTab: View {
     @Environment(AppEnvironment.self) private var appEnv
     @State private var enabled = true
     @State private var resumeWindowMinutes = AutomationSettings.defaultResumeWindowSeconds / 60
+    @State private var silenceAutoPauseEnabled = SilenceAutoPauseSettings.defaultEnabled
+    @State private var silenceThresholdMinutes = Int(SilenceAutoPauseSettings.defaultThresholdSeconds / 60)
     @State private var deniedBannerDismissed = false
     @State private var loaded = false
 
     private static let deniedBannerKey = "automation.deniedBannerDismissed"
 
     var body: some View {
+        @Bindable var google = appEnv.googleCalendar
         Form {
             Section("Meeting automation") {
                 Toggle("Meeting automation (notifications, auto-stop)", isOn: $enabled)
@@ -85,6 +88,133 @@ struct AutomationTab: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
+            Section("Silence auto-pause") {
+                Toggle("Auto-pause after sustained silence", isOn: $silenceAutoPauseEnabled)
+                    .onChange(of: silenceAutoPauseEnabled) { _, newValue in
+                        guard loaded else { return }
+                        Task {
+                            try? await appEnv.settings.set(
+                                SilenceAutoPauseSettings.enabledKey, to: newValue)
+                        }
+                    }
+                Stepper(value: $silenceThresholdMinutes, in: 1 ... 60) {
+                    Text("Silence threshold: \(silenceThresholdMinutes) min")
+                }
+                .onChange(of: silenceThresholdMinutes) { _, newValue in
+                    guard loaded else { return }
+                    Task {
+                        try? await appEnv.settings.set(
+                            SilenceAutoPauseSettings.thresholdSecondsKey, to: Double(newValue * 60))
+                    }
+                }
+                .disabled(!silenceAutoPauseEnabled)
+                Text(
+                    "If both your microphone and the meeting audio stay silent for this long, the recording pauses by itself (resumable). It never fires while either side has sound."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Section("Calendars") {
+                // Apple Calendar — on/off + per-calendar picker.
+                switch appEnv.calendarSuggestions.access {
+                case .granted:
+                    Toggle(
+                        "Apple Calendar",
+                        isOn: Binding(
+                            get: { appEnv.calendarSuggestions.appleEnabled },
+                            set: { value in
+                                appEnv.calendarSuggestions.setAppleEnabled(value)
+                                Task { await appEnv.calendarSourcesChanged() }
+                            }))
+                    if appEnv.calendarSuggestions.appleEnabled {
+                        calendarPicker(
+                            calendars: appEnv.calendarSuggestions.appleCalendars,
+                            hidden: appEnv.calendarSuggestions.appleHiddenCalendarIDs
+                        ) { id, shown in
+                            appEnv.calendarSuggestions.setAppleCalendar(id, shown: shown)
+                            Task { await appEnv.calendarSourcesChanged() }
+                        }
+                    }
+                case .notDetermined:
+                    LabeledContent("Apple Calendar") {
+                        Button("Enable") {
+                            Task {
+                                await appEnv.calendarSuggestions.requestAccessAndLoad(
+                                    userEmail: appEnv.userEmail)
+                                await appEnv.calendarSourcesChanged()
+                            }
+                        }
+                    }
+                case .denied:
+                    LabeledContent("Apple Calendar") {
+                        Text("Off (System Settings)").foregroundStyle(.orange)
+                    }
+                }
+
+                // Google Calendar — connect + per-calendar picker.
+                Toggle(
+                    "Google Calendar",
+                    isOn: Binding(
+                        get: { google.enabled },
+                        set: { value in
+                            google.setEnabled(value)
+                            Task { await appEnv.calendarSourcesChanged() }
+                        }))
+                TextField("OAuth desktop client ID", text: $google.clientID)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        Task {
+                            await google.saveSettings()
+                            await appEnv.calendarSourcesChanged()
+                        }
+                    }
+                HStack {
+                    Button("Save") {
+                        Task {
+                            await google.saveSettings()
+                            await appEnv.calendarSourcesChanged()
+                        }
+                    }
+                    Button(google.connected ? "Reconnect" : "Connect") {
+                        Task {
+                            await google.connect()
+                            await google.listCalendars()
+                            await appEnv.calendarSourcesChanged()
+                        }
+                    }
+                    .disabled(google.authorizing)
+                    if google.connected {
+                        Button("Disconnect") {
+                            Task {
+                                await google.disconnect()
+                                await appEnv.calendarSourcesChanged()
+                            }
+                        }
+                    }
+                    if google.refreshing || google.authorizing {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+                if google.connected {
+                    Label("Connected", systemImage: "checkmark.circle")
+                        .foregroundStyle(Theme.accent)
+                }
+                if let error = google.lastError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+                if google.connected && google.enabled {
+                    calendarPicker(
+                        calendars: google.googleCalendars,
+                        hidden: google.hiddenCalendarIDs
+                    ) { id, shown in
+                        google.setGoogleCalendar(id, shown: shown)
+                        Task { await appEnv.calendarSourcesChanged() }
+                    }
+                }
+            }
             if appEnv.captureStatus.notificationsDenied && !deniedBannerDismissed {
                 Section {
                     QuietBanner(
@@ -103,13 +233,41 @@ struct AutomationTab: View {
         }
         .formStyle(.grouped)
         .task {
+            await appEnv.googleCalendar.load()
+            await appEnv.googleCalendar.listCalendars()
+            await appEnv.calendarSuggestions.load()
             enabled = await AutomationSettings.enabled(from: appEnv.settings)
             resumeWindowMinutes =
                 await AutomationSettings.resumeWindowSeconds(from: appEnv.settings) / 60
+            silenceAutoPauseEnabled = await SilenceAutoPauseSettings.enabled(from: appEnv.settings)
+            silenceThresholdMinutes =
+                Int((await SilenceAutoPauseSettings.thresholdSeconds(from: appEnv.settings) / 60).rounded())
             deniedBannerDismissed =
                 (try? await appEnv.settings.get(Self.deniedBannerKey, as: Bool.self))
                 ?? nil ?? false
             loaded = true
+        }
+    }
+
+    /// A collapsible "show calendars" checklist for a source — each calendar a
+    /// checkbox (checked = shown). Hidden when the source has no calendars.
+    @ViewBuilder
+    private func calendarPicker(
+        calendars: [CalendarChoice], hidden: Set<String>,
+        toggle: @escaping (String, Bool) -> Void
+    ) -> some View {
+        if !calendars.isEmpty {
+            DisclosureGroup("Show calendars") {
+                ForEach(calendars) { calendar in
+                    Toggle(
+                        calendar.name,
+                        isOn: Binding(
+                            get: { !hidden.contains(calendar.id) },
+                            set: { toggle(calendar.id, $0) }))
+                        .toggleStyle(.checkbox)
+                }
+            }
+            .font(.callout)
         }
     }
 }
@@ -316,6 +474,7 @@ struct IdentityHandoffTab: View {
     @State private var identity: IdentityModel?
     @State private var handoff: HandoffSettingsModel?
     @State private var queue: QueuePanelModel?
+    @State private var processing: ProcessingQueueModel?
     @State private var revealedSecret: String?
 
     var body: some View {
@@ -341,6 +500,9 @@ struct IdentityHandoffTab: View {
             if let queue {
                 QueuePanelSection(model: queue, snapshot: appEnv.handoffStatus.snapshot)
             }
+            if let processing {
+                ProcessingQueueSection(model: processing, snapshot: appEnv.processingStatus.snapshot)
+            }
         }
         .formStyle(.grouped)
         .task {
@@ -354,6 +516,13 @@ struct IdentityHandoffTab: View {
                 let queueModel = QueuePanelModel(database: appEnv.database, kicker: appEnv.worker)
                 await queueModel.refresh()
                 queue = queueModel
+                let pipeline = appEnv.pipeline
+                let processingModel = ProcessingQueueModel(
+                    database: appEnv.database, worker: appEnv.processingQueue,
+                    settings: appEnv.settings,
+                    cancelRunning: { meetingID in _ = await pipeline.cancel(meetingID: meetingID) })
+                await processingModel.refresh()
+                processing = processingModel
             }
         }
     }
@@ -432,8 +601,23 @@ private struct HandoffSection: View {
             case .ssh:
                 TextField("User", text: $model.user)
                 TextField("Identity file", text: $model.identityFile)
-                TextField("Hosts (one per line)", text: $model.hostsText, axis: .vertical)
-                    .lineLimit(2 ... 4)
+                // A TextEditor, not a vertical TextField: on macOS, Return in a
+                // `TextField(axis: .vertical)` SUBMITS the field instead of
+                // inserting a newline, so "one per line" was impossible to type.
+                // (The parser also accepts commas — HandoffSettingsModel.hosts.)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Hosts (one per line, or comma-separated)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $model.hostsText)
+                        .font(.callout.monospaced())
+                        .frame(minHeight: 52, maxHeight: 96)
+                        .padding(4)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .strokeBorder(Color.secondary.opacity(0.3)))
+                        .accessibilityLabel("Evidence Store hosts, one per line")
+                }
                 TextField("Remote root", text: $model.remoteRoot)
             case .localFolder:
                 LabeledContent("Folder") {
@@ -457,6 +641,17 @@ private struct HandoffSection: View {
             Toggle("Include memory digest", isOn: $model.includeMemoryDigest)
                 .accessibilityLabel("Include memory digest in the evidence payload")
             Text("A second machine-facing render for the knowledge graph. On by default.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            // The verify/repair pass — a third synthesis call that audits the
+            // digest against the transcript and corrects grounding errors before
+            // it ships. Only meaningful when the digest is included, so it is
+            // disabled when "Include memory digest" is OFF.
+            Toggle("Verify & repair memory digest", isOn: $model.verifyMemoryDigest)
+                .disabled(!model.includeMemoryDigest)
+                .accessibilityLabel("Verify and repair the memory digest before sending")
+            Text("Runs a second pass that audits the digest against the transcript and corrects attribution/fact errors before sending. Higher accuracy; roughly doubles the digest's cloud cost.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -593,6 +788,70 @@ private struct QueuePanelSection: View {
     }
 }
 
+// MARK: - Processing queue panel (F1 Inc2)
+
+private struct ProcessingQueueSection: View {
+    @Bindable var model: ProcessingQueueModel
+    let snapshot: ProcessingSnapshot
+
+    var body: some View {
+        Section("Processing Queue") {
+            LabeledContent("State") {
+                Text(stateLabel)
+                    .foregroundStyle(snapshot.state == .waitingRetry ? .orange : .secondary)
+            }
+            if snapshot.pendingCount > 0 {
+                LabeledContent("Pending") { Text("\(snapshot.pendingCount)").monospacedDigit() }
+            }
+            Toggle("Pause processing", isOn: Binding(
+                get: { model.paused },
+                set: { value in Task { await model.setPaused(value) } }))
+                .help("Finish the in-flight meeting, then stop processing new ones until resumed.")
+
+            // Failed jobs: retriable, one row each.
+            ForEach(model.failedJobs, id: \.id) { job in
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(job.meetingID) · \(job.attempts) attempt\(job.attempts == 1 ? "" : "s")")
+                            .font(.system(size: 11, design: .monospaced))
+                        if let error = job.lastError, !error.isEmpty {
+                            Text(error).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                    }
+                    Spacer()
+                    Button("Retry") { Task { await model.retry(job) } }
+                }
+            }
+            // Live (pending/running) jobs: cancellable.
+            ForEach(model.liveJobs, id: \.id) { job in
+                HStack {
+                    Text("\(job.meetingID) · \(job.state.rawValue)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel", role: .destructive) { Task { await model.cancel(job) } }
+                }
+            }
+            HStack {
+                Button("Refresh") { Task { await model.refresh() } }
+                Spacer()
+                Button("Retry All") { Task { await model.retryAllFailed() } }
+                    .disabled(model.failedJobs.isEmpty)
+            }
+        }
+    }
+
+    private var stateLabel: String {
+        switch snapshot.state {
+        case .idle: return "Idle"
+        case .processing: return "Processing…"
+        case .pending: return "Queued (\(snapshot.pendingCount))"
+        case .waitingRetry: return "\(snapshot.failedCount) failed"
+        case .paused: return "Paused"
+        }
+    }
+}
+
 // MARK: - Usage tab
 
 struct UsageTab: View {
@@ -649,6 +908,15 @@ struct UsageTab: View {
                         }
                     }
                 }
+
+                // Manual on-demand refresh (sibling parity with the delivery /
+                // processing queues). Spend does not auto-tick live; this is
+                // the correctness guarantee regardless of `.task` re-fire.
+                HStack {
+                    Button("Refresh") { Task { await model.refresh() } }
+                        .accessibilityIdentifier("usage-refresh")
+                    Spacer()
+                }
             }
             Section("Storage") {
                 LabeledContent("Data root") {
@@ -663,8 +931,10 @@ struct UsageTab: View {
         .task {
             if model == nil {
                 let usage = UsageModel(ledger: appEnv.ledger, settings: appEnv.settings)
-                await usage.load()
+                await usage.load()  // load BEFORE publish -> no empty-section flash on first open
                 model = usage
+            } else {
+                await model?.load()  // re-fire (view node recreated) -> refresh
             }
         }
     }

@@ -25,3 +25,7 @@ extension MeetingNotes: FetchableRecord, PersistableRecord {
 extension HandoffItem: FetchableRecord, PersistableRecord {
     public static let databaseTableName = "handoff_queue"
 }
+
+extension ProcessingJob: FetchableRecord, PersistableRecord {
+    public static let databaseTableName = "processing_queue"
+}

@@ -8,7 +8,7 @@ private let repoRoot = VocabFixtures.repoRoot
 /// Persistent C6 dataRoot (venv provisioned once by the gated smoke step;
 /// gitignored). The engine points AT it directly so the sentinel machinery
 /// is exercised on the production path.
-private let c6DataRoot = repoRoot.appendingPathComponent("research/notes/dataroot", isDirectory: true)
+private let c6DataRoot = RegressionPin.notesDataRoot
 private let realHFHome = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".cache/huggingface", isDirectory: true)
 
@@ -65,7 +65,7 @@ func makeRealNotesEngine() async throws -> MLXSummarizationEngine {
         guard notesStackPresent() else {
             recordTestSkip(
                 "mlxEngineGeneratesSchemaValidNotesOnRealExcerpt",
-                reason: "C6 notes stack missing (provisioned venv at research/notes/dataroot or Gemma HF snapshot)")
+                reason: "C6 notes stack missing (provisioned venv at the maintainer-local notes data root or Gemma HF snapshot)")
             return
         }
 

@@ -130,6 +130,7 @@ struct BlaiseApplication: App {
         }
         .defaultSize(width: 1440, height: 900)
         .commands {
+            ProcessingQueueCommands()
             CommandGroup(after: .newItem) {
                 if let environment {
                     Button("Import Meeting Audio…") {
@@ -137,6 +138,9 @@ struct BlaiseApplication: App {
                         ImportPanel.present(uiState: environment.uiState)
                     }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
+                    Button("Reprocess All Meetings…") {
+                        environment.uiState.reprocessAllRequested = true
+                    }
                 }
             }
             CommandGroup(after: .textEditing) {
@@ -181,7 +185,7 @@ struct BlaiseApplication: App {
         // StatusBarController (NSStatusItem + NSPopover), installed by the app
         // delegate after launch. SwiftUI's MenuBarExtra spun an infinite render
         // loop with the live ticker and stack-overflowed when the dropdown was
-        // opened during recording; see notes/menubar-live-content.md.
+        // opened during recording.
 
         Settings {
             if let environment {
@@ -191,6 +195,31 @@ struct BlaiseApplication: App {
                     .tint(Theme.accent)
                     .id(DesignSelection.shared.direction)  // live design switch
             }
+        }
+
+        // F1 Inc2: a dedicated, openable Processing Queue window (View ▸
+        // Processing Queue, ⇧⌘0). The live queue IS the way to watch/confirm
+        // processing + Reprocess-all.
+        Window("Processing Queue", id: "processing-queue") {
+            if let environment {
+                ProcessingQueueWindow()
+                    .environment(environment)
+                    .preferredColorScheme(.dark)
+                    .tint(Theme.accent)
+            }
+        }
+        .defaultSize(width: 480, height: 440)
+    }
+}
+
+/// F1 Inc2: opens the Processing Queue window from the menu (needs the view
+/// environment's `openWindow`, so it lives in a `Commands` struct).
+struct ProcessingQueueCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+    var body: some Commands {
+        CommandGroup(after: .windowArrangement) {
+            Button("Processing Queue") { openWindow(id: "processing-queue") }
+                .keyboardShortcut("0", modifiers: [.command, .shift])
         }
     }
 }
@@ -259,6 +288,9 @@ struct MainWindow: View {
                         uiState.importSourceURL = nil
                     }
                 }
+            }
+            .sheet(isPresented: $uiState.reprocessAllRequested) {
+                ReprocessAllSheet { uiState.reprocessAllRequested = false }
             }
             .onDrop(of: [.fileURL], isTargeted: nil) { providers in
                 guard let provider = providers.first else { return false }

@@ -16,7 +16,7 @@ public enum EvidencePayloadBuilder {
 
     /// The notes user-action-items key form on the wire. New payloads always
     /// carry `.current` (`user_action_items`, the G4 rename). `.legacy`
-    /// (`legacy_user_action_items`) exists ONLY so re-materialization of a payload
+    /// (`ric_action_items`) exists ONLY so re-materialization of a payload
     /// minted before G4 can reproduce its stored `version_hash` byte-for-byte —
     /// the same presence-gating discipline that protects pre-v2 `meeting_type`
     /// and pre-G2 `name_substitutions` rows.
@@ -27,7 +27,7 @@ public enum EvidencePayloadBuilder {
         var wireKey: String {
             switch self {
             case .current: return "user_action_items"
-            case .legacy: return "legacy_user_action_items"
+            case .legacy: return "ric_action_items"
             }
         }
     }
@@ -41,11 +41,12 @@ public enum EvidencePayloadBuilder {
         segments: [TranscriptSegment],
         notes: MeetingNotes,
         user: UserIdentity,
-        userActionItemsKey: UserActionItemsKey = .current
+        userActionItemsKey: UserActionItemsKey = .current,
+        digestPromptVersion: DigestPromptVersion = DigestPromptBuilder.shippedVersion
     ) -> Payload {
         let value = payloadValue(
             meeting: meeting, segments: segments, notes: notes, user: user,
-            userActionItemsKey: userActionItemsKey)
+            userActionItemsKey: userActionItemsKey, digestPromptVersion: digestPromptVersion)
         let bytes = CanonicalJSONWriter.write(value)
         return Payload(bytes: bytes, versionHash: sha256Hex(bytes))
     }
@@ -61,7 +62,8 @@ public enum EvidencePayloadBuilder {
         segments: [TranscriptSegment],
         notes: MeetingNotes,
         user: UserIdentity,
-        userActionItemsKey: UserActionItemsKey = .current
+        userActionItemsKey: UserActionItemsKey = .current,
+        digestPromptVersion: DigestPromptVersion = DigestPromptBuilder.shippedVersion
     ) -> CanonicalJSONValue {
         let attendees: [CanonicalJSONValue] = meeting.attendees.map { attendee in
             var fields: [(String, CanonicalJSONValue)] = [("name", .string(attendee.name))]
@@ -91,7 +93,7 @@ public enum EvidencePayloadBuilder {
             ("detailed_notes", .string(structured.detailedNotes)),
             ("decisions", .array(structured.decisions.map(CanonicalJSONValue.string))),
             ("action_items", .array(structured.actionItems.map(actionItemValue))),
-            // G4 rename held the position `legacy_user_action_items` occupied (between
+            // G4 rename held the position `ric_action_items` occupied (between
             // action_items and meeting_type). `.legacy` re-emits the OLD key in
             // that same slot so a pre-G4 payload re-materializes byte-identically
             // to its stored version_hash; new payloads always use `.current`.
@@ -154,10 +156,16 @@ public enum EvidencePayloadBuilder {
             ("pipeline_version", .string(notes.provenance.pipelineVersion)),
         ]
         if notes.memoryDigest != nil {
+            // #102 (F9): `memory_digest.model` denotes the SYNTHESIS engine — the
+            // model that PRODUCED the digest draft (always Sonnet = the engine the
+            // user selected for notes), NOT the per-call combined-audit model. The
+            // audit model (which may be the cheaper Haiku when the toggle is ON)
+            // lives in the cloud-spend RECEIPT, where the ledger truth is keyed.
+            // This provenance field intentionally stays the synthesis model.
             provenanceFields.append((
                 "memory_digest",
                 .object([
-                    ("prompt_version", .string(DigestPromptBuilder.promptVersion)),
+                    ("prompt_version", .string(digestPromptVersion.rawValue)),
                     ("engine", .string(notes.provenance.engine)),
                     ("model", .string(notes.provenance.model)),
                 ])))

@@ -20,6 +20,48 @@ models/
 extension/node_modules/
 extension/.cft/
 
+# Snapshot digests sidecars: unsalted name digests are dictionary-recoverable,
+# so they stay local and are never committed (a fixtures test asserts this).
+extension/test/fixtures/*.digests.json
+
 # Per-run machine-state skip records (the test runner rewrites these each run;
 # environment-gated, never a source of truth) — must not be committed.
 .test-skips/
+
+# Local build override (bundle id + signing identity). This file is read by
+# scripts/env.sh when present; absent, the build uses the public default bundle
+# id (app.blaise.mac). It is the ONLY place a maintainer's private bundle id may
+# live, so it must never be committed.
+scripts/blaise.env
+
+# Maintainer-local tripwire inputs: the literal secret patterns and the
+# low-ambiguity name list the pre-commit hook loads at runtime. Committing a
+# list of confidential terms would itself be the leak — keep them local only.
+scripts/tripwire-secrets.txt
+scripts/tripwire-names.txt
+
+# Defensive: private working surfaces must never appear in this public repo.
+# They live in the separate private working-files repo. These ignores mean a
+# stray copy cannot be staged even with `git add` (and the pre-commit tripwire
+# rejects it even with `git add -f`).
+context/
+audits/
+research/
+notes/
+design/
+private/
+.claude/
+
+# Belt-and-suspenders for local scratch that has historically held real content.
+docs/error log crash*.txt
+fixtures/segments/
+granola-temp-example/
+granola-temp-*
+
+# Maintainer-local real-engine test scratch (neutral defaults for the env-
+# overridable paths in the regression/integration suite; only created by gated
+# real-engine runs, never by CI or a clean clone).
+.tier2-runs/
+.asr-venv/
+.asr-out/
+.c6-notes-dataroot/

@@ -57,7 +57,7 @@ public struct UpcomingMeetingRow: Sendable, Equatable, Identifiable {
 
 public enum UpcomingMeetings {
     /// Builds today's remaining-meeting rows from event snapshots:
-    /// - within `now`'s calendar day (America/Sao_Paulo by default — the user's tz),
+    /// - within `now`'s calendar day (the system time zone by default),
     /// - whose END is still in the future (a meeting whose end passed drops),
     /// - excluding any whose code is in `recordedCodes` (already recorded /
     ///   recording — the row disappears),
@@ -74,7 +74,7 @@ public enum UpcomingMeetings {
         now: Date,
         recordedCodes: Set<String> = [],
         userEmail: String,
-        calendar: Calendar = saoPauloCalendar
+        calendar: Calendar = localCalendar
     ) -> [UpcomingMeetingRow] {
         let userEmailFolded = userEmail.lowercased()
         let selfExcludes = !userEmailFolded.isEmpty
@@ -102,11 +102,11 @@ public enum UpcomingMeetings {
             .sorted { ($0.start, $0.title) < ($1.start, $1.title) }
     }
 
-    /// America/Sao_Paulo (the user's timezone) — the day-grouping reference for the
-    /// "Today" scoping and the day-rollover refresh.
-    public static var saoPauloCalendar: Calendar {
+    /// The system time zone — the day-grouping reference for the "Today" scoping
+    /// and the day-rollover refresh.
+    public static var localCalendar: Calendar {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "America/Sao_Paulo") ?? .current
+        calendar.timeZone = .current
         return calendar
     }
 
@@ -115,7 +115,7 @@ public enum UpcomingMeetings {
     /// gone, today's appear). The adapter polls this beside the suggestion
     /// cadence (§4b).
     public static func dayChanged(
-        from lastRefresh: Date, to now: Date, calendar: Calendar = saoPauloCalendar
+        from lastRefresh: Date, to now: Date, calendar: Calendar = localCalendar
     ) -> Bool {
         !calendar.isDate(lastRefresh, inSameDayAs: now)
     }

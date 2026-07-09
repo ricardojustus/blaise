@@ -159,6 +159,36 @@ public struct NotesRepository: Sendable {
             try MeetingNotes.fetchOne(db, key: meetingID)
         }
     }
+
+    /// Full-text search across all meeting NOTES (F2). Notes are one row per
+    /// meeting, so a hit is a meeting (no segment). Uses the same all-tokens
+    /// prefix matcher and snippet delimiters as transcript search, so query
+    /// semantics and snippet rendering are identical across surfaces.
+    /// `meeting_id` is stored as `notes_fts` column 0 (UNINDEXED) and read
+    /// directly — no rowid join. Capped to bound a pathological query.
+    public func searchNotes(_ query: String) async throws -> [NotesSearchHit] {
+        guard let pattern = FTS5Pattern(matchingAllTokensIn: query) else {
+            return []
+        }
+        return try await database.pool.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT
+                        meeting_id AS meeting_id,
+                        snippet(notes_fts, 1, ?, ?, '…', 12) AS snippet
+                    FROM notes_fts
+                    WHERE notes_fts MATCH ?
+                    ORDER BY bm25(notes_fts), meeting_id
+                    LIMIT 50
+                    """,
+                arguments: [SearchHit.matchStartDelimiter, SearchHit.matchEndDelimiter, pattern.rawPattern]
+            )
+            return rows.map { row in
+                NotesSearchHit(meetingID: row["meeting_id"], snippet: row["snippet"])
+            }
+        }
+    }
 }
 
 // MARK: - HandoffRepository
@@ -555,6 +585,236 @@ public struct SettingsStore: Sendable {
                 sql: "INSERT INTO app_setting (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 arguments: [key, json]
             )
+        }
+    }
+}
+
+// MARK: - F1 processing queue repository
+
+/// Durable processing-queue (F1). Mirrors `HandoffRepository`. The worker drains
+/// it by calling the unchanged `ProcessingPipeline.dispatchProcessing`; this
+/// repository owns enqueue/claim/complete + the startup sweep. `complete`/`fail`
+/// are UPDATE…WHERE-id, so a row deleted mid-run (meeting deletion) is a safe
+/// no-op (H-2).
+public struct ProcessingQueueRepository: Sendable {
+    let database: BlaiseDatabase
+
+    public init(database: BlaiseDatabase) {
+        self.database = database
+    }
+
+    /// Enqueue a process job for a meeting. Idempotent (F1 §5): if a live
+    /// (pending/running) job already exists for the meeting, return it —
+    /// SELECT-then-INSERT under the write lock; the partial unique index is the
+    /// belt-and-suspenders backstop against logic bugs.
+    @discardableResult
+    public func enqueue(meetingID: MeetingID, origin: ProcessingJobOrigin) async throws -> ProcessingJob {
+        try await database.pool.write { db in
+            try Self.enqueue(db, meetingID: meetingID, origin: origin)
+        }
+    }
+
+    /// Transaction-scoped enqueue (FIFO `created_seq` assigned monotonically).
+    static func enqueue(_ db: Database, meetingID: MeetingID, origin: ProcessingJobOrigin) throws -> ProcessingJob {
+        if let existing = try ProcessingJob
+            .filter(Column("meeting_id") == meetingID)
+            .filter(sql: "state IN ('pending','running')")
+            .fetchOne(db)
+        {
+            // H-promote: a USER admission collapsing into an existing AUTO/
+            // reprocess_all PENDING job promotes the job's origin, so the worker
+            // runs it with refuseCancelled=false — otherwise the user's
+            // Process/Regenerate of a CANCELLED meeting would silently collapse
+            // into an auto job and be refused. (A running job already captured
+            // its origin, so only pending is promotable.)
+            if origin == .user, existing.origin != .user, existing.state == .pending {
+                try db.execute(
+                    sql: "UPDATE processing_queue SET origin = ? WHERE id = ?",
+                    arguments: [ProcessingJobOrigin.user.rawValue, existing.id])
+                return try ProcessingJob.fetchOne(db, key: existing.id) ?? existing
+            }
+            return existing
+        }
+        let nextSeq = try Int64.fetchOne(
+            db, sql: "SELECT IFNULL(MAX(created_seq), 0) + 1 FROM processing_queue") ?? 1
+        let job = ProcessingJob(
+            id: ULID.generate(),
+            meetingID: meetingID,
+            state: .pending,
+            origin: origin,
+            attempts: 0,
+            createdSeq: nextSeq,
+            enqueuedAt: Date())
+        try job.insert(db)
+        guard let stored = try ProcessingJob.fetchOne(db, key: job.id) else {
+            throw BlaiseDatabaseError.processingJobNotFound(job.id)
+        }
+        return stored
+    }
+
+    /// Claim the oldest `pending` job (FIFO by `created_seq` ONLY — L-4), marking
+    /// it `running`. Returns nil if none; the worker drains one at a time.
+    public func claimNext() async throws -> ProcessingJob? {
+        try await database.pool.write { db in
+            guard let job = try ProcessingJob
+                .filter(Column("state") == ProcessingJobState.pending.rawValue)
+                .order(Column("created_seq").asc)
+                .fetchOne(db)
+            else { return nil }
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'running', started_at = ? WHERE id = ?",
+                arguments: [Date(), job.id])
+            return try ProcessingJob.fetchOne(db, key: job.id)
+        }
+    }
+
+    /// Mark a job `done`. No-op if the row was deleted mid-run (H-2).
+    public func complete(_ id: String) async throws {
+        try await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'done', finished_at = ? WHERE id = ?",
+                arguments: [Date(), id])
+        }
+    }
+
+    /// Mark a job `failed` + bump `attempts`. No-op if the row was deleted (H-2).
+    public func fail(_ id: String, error: String) async throws {
+        try await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'failed', last_error = ?, "
+                    + "attempts = attempts + 1, finished_at = ? WHERE id = ?",
+                arguments: [error, Date(), id])
+        }
+    }
+
+    /// Oldest `pending` job (FIFO peek), or nil.
+    public func nextPending() async throws -> ProcessingJob? {
+        try await database.pool.read { db in
+            try ProcessingJob
+                .filter(Column("state") == ProcessingJobState.pending.rawValue)
+                .order(Column("created_seq").asc)
+                .fetchOne(db)
+        }
+    }
+
+    /// Count of live (pending or running) jobs.
+    public func liveCount() async throws -> Int {
+        try await database.pool.read { db in
+            try ProcessingJob.filter(sql: "state IN ('pending','running')").fetchCount(db)
+        }
+    }
+
+    /// Startup sweep: a stale `running` row is an interrupted claim → reset to
+    /// `pending` (twin of the handoff `delivering→pending` sweep).
+    public func resetStaleRunning() async throws {
+        try await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'pending', started_at = NULL WHERE state = 'running'")
+        }
+    }
+
+    /// Mark a job `cancelled` (the worker's drain after the user cancelled the
+    /// in-flight run — `pipeline.cancel` → typed `EngineError.cancelled`). A
+    /// cancelled job is terminal and offers no Retry. No-op if the row is gone.
+    public func markCancelled(_ id: String) async throws {
+        try await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'cancelled', finished_at = ? WHERE id = ?",
+                arguments: [Date(), id])
+        }
+    }
+
+    // MARK: - Increment 2 (UI / cancel / snapshot)
+
+    /// CAS-cancel a PENDING job (C2): flips `pending → cancelled` only. Returns
+    /// true iff a pending row was cancelled; false means the caller must reload
+    /// (a job claimed `running` between the UI read and here must NOT be stomped
+    /// — the caller routes a running job to `pipeline.cancel` instead).
+    @discardableResult
+    public func cancelPending(_ id: String) async throws -> Bool {
+        try await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'cancelled', finished_at = ? "
+                    + "WHERE id = ? AND state = 'pending'",
+                arguments: [Date(), id])
+            return db.changesCount > 0
+        }
+    }
+
+    /// Retry a `failed` job → `pending` (manual retry — D3). CAS-guarded to
+    /// `failed` (clears the error; `attempts` is preserved as history).
+    public func retry(_ id: String) async throws {
+        try await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'pending', last_error = NULL, "
+                    + "started_at = NULL, finished_at = NULL WHERE id = ? AND state = 'failed'",
+                arguments: [id])
+        }
+    }
+
+    /// Retry ALL `failed` jobs → `pending`.
+    public func retryAllFailed() async throws {
+        try await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'pending', last_error = NULL, "
+                    + "started_at = NULL, finished_at = NULL WHERE state = 'failed'")
+        }
+    }
+
+    /// Fetch a job by id (the cancel-routing reload after a CAS no-op).
+    public func job(_ id: String) async throws -> ProcessingJob? {
+        try await database.pool.read { db in
+            try ProcessingJob.fetchOne(db, key: id)
+        }
+    }
+
+    /// The live (`pending`/`running`) job for a meeting, or nil — the detail view
+    /// gates its busy/Cancel UI on this (AC1b).
+    public func liveJob(meetingID: MeetingID) async throws -> ProcessingJob? {
+        try await database.pool.read { db in
+            try ProcessingJob
+                .filter(Column("meeting_id") == meetingID)
+                .filter(sql: "state IN ('pending','running')")
+                .fetchOne(db)
+        }
+    }
+
+    /// All jobs, newest first (the panel list).
+    public func allJobs() async throws -> [ProcessingJob] {
+        try await database.pool.read { db in
+            try ProcessingJob.order(Column("created_seq").desc).fetchAll(db)
+        }
+    }
+
+    /// Failed (retriable) jobs, oldest first.
+    public func failedJobs() async throws -> [ProcessingJob] {
+        try await database.pool.read { db in
+            try ProcessingJob
+                .filter(Column("state") == ProcessingJobState.failed.rawValue)
+                .order(Column("created_seq").asc)
+                .fetchAll(db)
+        }
+    }
+
+    /// The currently-running job (≤1 — the worker is sequential), or nil.
+    public func runningJob() async throws -> ProcessingJob? {
+        try await database.pool.read { db in
+            try ProcessingJob
+                .filter(Column("state") == ProcessingJobState.running.rawValue)
+                .fetchOne(db)
+        }
+    }
+
+    /// Counts for the snapshot in one read.
+    public func counts() async throws -> (pending: Int, failed: Int, runningMeetingID: MeetingID?) {
+        try await database.pool.read { db in
+            let pending = try ProcessingJob
+                .filter(Column("state") == ProcessingJobState.pending.rawValue).fetchCount(db)
+            let failed = try ProcessingJob
+                .filter(Column("state") == ProcessingJobState.failed.rawValue).fetchCount(db)
+            let running = try ProcessingJob
+                .filter(Column("state") == ProcessingJobState.running.rawValue).fetchOne(db)
+            return (pending, failed, running?.meetingID)
         }
     }
 }

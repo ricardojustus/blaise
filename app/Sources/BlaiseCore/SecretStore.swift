@@ -16,9 +16,10 @@ public struct SecretStoreError: Error, Equatable, Sendable {
     public let operation: String
 }
 
-/// macOS Keychain generic password items, service `app.blaise.mac`,
-/// account = `engine.<id>.<key>` (same scheme as SettingsStore keys — two
-/// engines declaring `apiKey` can never collide).
+/// macOS Keychain generic password items, service = `BlaiseBundle.identifier`
+/// (`app.blaise.mac` by default; a gitignored `scripts/blaise.env` override may
+/// set a production id), account = `engine.<id>.<key>` (same scheme as
+/// SettingsStore keys — two engines declaring `apiKey` can never collide).
 ///
 /// Ad-hoc-signing caveat (accepted, documented in the C2 spec): per-build
 /// ad-hoc identities may force re-granting Keychain access (or re-entering

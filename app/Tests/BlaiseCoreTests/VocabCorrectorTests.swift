@@ -269,12 +269,12 @@ import Testing
 
     // MARK: Real-transcript corpus (the audit's strongest FP check, permanent)
 
-    @Test(.disabled("mint-pending: reads OUT research/asr real ASR with the pre-scrub allowed-set; re-derive against the synthetic corpus at G8 mint")) func realTranscriptCorpusYieldsOnlyKnownCorrections() throws {
-        // research/asr/out holds the meeting sample's engine outputs — local
+    @Test(.disabled("mint-pending: reads the maintainer-local real ASR output with the pre-scrub allowed-set; re-derive against the synthetic corpus")) func realTranscriptCorpusYieldsOnlyKnownCorrections() throws {
+        // The directory holds the meeting sample's engine outputs — local
         // research artifacts referenced by path; skip when absent.
-        let outDir = VocabFixtures.repoRoot.appendingPathComponent("research/asr/out")
+        let outDir = RegressionPin.asrOutDir
         guard FileManager.default.fileExists(atPath: outDir.path) else {
-            print("skip realTranscriptCorpusYieldsOnlyKnownCorrections: research/asr/out absent (local research artifacts not in this checkout)")
+            print("skip realTranscriptCorpusYieldsOnlyKnownCorrections: real ASR output dir absent (maintainer-local artifacts not in this checkout)")
             return
         }
         let files = try FileManager.default

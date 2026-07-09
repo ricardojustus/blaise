@@ -99,7 +99,7 @@ private func storedDigest(_ harness: PipelineHarness, _ meetingID: MeetingID) as
     }
 
     /// AC3: a digest-ON payload carries a top-level `memory_digest` string +
-    /// `provenance.memory_digest.prompt_version = "md-v1"`.
+    /// `provenance.memory_digest.prompt_version = "md-v6"` (the shipped contract).
     @Test func payloadCarriesMemoryDigestAndProvenance() async throws {
         let harness = try await makeDigestHarness()
         let meeting = try await importFictional(harness)
@@ -109,7 +109,7 @@ private func storedDigest(_ harness: PipelineHarness, _ meetingID: MeetingID) as
         #expect(payload["memory_digest"] as? String == DigestPipelineFixtures.cleanDigest)
         let provenance = try #require(payload["provenance"] as? [String: Any])
         let mdProv = try #require(provenance["memory_digest"] as? [String: Any])
-        #expect(mdProv["prompt_version"] as? String == "md-v1")
+        #expect(mdProv["prompt_version"] as? String == "md-v6")
     }
 
     /// AC3: a degenerate meeting yields a `## HEADER`-only digest, still present.

@@ -44,15 +44,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleExecutable</key>
 	<string>Blaise</string>
 	<key>CFBundleIdentifier</key>
-	<string>app.blaise.mac</string>
+	<string>__BLAISE_BUNDLE_ID__</string>
 	<key>CFBundleName</key>
 	<string>Blaise</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>1.2.1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.1</string>
 	<key>NSHighResolutionCapable</key>
@@ -67,9 +67,26 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# c15: substitute the bundle id from BLAISE_BUNDLE_ID (default app.blaise.mac;
+# a gitignored scripts/blaise.env overrides to the prod id). Validate first — the
+# value flows into a sed replacement + the plist; reject anything that is not a
+# reverse-DNS-shaped id. The heredoc stays quoted, so only this one value is
+# interpolated; the usage strings are safe.
+if [[ ! "$BLAISE_BUNDLE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
+    echo "error: BLAISE_BUNDLE_ID '$BLAISE_BUNDLE_ID' is not a valid bundle id" >&2
+    exit 1
+fi
+sed -i '' "s/__BLAISE_BUNDLE_ID__/$BLAISE_BUNDLE_ID/" "$APP/Contents/Info.plist"
+echo "bundle id: $BLAISE_BUNDLE_ID"
+if [[ "$BLAISE_BUNDLE_ID" == "app.blaise.mac" ]]; then
+    echo "WARNING: built with the PUBLIC bundle id — TCC (mic/system-audio/calendar)" >&2
+    echo "WARNING: + Keychain items key to this id; a PRODUCTION build needs" >&2
+    echo "WARNING: scripts/blaise.env to set BLAISE_BUNDLE_ID to the prod id." >&2
+fi
+
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
-# Signing (C11, research/c11_capture.md §4): the STABLE Apple Development
+# Signing (C11): the STABLE Apple Development
 # identity gives a designated requirement keyed on identifier + leaf, so the
 # TCC grants (Microphone + System Audio Recording) survive rebuilds. Ad-hoc
 # signing changes the cdhash — and therefore the TCC identity — every build,

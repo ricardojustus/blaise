@@ -317,8 +317,14 @@ enum SLabelFixture {
     /// — the flat-string entry point that cleans the produced memory-DIGEST
     /// string. The digest-only resume's build (`digestOnlyBody`) is preceded by
     /// `generateMemoryDigest`'s `neutralizeText` (its own window's neutralize),
-    /// so the build count is 5 and the neutralize-family count is 5; renders stay
-    /// 4 (the digest resume re-mints WITHOUT re-rendering the notes markdown).
+    /// so the build count is 5; the neutralize-family count is 8 — the digest
+    /// path neutralizes the synthesis DRAFT, the md-v6 COMBINED-AUDIT output, AND
+    /// (md-v5 rollback branch) the verify/repair output + the notes-RECONCILED
+    /// output (FOUR `neutralizeText` calls present in `generateMemoryDigest`: the
+    /// md-v6 path runs synth→combined-audit, the md-v5 path runs
+    /// synth→verify→reconcile, and both branches' neutralizes live in the source
+    /// the grep counts); renders stay 4 (the digest resume re-mints WITHOUT
+    /// re-rendering the notes markdown).
     @Test func everyForwardRenderAndBuildFollowsANeutralize() {
         let source = Self.pipelineSource
         #expect(!source.isEmpty, "could not read ProcessingPipeline.swift")
@@ -343,7 +349,7 @@ enum SLabelFixture {
         // NEW unguarded forward flow shifts a count and fails here.
         #expect(renderSites.count == 4, "expected 4 forward render sites, found \(renderSites.count)")
         #expect(buildSites.count == 5, "expected 5 forward build sites, found \(buildSites.count)")
-        #expect(neutralizeSites.count == 5, "expected 5 neutralize-family calls, found \(neutralizeSites.count)")
+        #expect(neutralizeSites.count == 8, "expected 8 neutralize-family calls, found \(neutralizeSites.count)")
 
         // Mint-window discipline: pair the neutralize-family sites to the render
         // and build sites in line order; each render and each build must follow

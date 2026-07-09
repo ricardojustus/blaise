@@ -2,7 +2,7 @@
 # Canonical Blaise test invocation (Swift Testing via the bypass toolchain).
 # The explicit -Xswiftc/-Xlinker flags supply the Testing framework search
 # paths SwiftPM would normally derive through xcrun (blocked by the Xcode
-# license wall). See research/c1_build_persistence.md §4.
+# license wall).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

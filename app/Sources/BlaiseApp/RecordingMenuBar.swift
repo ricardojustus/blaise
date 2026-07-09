@@ -87,6 +87,20 @@ extension CaptureStatusHolder: AutomationNotificationMirroring {
 
 // MARK: - Calendar suggestions (EventKit adapter; graceful absence)
 
+/// A selectable calendar (id + display name) for the Settings picker — shared by
+/// the Apple and Google calendar lists.
+struct CalendarChoice: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+}
+
+/// Persisted Apple Calendar source settings (mirrors `GoogleCalendarSettings`).
+private struct AppleCalendarSettings: Codable, Equatable, Sendable {
+    var enabled: Bool
+    var hiddenCalendarIDs: [String]
+    static let `default` = AppleCalendarSettings(enabled: true, hiddenCalendarIDs: [])
+}
+
 /// EventKit full access (macOS has no read-only level —
 /// NSCalendarsFullAccessUsageDescription; its own TCC prompt, fired ONLY
 /// when the user opens calendar suggestions). Denied/absent → plain manual.
@@ -96,8 +110,70 @@ final class CalendarSuggestionProvider {
         case notDetermined, granted, denied
     }
 
+    static let settingsKey = "calendar.apple.settings"
+
+    private let google: GoogleCalendarModel
+    private let settings: SettingsStore
     private var store: EKEventStore?
     private(set) var suggestions: [MeetingSuggestion] = []
+    private(set) var upcomingRows: [UpcomingMeetingRow] = []
+
+    /// Apple Calendar source on/off — user-level, independent of the OS grant.
+    var appleEnabled = true
+    /// EventKit `calendarIdentifier`s the user has hidden (empty = all shown).
+    private(set) var appleHiddenCalendarIDs: Set<String> = []
+    /// Available EventKit calendars (id + title) for the Settings picker.
+    private(set) var appleCalendars: [CalendarChoice] = []
+
+    init(google: GoogleCalendarModel, settings: SettingsStore) {
+        self.google = google
+        self.settings = settings
+    }
+
+    /// Load the persisted Apple-source settings (enabled + hidden calendars) and
+    /// refresh the picker list. Called at startup and when Settings opens.
+    func load() async {
+        let stored = (try? await settings.get(Self.settingsKey, as: AppleCalendarSettings.self))
+            ?? nil ?? .default
+        appleEnabled = stored.enabled
+        appleHiddenCalendarIDs = Set(stored.hiddenCalendarIDs)
+        refreshAppleCalendars()
+    }
+
+    /// Enumerate the available EventKit calendars for the picker (no prompt;
+    /// empty when access is not granted).
+    func refreshAppleCalendars() {
+        guard access == .granted else { appleCalendars = []; return }
+        let store = store ?? EKEventStore()
+        self.store = store
+        appleCalendars = store.calendars(for: .event)
+            .map { CalendarChoice(id: $0.calendarIdentifier, name: $0.title) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func setAppleEnabled(_ value: Bool) {
+        appleEnabled = value
+        persistApple()
+    }
+
+    /// Show/hide a specific Apple calendar across every surface.
+    func setAppleCalendar(_ id: String, shown: Bool) {
+        if shown { appleHiddenCalendarIDs.remove(id) } else { appleHiddenCalendarIDs.insert(id) }
+        persistApple()
+    }
+
+    private var persistTask: Task<Void, Never>?
+    private func persistApple() {
+        let snapshot = AppleCalendarSettings(
+            enabled: appleEnabled, hiddenCalendarIDs: Array(appleHiddenCalendarIDs))
+        // Chain writes so a rapid burst of toggles persists in order (the last
+        // toggle wins on disk) rather than racing as detached Tasks.
+        let previous = persistTask
+        persistTask = Task { [settings] in
+            _ = await previous?.value
+            try? await settings.set(Self.settingsKey, to: snapshot)
+        }
+    }
 
     var access: Access {
         switch EKEventStore.authorizationStatus(for: .event) {
@@ -113,32 +189,61 @@ final class CalendarSuggestionProvider {
         let store = store ?? EKEventStore()
         self.store = store
         let granted = (try? await store.requestFullAccessToEvents()) ?? false
-        if granted { load(userEmail: userEmail) }
+        if granted {
+            // A user-initiated grant also turns the source ON, so a persisted
+            // appleEnabled=false can't leave the just-granted source silent.
+            if !appleEnabled { appleEnabled = true; persistApple() }
+            refreshAppleCalendars()
+            await refresh(userEmail: userEmail)
+        }
     }
 
-    /// Loads events ±15 min from now (no prompt; call only when granted).
-    func load(userEmail: String, now: Date = Date()) {
-        guard access == .granted else {
-            suggestions = []
-            return
-        }
-        let window = CalendarSuggestionBuilder.windowSeconds
-        let snapshots = eventSnapshots(
-            from: now.addingTimeInterval(-window), to: now.addingTimeInterval(window))
+    /// Refreshes the menu suggestions plus the main-window/menu upcoming rows.
+    /// EventKit is read only when already granted; Google Calendar is read only
+    /// when the user has connected and enabled it in Settings.
+    func refresh(
+        userEmail: String, recordedCodes: Set<String> = [], now: Date = Date()
+    ) async {
+        let suggestionSnapshots = await eventSnapshots(
+            from: now.addingTimeInterval(-CalendarSuggestionBuilder.lookbackSeconds),
+            to: now.addingTimeInterval(CalendarSuggestionBuilder.lookaheadSeconds))
         suggestions = CalendarSuggestionBuilder.suggestions(
-            from: snapshots, now: now, userEmail: userEmail)
+            from: suggestionSnapshots, now: now, userEmail: userEmail)
+
+        let calendar = UpcomingMeetings.localCalendar
+        let startOfDay = calendar.startOfDay(for: now)
+        let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)
+            ?? now.addingTimeInterval(24 * 3600)
+        let upcomingSnapshots = await eventSnapshots(from: startOfDay, to: endOfDay)
+        upcomingRows = UpcomingMeetings.rows(
+            from: upcomingSnapshots, now: now, recordedCodes: recordedCodes,
+            userEmail: userEmail, calendar: calendar)
     }
 
     /// Raw snapshots over an arbitrary window (C14 `PreMeetingScheduler`
-    /// input: a rolling 24 h fetch). No prompt; empty when not granted.
-    func eventSnapshots(from start: Date, to end: Date) -> [CalendarEventSnapshot] {
-        guard access == .granted else { return [] }
+    /// input: a rolling 24 h fetch). No prompt; empty when no source is enabled.
+    func eventSnapshots(from start: Date, to end: Date) async -> [CalendarEventSnapshot] {
+        var snapshots: [CalendarEventSnapshot] = []
+        snapshots.append(contentsOf: eventKitSnapshots(from: start, to: end))
+        snapshots.append(contentsOf: await google.snapshots(from: start, to: end))
+        return CalendarEventMerger.merged(snapshots)
+    }
+
+    private func eventKitSnapshots(from start: Date, to end: Date) -> [CalendarEventSnapshot] {
+        guard appleEnabled, access == .granted else { return [] }
         let store = store ?? EKEventStore()
         self.store = store
-        let predicate = store.predicateForEvents(withStart: start, end: end, calendars: nil)
-        return store.events(matching: predicate).map { event in
+        // Only calendars the user has NOT hidden (empty hidden set = all shown);
+        // all hidden → nothing.
+        let shown = store.calendars(for: .event)
+            .filter { !appleHiddenCalendarIDs.contains($0.calendarIdentifier) }
+        guard !shown.isEmpty else { return [] }
+        let predicate = store.predicateForEvents(withStart: start, end: end, calendars: shown)
+        return store.events(matching: predicate)
+            .filter { !$0.isAllDay }  // never surface all-day events (Birthdays, all-day blocks)
+            .map { event in
             CalendarEventSnapshot(
-                eventIdentifier: event.eventIdentifier ?? "",
+                eventIdentifier: "eventkit:\(event.eventIdentifier ?? "")",
                 title: event.title ?? "Meeting",
                 start: event.startDate,
                 end: event.endDate,
@@ -159,53 +264,6 @@ final class CalendarSuggestionProvider {
     }
 }
 
-// MARK: - Menu bar label + always-alive window routing
-
-/// The MenuBarExtra label, plus the notification-click → open-main-window
-/// routing observer (round-2 M-2). The MenuBarExtra label view tree is alive
-/// for the whole app lifetime — including when the main window is CLOSED,
-/// the state where the WindowGroup's own observer no longer exists — so this
-/// is the seam that can recreate a closed window in response to a click. The
-/// observer reacts to `AppUIState.openMainWindowRequest`, the counter the
-/// notification action increments (`AppEnvironment` `onAction.openMainWindow`).
-struct MenuBarLabelWithWindowRouting: View {
-    /// The live capture status + handoff status holders, read HERE (inside this
-    /// leaf's body) rather than in `App.body`. Field bug 12/06: reading
-    /// `captureStatus.state` / `handoffStatus.snapshot` in the scene builder
-    /// made every recording tick (and every capture lifecycle event) invalidate
-    /// the WHOLE `App.body` — re-creating the sibling `Settings { }` content and
-    /// its `TabView`, which drops the macOS Settings tab-item SF Symbol icons
-    /// (the FB15540812 re-render class). Confining the ticking reads to this
-    /// always-alive label means a tick can only re-render the menu-bar glyph.
-    /// Holders are optional: nil only during the brief composition-root failure
-    /// window (no env), where the label renders the idle glyph.
-    var captureStatus: CaptureStatusHolder?
-    var handoffStatus: HandoffStatusHolder?
-    /// nil only during the brief composition-root failure window (no env).
-    var uiState: AppUIState?
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        let state = captureStatus?.state ?? .idle
-        let handoffWarning = handoffStatus?.snapshot.warning != nil
-        Group {
-            // G12 §1: while recording/paused the label expands to the live
-            // timer (`● MM:SS`, tabular digits). The handoff warning badge keeps
-            // priority only in the quiet states (as before); a live recording
-            // owns the menu-bar item.
-            if handoffWarning, RecordingTimerModel.isQuietState(state) {
-                RecordingMenuBarLabel(state: state, handoffWarning: true)
-            } else {
-                RecordingTimerLabel(state: state)
-            }
-        }
-        .onChange(of: uiState?.openMainWindowRequest) { _, _ in
-            openWindow(id: "main")
-            NSApp.activate(ignoringOtherApps: true)
-        }
-    }
-}
-
 /// The ⌥⌘R Start/Stop menu command. Its `captureStatus.isRecording` read is
 /// confined to this child view so it does NOT register `App.body` (the scene
 /// builder) as a dependency of the ticking `captureStatus.state` — which would
@@ -221,53 +279,6 @@ struct RecordingMenuCommandButton: View {
             Task { await appEnv.toggleRecording() }
         }
         .keyboardShortcut("r", modifiers: [.option, .command])
-    }
-}
-
-struct RecordingMenuBarLabel: View {
-    let state: IndicatorState
-    /// Handoff persistent-failure warning (HandoffSnapshot.warning != nil):
-    /// the quiet states swap to a badged glyph while it is active. Recording
-    /// and alarm displays keep priority — the badge returns when they end,
-    /// and the banner/notification surfaces carry the warning meanwhile.
-    var handoffWarning = false
-
-    var body: some View {
-        if handoffWarning, isQuietState {
-            Image(systemName: "waveform.badge.exclamationmark")
-                .foregroundStyle(.orange)
-        } else {
-            switch state {
-            case .idle:
-                Image(systemName: "waveform.circle")
-            case .recording:
-                Image(systemName: "record.circle")
-                    .foregroundStyle(Color(red: 0.92, green: 0.32, blue: 0.32))
-            case .warning:
-                Image(systemName: "exclamationmark.circle")
-                    .foregroundStyle(.orange)
-            case .alarm:
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-            case .processing:
-                Image(systemName: "arrow.triangle.2.circlepath.circle")
-            case .grace:
-                // Post-recording template glyph variant: pause-adjacent, calm.
-                Image(systemName: "pause.circle")
-            case .paused:
-                // G9: held-open meeting — static accent pause-fill glyph
-                // (calm, not the loud recording red).
-                Image(systemName: "pause.circle.fill")
-                    .foregroundStyle(Theme.accent)
-            }
-        }
-    }
-
-    private var isQuietState: Bool {
-        switch state {
-        case .idle, .processing, .grace, .paused: return true
-        case .recording, .warning, .alarm: return false
-        }
     }
 }
 
@@ -374,9 +385,9 @@ struct RecordingMenuView: View {
             }
         }
         .onAppear {
-            // Refresh suggestions when the menu opens (granted = no prompt).
-            if calendar.access == .granted {
-                calendar.load(userEmail: appEnv.userEmail)
+            // Refresh suggestions/upcoming rows when the menu opens (no prompt).
+            Task {
+                await appEnv.refreshCalendarSurfaces()
             }
         }
     }
@@ -469,6 +480,21 @@ struct RecordingMenuView: View {
             Button("In Person") { Task { await appEnv.startRecording(source: .inPerson) } }
         }
 
+        if !calendar.upcomingRows.isEmpty {
+            Divider()
+            Text("Upcoming")
+            ForEach(calendar.upcomingRows.prefix(4)) { row in
+                Button("\(Self.time(row.start)) Record: \(Self.menuTitle(row.title))") {
+                    Task { await appEnv.startRecording(upcoming: row) }
+                }
+                if row.offersLaunchAndRecord {
+                    Button("\(Self.time(row.start)) Launch: \(Self.menuTitle(row.title))") {
+                        Task { await appEnv.launchAndRecord(upcoming: row) }
+                    }
+                }
+            }
+        }
+
         switch calendar.access {
         case .granted:
             if calendar.suggestions.isEmpty {
@@ -481,11 +507,11 @@ struct RecordingMenuView: View {
                 }
             }
         case .notDetermined:
-            Button("Show Calendar Suggestions…") {
+            Button("Enable Apple Calendar…") {
                 Task { await calendar.requestAccessAndLoad(userEmail: appEnv.userEmail) }
             }
         case .denied:
-            Text("Calendar access off (System Settings → Privacy)")
+            Text("Apple Calendar off (System Settings → Privacy)")
         }
     }
 
@@ -503,6 +529,12 @@ struct RecordingMenuView: View {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm"
         return formatter.string(from: date)
+    }
+
+    private static func menuTitle(_ title: String) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 16 else { return trimmed.isEmpty ? "Meeting" : trimmed }
+        return String(trimmed.prefix(15)) + "…"
     }
 
     /// G9 accumulated recorded time (sum of part durations) for the paused

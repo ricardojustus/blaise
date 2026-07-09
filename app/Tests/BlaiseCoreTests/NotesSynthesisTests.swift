@@ -21,7 +21,7 @@ func makeNotesRequest(
         meeting: Meeting(
             id: "01TESTMEETING0000000000000",
             title: title,
-            startedAt: Date(timeIntervalSince1970: 1_774_000_000),  // 20/03/2026 América/SP
+            startedAt: Date(timeIntervalSince1970: 1_774_000_000),  // 2026-03-20 09:46 UTC -> 20/03/2026
             source: .meet,
             status: .processing,
             attendees: attendees,
@@ -151,14 +151,14 @@ let sampleEngineResponseJSON = """
 
     @Test func userItemAlreadyPresentIsNotDuplicated() throws {
         // ALSO the G4 legacy-key decode (spec §2, AC2): this fixture carries
-        // the pre-rename `legacy_user_action_items` key — the decoder must still read
+        // the pre-rename `ric_action_items` key — the decoder must still read
         // it into `userActionItems`. The new-key path is covered by every
         // other fixture (sampleEngineResponseJSON now carries
         // `user_action_items`).
         let json = """
             {"title": null, "summary": "s", "detailed_notes": "d", "decisions": [],
              "action_items": [{"owner": "Sam", "text": "enviar"}],
-             "legacy_user_action_items": [{"owner": "Sam", "text": "enviar"}],
+             "ric_action_items": [{"owner": "Sam", "text": "enviar"}],
              "speaker_name_mapping": []}
             """
         let (structured, mapping) = try NotesEngineResponse.decode(from: Data(json.utf8)).toNotes()
@@ -187,14 +187,17 @@ let sampleEngineResponseJSON = """
         #expect(structured.meetingType == .general)
     }
 
-    @Test func unknownMeetingTypeFailsDecodingLoudly() {
-        // The enum is strict: a value outside the taxonomy is a contract
-        // violation, not something to coerce.
+    @Test func unknownMeetingTypeDecodesToGeneralNotThrow() throws {
+        // Leniency (account-engine hardening, commit 0d89f42): the `claude -p`
+        // notes path has no server-side enum enforcement, so an out-of-taxonomy
+        // meeting_type must decode to `.general` rather than failing the ENTIRE
+        // notes. No-op for the schema-enforced API/MLX engines. The dedicated
+        // contract lives in NotesMeetingTypeLeniencyTests; this pins the engine
+        // decode path too.
         let json = sampleEngineResponseJSON.replacingOccurrences(
             of: "\"project_review\"", with: "\"standup\"")
-        #expect(throws: (any Error).self) {
-            _ = try NotesEngineResponse.decode(from: Data(json.utf8))
-        }
+        let (structured, _) = try NotesEngineResponse.decode(from: Data(json.utf8)).toNotes()
+        #expect(structured.meetingType == .general)
     }
 }
 
@@ -223,7 +226,7 @@ let sampleEngineResponseJSON = """
     }
 
     @Test func shippedPromptVersionMatchesTheValidationVerdict() {
-        // The blind v1-vs-v2 validation (audits/c6/notes_v2/) decides the
+        // The blind v1-vs-v2 validation decides the
         // shipped default; the provenance string follows the selection.
         #expect(NotesPromptBuilder.promptVersion == NotesPromptBuilder.shippedVersion.rawValue)
         #expect(NotesPromptBuilder.systemPrompt
@@ -282,7 +285,7 @@ let sampleEngineResponseJSON = """
     @Test func v11IsV1PlusOnlyTheTwoFieldFixBlocks() {
         // v1.1 = the frozen v1 text + ONLY the user's two field-fix blocks: the
         // v1 prefix is byte-identical (decisions/action_items/
-        // legacy_user_action_items rules untouched), and no v2 material leaks in.
+        // ric_action_items rules untouched), and no v2 material leaks in.
         let v1 = NotesPromptBuilder.systemPrompt(for: .v1)
         let v11 = NotesPromptBuilder.systemPrompt(for: .v11)
         #expect(v11.hasPrefix(v1))
@@ -419,7 +422,7 @@ let sampleEngineResponseJSON = """
         // Previously-persisted NotesResult JSON has no speaker_name_mapping.
         let legacy = """
             {"structured": {"title": null, "summary": "s", "detailed_notes": "d",
-              "decisions": [], "action_items": [], "legacy_user_action_items": []},
+              "decisions": [], "action_items": [], "ric_action_items": []},
              "provenance": {"engine": "e", "model": "m", "pipeline_version": "p"}}
             """
         let result = try JSONDecoder().decode(NotesResult.self, from: Data(legacy.utf8))

@@ -57,9 +57,13 @@ public enum NotesRenderer {
         blocks.append("## \(strings.decisions)")
         blocks.append(renderList(s.decisions.map { "- \(normalizeListText($0))" }, emptyMarker: strings.noneMarker))
         blocks.append("## \(strings.actionItems)")
-        blocks.append(renderList(s.actionItems.map(renderActionItem), emptyMarker: strings.noneMarker))
+        blocks.append(renderList(
+            s.actionItems.filter { !normalizeListText($0.text).isEmpty }.map(renderActionItem),
+            emptyMarker: strings.noneMarker))
         blocks.append("## \(strings.userActionItems)")
-        blocks.append(renderList(s.userActionItems.map(renderActionItem), emptyMarker: strings.userNoneMarker))
+        blocks.append(renderList(
+            s.userActionItems.filter { !normalizeListText($0.text).isEmpty }.map(renderActionItem),
+            emptyMarker: strings.userNoneMarker))
         return blocks.joined(separator: "\n\n") + "\n"
     }
 
@@ -307,7 +311,11 @@ public enum NotesRenderer {
     }
 
     private static func renderActionItem(_ item: ActionItem) -> String {
-        "- **\(normalizeListText(item.owner)):** \(normalizeListText(item.text))"
+        let owner = normalizeListText(item.owner)
+        let text = normalizeListText(item.text)
+        // No owner (e.g. an unresolved speaker) → drop the prefix rather than
+        // emit an empty "**:**".
+        return owner.isEmpty ? "- \(text)" : "- **\(owner):** \(text)"
     }
 
     private static func renderList(_ lines: [String], emptyMarker: String) -> String {

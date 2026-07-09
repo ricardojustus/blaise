@@ -15,18 +15,31 @@ public struct PipelineVocabulary: Sendable {
     public let suppression: Set<String>
     public let commonNames: Set<String>
 
+    /// #101: glossary `(canonical, alias)` pairs whose alias was REJECTED at
+    /// admission ONLY because the folded surface is an everyday lexicon word
+    /// (`AliasAdmission.Rejection.lexiconWord`) — never `.brCommonName`, never
+    /// `.collision`. These never reach the corrector, `keptAliases`, or
+    /// `scopedAliasBindings` (admission discipline is unchanged); they are
+    /// surfaced ONLY as a downstream signal for the grounded person-mention hint
+    /// (`GroundedPersonHints`), which lives entirely in the LLM USER MESSAGE.
+    /// Empty by default and on every test/fixture path that does not run the
+    /// `user()` admission loop.
+    public let everydayRejectedAliases: [(canonical: String, alias: String)]
+
     /// Canonical spellings, in dictionary order (NotesRequest.vocabulary).
     public var canonicalTerms: [String] { dictionary.entries.map(\.canonical) }
 
     public init(
         dictionary: VocabularyDictionary,
         suppression: Set<String>,
-        commonNames: Set<String>
+        commonNames: Set<String>,
+        everydayRejectedAliases: [(canonical: String, alias: String)] = []
     ) throws {
         self.dictionary = dictionary
         self.corrector = try VocabularyCorrector(dictionary: dictionary, suppression: suppression)
         self.suppression = suppression
         self.commonNames = commonNames
+        self.everydayRejectedAliases = everydayRejectedAliases
     }
 
     /// Direct-corrector initializer (used by the isolated loader, which builds
@@ -35,12 +48,14 @@ public struct PipelineVocabulary: Sendable {
         dictionary: VocabularyDictionary,
         corrector: VocabularyCorrector,
         suppression: Set<String>,
-        commonNames: Set<String>
+        commonNames: Set<String>,
+        everydayRejectedAliases: [(canonical: String, alias: String)] = []
     ) {
         self.dictionary = dictionary
         self.corrector = corrector
         self.suppression = suppression
         self.commonNames = commonNames
+        self.everydayRejectedAliases = everydayRejectedAliases
     }
 
     public enum LoadError: Error {
@@ -189,6 +204,12 @@ public struct PipelineVocabulary: Sendable {
         var suppressionAugment: Set<String> = []
         var aliasesAdmitted = 0
         var canonicalsLimited = 0
+        // #101: aliases rejected ONLY for being an everyday lexicon word
+        // (`.lexiconWord`) — the everyday-mishearing case. NOT `.brCommonName`
+        // (false-resolution risk, out of scope) and NOT `.collision` (already
+        // bound to another canonical). Captured in the existing single pass with
+        // no admission-behavior change; consumed only by the grounded-hint helper.
+        var everydayRejectedAliases: [(canonical: String, alias: String)] = []
 
         for (entry, line) in zip(entries, entryLines) {
             let folded = VocabNormalization.canonicalMode(entry.canonical)
@@ -242,6 +263,14 @@ public struct PipelineVocabulary: Sendable {
                 if case .rejected(let rejection) = verdict {
                     diagnostics.add(GlossaryDiagnosticItem(
                         line: line, prefix: alias, reason: .aliasRejectedUnsafe(reason: rejectionText(rejection))))
+                    // #101: capture ONLY the everyday-lexicon-word rejection (the
+                    // recurring-mishearing case the grounded hint targets). NEVER
+                    // `.brCommonName` (a common given name — false-resolution risk)
+                    // and NEVER `.collision` (already bound elsewhere). Admission
+                    // itself is unchanged — the alias is still dropped here.
+                    if case .lexiconWord = rejection {
+                        everydayRejectedAliases.append((canonical: entry.canonical, alias: alias))
+                    }
                     continue
                 }
                 if AliasCoreScan.hasNoDistinctiveCore(alias, pt: lexicons.pt, en: lexicons.en) {
@@ -350,7 +379,8 @@ public struct PipelineVocabulary: Sendable {
 
         let vocabulary = PipelineVocabulary(
             dictionary: finalDictionary, corrector: corrector,
-            suppression: suppression, commonNames: lexicons.commonNames)
+            suppression: suppression, commonNames: lexicons.commonNames,
+            everydayRejectedAliases: everydayRejectedAliases)
         return UserLoad(vocabulary: vocabulary, diagnostics: diagnostics, loadedAt: now())
     }
 

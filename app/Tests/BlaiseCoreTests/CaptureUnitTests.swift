@@ -494,17 +494,20 @@ struct CalendarSuggestionTests {
             urlString: url, attendees: attendees)
     }
 
-    @Test("±15 min window; needs attendees or a link; Meet code extracted")
+    @Test("look-back → 2h look-ahead window; needs attendees or a link; Meet code extracted")
     func windowAndCode() {
         let events = [
-            event(title: "In window", startOffset: 600, location: "https://meet.google.com/abc-defg-hij"),
-            event(title: "Too far", startOffset: 1200, location: "https://meet.google.com/zzz-zzzz-zzz"),
+            event(title: "Soon", startOffset: 600, location: "https://meet.google.com/abc-defg-hij"),
+            event(title: "Within 2h", startOffset: 90 * 60, location: "https://meet.google.com/qqq-qqqq-qqq"),
+            event(title: "Beyond look-ahead", startOffset: 3 * 60 * 60, location: "https://meet.google.com/zzz-zzzz-zzz"),
+            event(title: "Long past", startOffset: -3600, location: "https://meet.google.com/ppp-pppp-ppp"),
             event(title: "No link no attendees", startOffset: 0),
         ]
         let suggestions = CalendarSuggestionBuilder.suggestions(
             from: events, now: now, userEmail: "sam.rivera@vexatron.test")
-        #expect(suggestions.count == 1)
-        #expect(suggestions[0].title == "In window")
+        // Soon + Within-2h surface; beyond the look-ahead, before the look-back,
+        // and the no-link/no-attendees event are all excluded.
+        #expect(suggestions.map(\.title) == ["Soon", "Within 2h"])
         #expect(suggestions[0].meetingCode == "abc-defg-hij")
         #expect(suggestions[0].source == .meet)
     }

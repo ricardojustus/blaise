@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Blaise",
-    // String form required: .macOS(.v26) needs PackageDescription 6.2 (see research/c1_build_persistence.md §1b correction).
+    // String form required: .macOS(.v26) needs PackageDescription 6.2.
     platforms: [.macOS("26.1")],
     products: [
         .executable(name: "Blaise", targets: ["BlaiseApp"]),

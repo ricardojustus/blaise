@@ -1,8 +1,8 @@
 // cft_smoke.mjs — unpacked-load smoke test via Chrome for Testing.
 //
 // Branded Chrome removed --load-extension in 137 (Chromium extensions PSA;
-// developer.chrome.com/blog/extension-news-june-2025; sources recorded in
-// research/c12_meet_extension.md addendum). Chrome for Testing retains it,
+// developer.chrome.com/blog/extension-news-june-2025). Chrome for Testing
+// retains it,
 // so this script:
 //   1. downloads CfT stable via `npx @puppeteer/browsers install` into
 //      extension/.cft/ (gitignored, dev-time only, ~150 MB on first run)

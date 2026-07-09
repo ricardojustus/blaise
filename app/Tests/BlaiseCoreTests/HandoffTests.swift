@@ -156,7 +156,7 @@ import Testing
     }
 }
 
-// Impl-audit round-1 regression tests (audits/c1/impl_audit_round1.md)
+// Impl-audit round-1 regression tests
 @Suite struct HandoffTransitionContractTests {
     /// F3: `delivered` is terminal — any transition out of it throws.
     @Test func deliveredIsTerminal() async throws {

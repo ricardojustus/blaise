@@ -38,7 +38,7 @@ public struct EngineRegistry: Sendable {
 /// Shipped default engine ids — used when `SettingsStore` has no selection.
 public enum EngineDefaults {
     public static let asrEngineID = "mlx-whisper-large-v3-turbo"
-    /// Cloud-as-default per the bake-off verdict (audits/c6/bakeoff_judgment.md):
+    /// Cloud-as-default per the engine bake-off verdict:
     /// the local engine FAILED the faithfulness hard floor (fabricated
     /// owner/action item in all three blind generations). Pre-sanctioned
     /// outcome under B-2/B-3; local stays registered and user-selectable.

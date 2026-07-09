@@ -1000,7 +1000,7 @@ func makeWorker(
 
     @Test func preG4LegacyKeyPayloadReMaterializesAndRecovers() async throws {
         // G4-M3 regression: an item minted BEFORE the legacy→user key rename stored a
-        // payload (and version_hash) keyed `legacy_user_action_items`. When its file is
+        // payload (and version_hash) keyed `ric_action_items`. When its file is
         // damaged/missing, re-materialization must reproduce that LEGACY hash
         // and recover — not quarantine. With the builder emitting the new key
         // UNCONDITIONALLY, the rebuilt bytes carry `user_action_items`, the hash
@@ -1026,11 +1026,11 @@ func makeWorker(
         guard let finalMeeting = try await MeetingRepository(database: database).fetch(meeting.id) else {
             throw TestFailure()
         }
-        // Mint the payload the OLD way: legacy `legacy_user_action_items` key form.
+        // Mint the payload the OLD way: legacy `ric_action_items` key form.
         let legacy = EvidencePayloadBuilder.build(
             meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault,
             userActionItemsKey: .legacy)
-        #expect(String(decoding: legacy.bytes, as: UTF8.self).contains("legacy_user_action_items"))
+        #expect(String(decoding: legacy.bytes, as: UTF8.self).contains("ric_action_items"))
         let relative = database.paths.relativeHandoffPayloadPath(
             meetingID: meeting.id, versionHash: legacy.versionHash)
         try ImmutablePayloadWriter.write(legacy.bytes, to: database.rootURL.appendingPathComponent(relative))
@@ -1052,7 +1052,80 @@ func makeWorker(
         #expect(rows.first?.state == .delivered)
         let restored = try Data(contentsOf: url)
         #expect(EvidencePayloadBuilder.sha256Hex(restored) == item.versionHash)
-        #expect(String(decoding: restored, as: UTF8.self).contains("legacy_user_action_items"))
+        #expect(String(decoding: restored, as: UTF8.self).contains("ric_action_items"))
+        #expect(transport.calls.first?.payload == restored)
+        #expect(await worker.currentSnapshot().damagedItems.isEmpty)
+    }
+
+    @Test func queuedMdV2DigestPayloadReMaterializesAndRecoversAfterShippedBump() async throws {
+        // T3.2 / AC6: a payload minted under a PRIOR digest contract (md-v2)
+        // carries a memory_digest, so its version_hash bakes in `md-v2`. After
+        // the shipped bump (now md-v6), that queued item's file is damaged/missing
+        // and re-materialization must reproduce the md-v2 hash — the worker
+        // rebuilds across the SHIPPED version then each prior one
+        // (md-v1 … md-v5 via `DigestPromptVersion.allCases`), so the md-v2 build
+        // matches and the item RECOVERS instead of quarantining. Every prior
+        // contract is retained append-only, which is what makes this loop reach
+        // the matching build.
+        #expect(DigestPromptBuilder.shippedVersion == .mdV6, "precondition: md-v6 is shipped")
+        let database = try makeDatabase()
+        try await seedHandoffConfig(database)  // valid destination (empty default would pause the worker)
+        let meeting = makeMeeting(title: "Quoll Harbor roadmap", attendees: [
+            Attendee(name: "Dana Marsh", email: "dana@vexatronlabs.example", source: .manual)
+        ])
+        try await MeetingRepository(database: database).create(meeting)
+        let provenance = ASRProvenance(
+            engine: "stub", model: "stub", runtime: "stub", engineVersion: "1", transcribedAt: msDate())
+        let segments = [
+            TranscriptSegment(
+                meetingID: meeting.id, ord: 0, startSeconds: 0, endSeconds: 1.5,
+                speakerLabel: "S0", speakerName: "Dana Marsh", text: "Shipping in May."),
+        ]
+        let stored = try await database.persistTranscript(
+            meetingID: meeting.id, segments: segments, asrProvenance: provenance,
+            dominantLanguage: "en", updatedAt: msDate())
+        // A notes row carrying a memory_digest, so the digest contract version is
+        // load-bearing in the payload bytes (not a no-op digest axis).
+        var notes = makeNotes(meetingID: meeting.id)
+        notes.memoryDigest = "## HEADER\nmeeting: Quoll Harbor roadmap\ndate: 2026-03-14\nspeaker: Dana Marsh\n"
+        guard let finalMeeting = try await MeetingRepository(database: database).fetch(meeting.id) else {
+            throw TestFailure()
+        }
+        // Mint the payload under the PRIOR contract: md-v2 (no longer shipped).
+        let priorContract = EvidencePayloadBuilder.build(
+            meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault,
+            digestPromptVersion: .mdV2)
+        #expect(String(decoding: priorContract.bytes, as: UTF8.self)
+            .contains("\"prompt_version\":\"md-v2\""))
+        // The SHIPPED build (md-v3) produces a DIFFERENT hash — so recovery cannot
+        // come from the shipped combination; it must reach the md-v2 build.
+        let shippedBuild = EvidencePayloadBuilder.build(
+            meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault)
+        #expect(shippedBuild.versionHash != priorContract.versionHash)
+        let relative = database.paths.relativeHandoffPayloadPath(
+            meetingID: meeting.id, versionHash: priorContract.versionHash)
+        try ImmutablePayloadWriter.write(
+            priorContract.bytes, to: database.rootURL.appendingPathComponent(relative))
+        let item = try await database.finalizeMeetingProcessing(
+            meetingID: meeting.id, versionHash: priorContract.versionHash,
+            payloadPath: relative, notes: notes)
+
+        // Damage the file so the pre-stream self-check must re-materialize.
+        let url = database.rootURL.appendingPathComponent(item.payloadPath)
+        try FileManager.default.removeItem(at: url)
+
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        let rows = try await HandoffRepository(database: database).allItems()
+        // Recovered, not quarantined: delivered, file restored to the md-v2
+        // bytes, hash intact.
+        #expect(rows.first?.state == .delivered)
+        let restored = try Data(contentsOf: url)
+        #expect(EvidencePayloadBuilder.sha256Hex(restored) == item.versionHash)
+        #expect(String(decoding: restored, as: UTF8.self).contains("\"prompt_version\":\"md-v2\""))
         #expect(transport.calls.first?.payload == restored)
         #expect(await worker.currentSnapshot().damagedItems.isEmpty)
     }
@@ -1077,7 +1150,7 @@ func makeWorker(
         #expect(await worker.deliveryHistory().first?.itemID == item.id)
     }
 
-    @Test(.disabled("PRE-EXISTING in-process deadlock (confirmed on the unmodified baseline via git-stash, unrelated to the backoff virtual clock): the test blocks the main thread with DispatchSemaphore.wait() inside DispatchQueue.main.async and awaits across it, which deadlocks the swift-testing in-process runner in this toolchain — it was the sole cause of the `--filter Handoff` watchdog hang. Documented in QUESTIONS.md with a fix (re-express the main-actor occupation without blocking the main thread). Re-enable after that fix.")) func kickLandingDuringIdlePublishSuspensionIsNotLost() async throws {
+    @Test(.disabled("PRE-EXISTING in-process deadlock (confirmed on the unmodified baseline via git-stash, unrelated to the backoff virtual clock): the test blocks the main thread with DispatchSemaphore.wait() inside DispatchQueue.main.async and awaits across it, which deadlocks the swift-testing in-process runner in this toolchain — it was the sole cause of the `--filter Handoff` watchdog hang. Documented internally with a fix (re-express the main-actor occupation without blocking the main thread). Re-enable after that fix.")) func kickLandingDuringIdlePublishSuspensionIsNotLost() async throws {
         // Impl-audit H-1 regression: a kick that lands while drain() is
         // suspended inside publish(.idle)'s MainActor hop must re-loop, not
         // be swallowed (the item would otherwise sit `pending` until the
@@ -1104,7 +1177,13 @@ func makeWorker(
         let release = DispatchSemaphore(value: 0)
         DispatchQueue.main.async {
             occupied.withLock { $0 = true }
-            release.wait()
+            // Bounded: the signal (line below, after the kick-during-suspension
+            // setup) normally arrives in milliseconds, so this never fires on
+            // the happy path. The timeout exists only so full-suite parallelism
+            // — where cooperative-pool pressure can delay the test task reaching
+            // release.signal() — can never turn this main-thread occupier into a
+            // permanent, suite-killing deadlock.
+            _ = release.wait(timeout: .now() + .seconds(30))
         }
         while !occupied.withLock({ $0 }) {
             try await Task.sleep(for: .milliseconds(2))

@@ -143,6 +143,19 @@ final class RecordingDispatcher: ProcessingDispatching, @unchecked Sendable {
     var dispatched: [MeetingID] { ids.withLock { $0 } }
 }
 
+/// Test-only: drives the real pipeline synchronously (the pre-F1-Inc2 listener
+/// seam behavior). In production the listener routes through the durable queue
+/// (`QueueProcessingDispatcher`); this adapter lets the end-to-end
+/// roster-absorption test still exercise a real regenerate run without spinning
+/// up a worker. The AC9 admission guard scans app/Sources only, so a test-only
+/// direct caller is fine.
+struct DirectPipelineDispatcher: ProcessingDispatching, @unchecked Sendable {
+    let pipeline: ProcessingPipeline
+    func dispatch(meetingID: MeetingID) async {
+        _ = try? await pipeline.dispatchProcessing(meetingID: meetingID, refuseCancelled: true)
+    }
+}
+
 func expectedAck(secret: String, iv: String, status: Int) -> String {
     let key = SymmetricKey(data: SHA256.hash(data: Data((secret + "ack").utf8)))
     let mac = HMAC<SHA256>.authenticationCode(
@@ -871,7 +884,8 @@ func finalizeGoldenMeeting(
         #expect(try await harness.queueRows(meeting.id) == 1)
 
         let ingestor = MeetEventsIngestor(
-            database: harness.database, secrets: secrets, dispatcher: harness.pipeline,
+            database: harness.database, secrets: secrets,
+            dispatcher: DirectPipelineDispatcher(pipeline: harness.pipeline),
             now: { msDate() })
         let startMs = Int64(msDate().timeIntervalSince1970 * 1000)
         let batch = MeetWireBatch(

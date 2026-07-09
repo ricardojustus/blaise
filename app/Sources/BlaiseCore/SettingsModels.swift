@@ -201,6 +201,11 @@ public final class HandoffSettingsModel {
     /// the knowledge graph's graph extractor reads. Default ON. OFF ⇒ no second synthesis
     /// call and no `memory_digest` on the payload (absent ⇒ skip to the knowledge graph).
     public var includeMemoryDigest = MemoryDigestSettings.defaultEnabled
+    /// "Verify & repair memory digest" — the second auditor pass that audits the
+    /// digest against the transcript and repairs grounding errors before sending.
+    /// Default ON (the validated precision config). Only meaningful when
+    /// `includeMemoryDigest` is ON; the UI disables it when the digest is OFF.
+    public var verifyMemoryDigest = MemoryDigestSettings.defaultVerifyEnabled
     public private(set) var validationError: String?
 
     private let settings: SettingsStore
@@ -224,6 +229,7 @@ public final class HandoffSettingsModel {
         markdownSidecar = (try? await settings.get(HandoffDestination.Key.localMarkdownSidecar, as: Bool.self))
             ?? nil ?? true
         includeMemoryDigest = await MemoryDigestSettings.isEnabled(in: settings)
+        verifyMemoryDigest = await MemoryDigestSettings.isVerifyEnabled(in: settings)
         validationError = validationMessage(of: current)
     }
 
@@ -266,6 +272,9 @@ public final class HandoffSettingsModel {
         // G14: persist the memory-digest toggle (forward renders only — it
         // never rewrites already-minted payloads).
         try? await settings.set(MemoryDigestSettings.enabledKey, to: includeMemoryDigest)
+        // Persist the verify/repair toggle (forward renders only). The dev env
+        // override BLAISE_DIGEST_VERIFY=1 forces the pass on regardless of this.
+        try? await settings.set(MemoryDigestSettings.verifyEnabledKey, to: verifyMemoryDigest)
         let candidate = HandoffSettings(
             user: user.trimmingCharacters(in: .whitespaces),
             identityFile: identityFile.trimmingCharacters(in: .whitespaces),
@@ -427,6 +436,12 @@ public final class UsageModel {
             (try? await ledger.monthReceipts())
             ?? CloudSpendMonthReceipts(monthKey: monthKey, receipts: [], accumulatorUSD: spentUSD)
     }
+
+    /// Cosmetic alias of `load()` so the Usage tab's Refresh button mirrors the
+    /// sibling panels (QueuePanelModel.refresh / ProcessingQueueModel.refresh):
+    /// re-reads the ledger month view on demand. Spend does NOT auto-tick live;
+    /// this + refresh-on-open is the correctness guarantee.
+    public func refresh() async { await load() }
 
     public func setCeiling(_ value: Double) async {
         guard value > 0 else { return }

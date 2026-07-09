@@ -350,7 +350,11 @@ struct RecordingControllerTests {
             now: { msDate() },
             finalizer: { paths, meetingID, part in
                 order.append("encodeEntered")
-                gate.wait()
+                // Bounded: gate.signal() (after the 200ms hold below) normally
+                // arrives well within this window, so the timeout never fires on
+                // the happy path. It exists only so a gated finalizer can never
+                // permanently block its thread under full-suite parallelism.
+                _ = gate.wait(timeout: .now() + .seconds(30))
                 let outcome = CaptureRecovery.finalizeTracks(
                     paths: paths, meetingID: meetingID, part: part)
                 order.append("encodeDone")

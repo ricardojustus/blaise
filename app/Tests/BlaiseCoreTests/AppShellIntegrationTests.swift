@@ -99,7 +99,7 @@ import Testing
         // (a) Known seeded-mock strings, via the view-model path: snippet
         // segments carry the mapped match runs and the meeting title joins.
         for term in ["patch", "crash-free"] {
-            let results = await library.search(term)
+            let results = await library.search(term).transcripts
             #expect(!results.isEmpty, "no results for \(term)")
             let first = try #require(results.first)
             #expect(first.segments.contains { $0.isMatch })
@@ -108,11 +108,11 @@ import Testing
 
         // (b) Planted transcripts: both meetings reachable; diacritic-folded
         // FTS (unicode61 remove_diacritics) matches "orcamento" too.
-        let planted = await library.search("orçamento")
+        let planted = await library.search("orçamento").transcripts
         #expect(planted.contains { $0.hit.meetingID == plantedA.id })
-        let folded = await library.search("orcamento")
+        let folded = await library.search("orcamento").transcripts
         #expect(folded.contains { $0.hit.meetingID == plantedA.id })
-        let english = await library.search("roadmap")
+        let english = await library.search("roadmap").transcripts
         #expect(english.contains { $0.hit.meetingID == plantedB.id })
         #expect(english.first { $0.hit.meetingID == plantedB.id }?.meetingTitle == "Planted B — roadmap")
     }
@@ -120,7 +120,7 @@ import Testing
     @Test func engineSwitchThenRegenerateEndToEnd() async throws {
         // Settings switch + regenerate with mock engines: the regenerated
         // notes carry the NEWLY selected engine's provenance (real-engine
-        // evidence = C7 AC4, audits/c7).
+        // evidence = C7 AC4).
         let harness = try await makePipelineHarness()
         let meeting = try await harness.importTestMeeting()
         _ = try await harness.pipeline.process(meetingID: meeting.id)

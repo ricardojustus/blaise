@@ -29,6 +29,9 @@ final class AppUIState {
     /// specific tab (and scroll to a segment).
     var detailRequest: DetailRequest?
     var importSourceURL: URL?
+    /// F1 Inc2: set by the "Reprocess All Meetings…" menu item; presents the
+    /// cost-cap confirmation sheet.
+    var reprocessAllRequested = false
     /// G3 onboarding: presented at most ONCE per launch when the stored
     /// identity is empty (first run / not yet onboarded). Skippable — the app
     /// works unnamed — and re-offerable from Settings, but never nagging: the
@@ -76,6 +79,13 @@ final class AppEnvironment {
     let pipeline: ProcessingPipeline
     let worker: HandoffWorker
     let handoffStatus: HandoffStatusHolder
+    /// F1 Inc2: the durable processing-queue worker — the single admission path
+    /// for full-pipeline work (the user's Process/Regenerate, import, recovery,
+    /// the listener re-mint, and Reprocess-all all enqueue here).
+    let processingQueue: ProcessingQueueWorker
+    /// F1 Inc2: the observable processing-queue state for the Settings panel +
+    /// StatusBar (the worker publishes into it).
+    let processingStatus: ProcessingStatusHolder
     let ingestor: MeetEventsIngestor
     let listener: MeetEventsListener
     let listenerStatus: ListenerStatusHolder
@@ -90,6 +100,7 @@ final class AppEnvironment {
     // by the meter view (leaf observation) so a ≤ 10 Hz level publish never
     // invalidates the scene root.
     let levelMeter = LevelMeterHolder()
+    let googleCalendar: GoogleCalendarModel
     let calendarSuggestions: CalendarSuggestionProvider
     // C14: recording automation.
     let tracker: MeetCallTracker
@@ -110,6 +121,12 @@ final class AppEnvironment {
     /// controller's `.level` events; publishes into `levelMeter` (the
     /// leaf-observed holder). nil when not recording.
     private var levelMeterModel: LevelMeter?
+    /// Silence auto-pause watchdog (orthogonal to the `MeetCallTracker` end-
+    /// detector): armed at each recording start/resume, fed the same `.level`
+    /// events as the meter, and fires ONCE to `pauseRecording()` after BOTH
+    /// tracks sit below the silence floor for the configured threshold. Disarmed
+    /// on pause/stop and after firing.
+    private var silenceWatchdog = SilenceWatchdog()
     private var automationEventTask: Task<Void, Never>?
     private var schedulerTask: Task<Void, Never>?
     private var tickerTask: Task<Void, Never>?
@@ -175,17 +192,37 @@ final class AppEnvironment {
             vocabularyProvider: { PipelineVocabulary.user(dataRoot: dataRoot) },
             handoffKicker: worker,
             meetEventsSweeper: ingestor)
-        dispatcherBox.set(pipeline)
-        // C11: capture engine + lifecycle controller. The kick is the
-        // track-inventory-aware, status-dependent dispatch.
+        // F1 Inc2: the durable processing queue is the single admission path for
+        // full-pipeline work. runJob = the unchanged executor; the job's origin
+        // sets refuseCancelled (auto/recovery must not resurrect a user-cancelled
+        // meeting — D1). Sequential worker + the single-flight chain = no new
+        // concurrency.
         let pipeline = self.pipeline
+        let processingStatus = ProcessingStatusHolder()
+        self.processingStatus = processingStatus
+        let pauseSettings = settings
+        let processingQueue = ProcessingQueueWorker(
+            database: database,
+            holder: processingStatus,
+            isPaused: {
+                ((try? await pauseSettings.get(ProcessingQueueSettings.pausedKey, as: Bool.self)) ?? nil)
+                    ?? false
+            },
+            runJob: { meetingID, origin in
+                _ = try await pipeline.dispatchProcessing(
+                    meetingID: meetingID, refuseCancelled: origin != .user)
+            })
+        self.processingQueue = processingQueue
+        // C3: the Meet-listener post-ready re-mint routes through the queue too
+        // (was a direct dispatchProcessing via the pipeline conformance).
+        dispatcherBox.set(QueueProcessingDispatcher(queue: processingQueue))
+        // C11: capture engine + lifecycle controller. The stop/End kick now
+        // ENQUEUES (origin .auto → refuseCancelled) instead of dispatching.
         let recordingController = RecordingController(
             database: database,
             engine: CaptureSession(),
             processKicker: { meetingID in
-                // G10 §1: the stop/End auto-kick refuses a cancelled meeting.
-                _ = try? await pipeline.dispatchProcessing(
-                    meetingID: meetingID, refuseCancelled: true)
+                await processingQueue.enqueue(meetingID, origin: .auto)
             },
             observer: observerBox)
         self.recordingController = recordingController
@@ -199,7 +236,9 @@ final class AppEnvironment {
 
         // C14: the automation tracker + calendar pre-meeting scheduler.
         // Closures capture locals (not self — the boxes close the cycles).
-        let calendar = CalendarSuggestionProvider()
+        let googleCalendar = GoogleCalendarModel(settings: settings, secrets: secrets)
+        self.googleCalendar = googleCalendar
+        let calendar = CalendarSuggestionProvider(google: googleCalendar, settings: settings)
         self.calendarSuggestions = calendar
         let notifier = self.notificationAdapter
         let schedulerRef = Mutex<PreMeetingScheduler?>(nil)
@@ -212,12 +251,8 @@ final class AppEnvironment {
                 let identity =
                     (try? await settings.get(UserIdentity.settingsKey, as: UserIdentity.self))
                     ?? nil ?? .shippedDefault
-                return await MainActor.run {
-                    if calendar.access == .granted {
-                        calendar.load(userEmail: identity.email)
-                    }
-                    return calendar.suggestions
-                }
+                await calendar.refresh(userEmail: identity.email)
+                return await MainActor.run { calendar.suggestions }
             },
             calendarHook: { code in
                 let scheduler = schedulerRef.withLock { $0 }
@@ -279,6 +314,16 @@ final class AppEnvironment {
                     // channel's silence clock starts from `at`).
                     self.levelMeterModel = LevelMeter(recordingStart: at)
                     self.levelMeter.reset()
+                    // Silence auto-pause: arm for this live session (start AND
+                    // resume re-emit `.started`); read the two settings at arm
+                    // time so a change takes effect on the next session. The
+                    // clock is monotonic process uptime (never wall-clock), so a
+                    // sleep/wake gap cannot false-fire the watchdog.
+                    self.silenceWatchdog.enabled =
+                        await SilenceAutoPauseSettings.enabled(from: self.settings)
+                    self.silenceWatchdog.thresholdSeconds =
+                        await SilenceAutoPauseSettings.thresholdSeconds(from: self.settings)
+                    self.silenceWatchdog.arm(nowUptime: ProcessInfo.processInfo.systemUptime)
                 case .micSilence(let active):
                     self.captureStatus.apply(.micSilence(active: active))
                 case .level(let you, let others):
@@ -292,6 +337,27 @@ final class AppEnvironment {
                     {
                         self.levelMeter.levels = levels
                     }
+                    // Silence auto-pause: a sustained dual-track silence (both
+                    // tracks below the floor for the threshold) pauses the
+                    // recording ONCE. Disarm-then-pause so the queued `.paused`
+                    // event can never re-trigger it; if the pause raced a stop
+                    // (no-op), re-arm so a later genuine silence still fires.
+                    let nowUptime = ProcessInfo.processInfo.systemUptime
+                    if self.silenceWatchdog.note(you: you, others: others, nowUptime: nowUptime),
+                        self.captureStatus.isRecording
+                    {
+                        let thresholdMinutes =
+                            Int((self.silenceWatchdog.thresholdSeconds / 60).rounded())
+                        self.silenceWatchdog.disarm()
+                        self.logger.notice(
+                            "silence auto-pause fired (both tracks below floor past threshold) — pausing recording")
+                        if let paused = await self.pauseRecording() {
+                            await self.notificationAdapter.postSilenceAutoPause(
+                                meetingID: paused.id, title: paused.title, minutes: thresholdMinutes)
+                        } else {
+                            self.silenceWatchdog.arm(nowUptime: nowUptime)
+                        }
+                    }
                 case .stopping:
                     // The encode may take a while — reflect "processing"
                     // immediately, before `.stopped` arrives.
@@ -300,6 +366,7 @@ final class AppEnvironment {
                     // G12 §2: tear down the live meter so the toolbar settles.
                     self.levelMeterModel = nil
                     self.levelMeter.reset()
+                    self.silenceWatchdog.disarm()
                 case .stopped(let id, let alarm, let kicked):
                     if kicked {
                         self.captureStatus.processingMeetingID = id
@@ -327,6 +394,7 @@ final class AppEnvironment {
                     // G12 §2: no live capture while paused — settle the meter.
                     self.levelMeterModel = nil
                     self.levelMeter.reset()
+                    self.silenceWatchdog.disarm()
                 case .resumed(let id, _, _):
                     // G9: the held meeting resumed — back to recording (the
                     // `.started` re-emission applies `.captureStarted`).
@@ -427,6 +495,8 @@ final class AppEnvironment {
             let denied = await notificationAdapter.authorizationDenied()
             await MainActor.run { captureStatus.notificationsDenied = denied }
         }
+        await googleCalendar.load()
+        await calendarSuggestions.load()
         // Handoff persistent-failure warning → Notification Center: the
         // holder fires once per failure episode (never per attempt); clearing
         // withdraws the standing notification silently — no success spam.
@@ -459,6 +529,7 @@ final class AppEnvironment {
         }
         library.start()
         await worker.start()
+        await processingQueue.start()  // F1 Inc2: resume sweep + drain any pending
         await listener.start()
 
         // C11 launch hygiene + recovery: destroy a crashed session's
@@ -473,11 +544,17 @@ final class AppEnvironment {
             ?? nil ?? .shippedDefault
         userEmail = startupIdentity.email
         userName = startupIdentity.name
-        Task { [database, pipeline, captureStatus] in
+        // Calendar surfaces refresh OFF the startup critical path: a slow or
+        // unreachable Google fetch must not delay paused-meeting restoration,
+        // pipeline-event subscription, or the scheduler timer below.
+        Task { await refreshCalendarSurfaces() }
+        Task { [database, processingQueue, captureStatus] in
+            // F1 Inc2: launch recovery ENQUEUES (origin .auto → refuseCancelled),
+            // funneling the orphan-CAF sweep + redispatchInterrupted + durable-
+            // grace recovery onto one queued job per meeting (the partial unique
+            // index dedups → no double-processing).
             let kick: @Sendable (MeetingID) async -> Void = { meetingID in
-                // G10 §1: launch auto re-dispatch refuses a cancelled meeting.
-                _ = try? await pipeline.dispatchProcessing(
-                    meetingID: meetingID, refuseCancelled: true)
+                await processingQueue.enqueue(meetingID, origin: .auto)
             }
             // G10 §2: the tombstone sweep — removes EXACTLY the tombstoned
             // dirs (durable owner intent, the only file-deletion authority for
@@ -612,12 +689,38 @@ final class AppEnvironment {
     }
 
     private func refreshSchedulerSnapshots() async {
-        guard calendarSuggestions.access == .granted else { return }
         let now = Date()
-        let snapshots = calendarSuggestions.eventSnapshots(
+        let snapshots = await calendarSuggestions.eventSnapshots(
             from: now.addingTimeInterval(-PreMeetingScheduler.validitySeconds),
             to: now.addingTimeInterval(24 * 3600))
         await scheduler.update(snapshots: snapshots)
+        await refreshCalendarSurfaces(now: now)
+    }
+
+    func refreshCalendarSurfaces(now: Date = Date()) async {
+        await calendarSuggestions.refresh(
+            userEmail: userEmail, recordedCodes: recordedMeetingCodes(), now: now)
+    }
+
+    /// A calendar source/visibility change (Apple or Google enable, or a
+    /// per-calendar hide/show): re-fetch the FILTERED snapshots into the 24h
+    /// scheduler too — so a now-hidden or disabled calendar's pending Launch &
+    /// Record notifications are withdrawn — not just the suggestion / upcoming
+    /// surfaces. Use this (not `refreshCalendarSurfaces`) from Settings actions.
+    func calendarSourcesChanged() async {
+        await refreshSchedulerSnapshots()
+    }
+
+    private func recordedMeetingCodes() -> Set<String> {
+        (try? database.pool.read { db in
+            try Set(String.fetchAll(
+                db,
+                sql: """
+                    SELECT DISTINCT meeting_code FROM meeting
+                    WHERE meeting_code IS NOT NULL
+                      AND status IN ('recording', 'processing', 'ready', 'failed', 'paused')
+                    """))
+        }) ?? []
     }
 
     // MARK: - Recording actions (menu bar + ⌥⌘R command)
@@ -633,7 +736,12 @@ final class AppEnvironment {
         // joined mid-way got no `scheduled_end_ms` and the §2 classifier could
         // never Rule-1 it. The supplied anchor (a surfaced suggestion) always
         // wins — §1 "written once at start when matched", no retroactive rebind.
-        let resolvedAnchor = anchor ?? coveringCalendarAnchor(code: meetingCode)
+        let resolvedAnchor: CalendarAnchor?
+        if let anchor {
+            resolvedAnchor = anchor
+        } else {
+            resolvedAnchor = await coveringCalendarAnchor(code: meetingCode)
+        }
         do {
             let meeting = try await recordingController.start(
                 source: source, title: title, meetingCode: meetingCode, attendees: attendees,
@@ -654,19 +762,26 @@ final class AppEnvironment {
             anchor: CalendarAnchor(suggestion: suggestion))
     }
 
+    func startRecording(upcoming row: UpcomingMeetingRow) async {
+        await startRecording(
+            source: row.source, title: row.title,
+            meetingCode: row.meetingCode, attendees: row.attendees,
+            anchor: row.anchor)
+        await refreshCalendarSurfaces()
+    }
+
     /// G11 §4 (v3.2): the calendar anchor for a quick-start with no surfaced
     /// suggestion — the late-join / undetected-Zoom anchor source. Reads the
     /// EventKit snapshots over the bind window [now − 15 min, now + buffer] and
     /// anchors to a covering event (`quickStartAnchor`). nil when access is
     /// not granted or no event covers now (the start stays ad-hoc → §1 columns
     /// NULL). EventKit reads only; never prompts (the prompt is its own opt-in).
-    private func coveringCalendarAnchor(code: String?) -> CalendarAnchor? {
-        guard calendarSuggestions.access == .granted else { return nil }
+    private func coveringCalendarAnchor(code: String?) async -> CalendarAnchor? {
         let now = Date()
         // The fetch must span any event that could COVER now: it can have
         // started up to its full duration ago, so reach back generously and
         // forward past the bind lead; quickStartAnchor enforces actual coverage.
-        let snapshots = calendarSuggestions.eventSnapshots(
+        let snapshots = await calendarSuggestions.eventSnapshots(
             from: now.addingTimeInterval(-12 * 3600),
             to: now.addingTimeInterval(CalendarSuggestionBuilder.bindLeadSeconds))
         return CalendarSuggestionBuilder.quickStartAnchor(for: now, code: code, in: snapshots)
@@ -702,14 +817,20 @@ final class AppEnvironment {
     }
 
     /// Pause the live recording (finalize the current part, hold the meeting
-    /// open). The `.paused` controller event drives the indicator.
-    func pauseRecording() async {
+    /// open). The `.paused` controller event drives the indicator. Returns the
+    /// paused meeting on success, or nil if the pause threw / no-op'd (e.g. a
+    /// stop already began) — the silence watchdog uses this to know whether to
+    /// disarm or re-arm.
+    @discardableResult
+    func pauseRecording() async -> Meeting? {
         do {
-            _ = try await recordingController.pause()
+            let meeting = try await recordingController.pause()
             captureStatus.lastActionError = nil
+            return meeting
         } catch {
             logger.error("pause recording failed: \(error)")
             captureStatus.lastActionError = "Could not pause recording: \(error)"
+            return nil
         }
     }
 
@@ -879,13 +1000,24 @@ final class AppEnvironment {
         }
         // Attendees from the matching current suggestion (user excluded as
         // today); the extension's first batch correlates live via the code.
-        if calendarSuggestions.access == .granted {
-            calendarSuggestions.load(userEmail: userEmail)
+        await refreshCalendarSurfaces()
+        let row = calendarSuggestions.upcomingRows.first {
+            $0.id == eventKey || $0.meetingCode == code
         }
         let suggestion = calendarSuggestions.suggestions.first { $0.meetingCode == code }
         await tracker.startCorrelated(
-            code: code, title: title, attendees: suggestion?.attendees ?? [],
-            anchor: suggestion.flatMap(CalendarAnchor.init(suggestion:)))
+            code: code, title: title,
+            attendees: row?.attendees ?? suggestion?.attendees ?? [],
+            anchor: row?.anchor ?? suggestion.flatMap(CalendarAnchor.init(suggestion:)))
+        await refreshCalendarSurfaces()
+    }
+
+    func launchAndRecord(upcoming row: UpcomingMeetingRow) async {
+        guard let code = row.meetingCode, let urlString = row.urlString else {
+            await startRecording(upcoming: row)
+            return
+        }
+        await launchAndRecord(eventKey: row.id, code: code, title: row.title, urlString: urlString)
     }
 
     /// ⌥⌘R: toggle. Not recording → quick-start (Meet, clipboard code if
@@ -926,10 +1058,8 @@ final class AppEnvironment {
             await MainActor.run {
                 userEmail = identity.email
                 userName = identity.name
-                if calendarSuggestions.access == .granted {
-                    calendarSuggestions.load(userEmail: userEmail)
-                }
             }
+            await refreshCalendarSurfaces()
         }
     }
 
@@ -1216,11 +1346,27 @@ final class AppEnvironment {
             configuration: configuration(
                 for: ClaudeSummarizationEngine.engineID, descriptors: ClaudeSummarizationEngine.descriptors),
             ledger: ledger)
+        // The "Account engine" — the user's Claude subscription via the `claude -p`
+        // CLI (~$0). Registered alongside the API engine so the existing engine
+        // picker surfaces it; it is NEVER the default (`EngineDefaults.summarization`
+        // stays the API engine) and runs only when the user selects it AND it is
+        // available (the `claude` binary resolves AND the OAuth token is set).
+        let claudeCode = ClaudeCodeSummarizationEngine(
+            configuration: configuration(
+                for: ClaudeCodeSummarizationEngine.engineID,
+                descriptors: ClaudeCodeSummarizationEngine.descriptors),
+            ledger: ledger)
         // `try!` is safe: the ids are distinct constants. Summarization
-        // order is load-bearing (D17): the lightweight cloud engine is
+        // order is load-bearing (D17): the lightweight API engine is
         // registered FIRST so that any first-registered substitution path
         // can never land on the 18 GB-peak local engine (the resolver also
         // prefers a lightweight engine on its own — belt and suspenders).
-        return try! EngineRegistry(asr: [whisper, parakeet], summarization: [claude, gemma])
+        // The account (claude -p) engine is registered LAST so the runtime
+        // lightweight-substitution / one-hop fallback never AUTO-routes a
+        // meeting's transcript through the subscription path: the API engine
+        // is preferred, then the local MLX engine, and the account engine runs
+        // ONLY when the user explicitly selects it.
+        return try! EngineRegistry(
+            asr: [whisper, parakeet], summarization: [claude, gemma, claudeCode])
     }
 }

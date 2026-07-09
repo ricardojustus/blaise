@@ -19,8 +19,7 @@ extension CaptureStitcher {
     /// Linear gain applied to every SYSTEM (other-side) track in the playback
     /// mix so the user's own mic is not buried (mix-balance fix, 2026-06-12).
     ///
-    /// Field measurement on the real meeting (offline RMS, see
-    /// audits/playback/r1_fix_neuter_checks.md): active-segment loudness was
+    /// Field measurement (offline RMS) found active-segment loudness was
     /// mic (the user) median ≈ −34 dBFS vs system (the others) median ≈ −21
     /// dBFS — a ~12.6 dB gap (the auditor measured 12.9 dB on solo segments,
     /// 17.0 dB overall). The mic CANNOT be boosted — AVAudioMix volume is 0…1

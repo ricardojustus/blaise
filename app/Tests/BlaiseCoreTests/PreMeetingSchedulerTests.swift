@@ -110,6 +110,22 @@ struct PreMeetingSchedulerTests {
         #expect(h.notifier.posts.count == 1, "fired-set dedupe (eventIdentifier + start)")
     }
 
+    @Test("a posted event removed from the snapshot set (hidden calendar) is withdrawn")
+    func vanishedEventWithdrawn() async {
+        let h = makeSchedulerHarness()
+        let start = SchedulerHarness.epoch.addingTimeInterval(600)
+        await h.scheduler.update(snapshots: [meetEvent(start: start)])
+        h.advance(541)  // T−59 s → posts
+        await h.scheduler.evaluate()
+        #expect(h.notifier.posts.count == 1)
+        #expect(h.notifier.withdrawals.isEmpty)
+        // The event's calendar is hidden → it vanishes from the next snapshot
+        // set; its already-posted Launch & Record notification must be withdrawn.
+        await h.scheduler.update(snapshots: [])
+        let key = PreMeetingScheduler.eventKey(meetEvent(start: start))
+        #expect(h.notifier.withdrawals.contains(key))
+    }
+
     @Test("events without a Meet code never fire (Zoom/Teams out of scope)")
     func nonMeetSkipped() async {
         let h = makeSchedulerHarness()

@@ -8,7 +8,7 @@ import Testing
 // `<repo>/.test-skips/<test>.txt` and return — never silently green.
 
 private let repoRoot = VocabFixtures.repoRoot
-private let researchVenv = repoRoot.appendingPathComponent("research/asr/.venv", isDirectory: true)
+private let researchVenv = RegressionPin.asrVenv
 private let realHFHome = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".cache/huggingface", isDirectory: true)
 private let fluidAudioModelsParent = FileManager.default.homeDirectoryForCurrentUser
@@ -107,10 +107,89 @@ private func tokenize(_ text: String) -> [String] {
         #expect(!result.provenance.vocabularyHintsApplied)
     }
 
+    // #100 Part A — the ONLY automated guard that dominant-language detection
+    // yields `en` on REAL audio with NO language hint (the byte-pin and the
+    // en-hinted seg-A test above both BYPASS Part A: they supply language="en"
+    // so the driver's `language is None` branch never runs). GATED + skip-
+    // protocol (mirrors whisperTranscribesRealSegA); it runs ONE ~18s local MLX
+    // forward pass per selected window. DO NOT count this as covered until the
+    // gated impl-audit run executes it.
+    @Test(.timeLimit(.minutes(10)))
+    func whisperDetectsEnglishWithNoLanguageHint() async throws {
+        let wav = VocabFixtures.fixture("icsi_sample/Bmr001_excerpt_5min.wav")
+        guard FileManager.default.isExecutableFile(atPath: researchVenv.appendingPathComponent("bin/python").path),
+            WhisperModelCache(hfHome: realHFHome).integrity()
+        else {
+            recordTestSkip(
+                "whisperDetectsEnglishWithNoLanguageHint",
+                reason: "research venv or HF whisper cache missing on this machine")
+            return
+        }
+
+        let dataRoot = try makeTempRoot()
+        let database = try BlaiseDatabase(rootURL: dataRoot)
+        let settings = SettingsStore(database: database)
+        try await settings.set(
+            "engine.\(MLXWhisperEngine.engineID).\(MLXWhisperEngine.venvPathKey)",
+            to: researchVenv.path)
+        try await settings.set(
+            "engine.\(MLXWhisperEngine.engineID).\(MLXWhisperEngine.hfHomePathKey)",
+            to: realHFHome.path)
+        let engine = MLXWhisperEngine(
+            configuration: EngineConfiguration(
+                engineID: MLXWhisperEngine.engineID,
+                descriptors: MLXWhisperEngine.descriptors,
+                settings: settings,
+                secrets: InMemorySecretStore()),
+            dataRoot: dataRoot,
+            uvBinary: repoRoot.appendingPathComponent("vendor/uv/uv"),
+            driverScript: try #require(MLXWhisperEngine.bundledDriverScript()),
+            requirementsFile: try #require(MLXWhisperEngine.bundledRequirementsFile()),
+            sweepOrphansOnInit: false)
+
+        #expect(await engine.availability() == .available)
+
+        // NO languageHint -> the driver runs the Part A multi-window detector.
+        let started = Date()
+        let result = try await engine.transcribe(ASRRequest(audioURL: wav))
+        let elapsed = Date().timeIntervalSince(started)
+        print("[integration] whisper icsi (nil-hint): \(result.segments.count) segments in \(String(format: "%.1f", elapsed)) s, lang=\(result.detectedLanguage ?? "nil")")
+
+        // THE Part A assertion: dominant language detected as English.
+        #expect(result.detectedLanguage == "en")
+        #expect(result.provenance.languageHint == nil)
+
+        let duration = try WAVHeader.read(at: wav).duration  // 300.0
+
+        // Re-assert the structural invariants on the nil-hint path.
+        #expect(result.segments.count >= 10)
+        for (index, segment) in result.segments.enumerated() {
+            #expect(!segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            #expect(segment.startSeconds >= 0)
+            #expect(segment.endSeconds <= 300.04)
+            #expect(segment.endSeconds > segment.startSeconds)
+            if index > 0 {
+                #expect(segment.startSeconds >= result.segments[index - 1].endSeconds)
+                #expect(segment.startSeconds > result.segments[index - 1].startSeconds)
+            }
+        }
+        // Word timings present (C4 dependency).
+        #expect(result.segments.allSatisfy { $0.words != nil })
+        #expect(result.segments.contains { !($0.words ?? []).isEmpty })
+
+        // Renormalize report-accounting equality on the nil-hint payload.
+        let raw = try JSONDecoder().decode(WhisperDriverOutput.self, from: result.rawPayload)
+        let (renormalized, report) = SegmentNormalizer.normalize(raw.asrSegments, audioDuration: duration)
+        #expect(renormalized == result.segments)
+        #expect(raw.segments.count >= renormalized.count)
+        #expect(report.droppedEmpty + report.droppedOutOfBounds + report.clampedDropped + report.droppedZeroLength
+                == raw.segments.count - renormalized.count)
+    }
+
     @Test(.timeLimit(.minutes(30)))
     func parakeetTranscribesRealSegB() async throws {
         let wav = VocabFixtures.fixture("icsi_sample/Bmr001_excerpt_5min.wav")
-        let oracleURL = repoRoot.appendingPathComponent("research/asr/out/fluidaudio_parakeet/icsi_excerpt.txt")
+        let oracleURL = RegressionPin.asrOutDir.appendingPathComponent("fluidaudio_parakeet/icsi_excerpt.txt")
         // The oracle is minted by a later model run; absent it, skip cleanly
         // rather than hard-fail (the stacks/model guard is implicit — prepare()
         // below is what exercises the FluidAudio models).
@@ -162,8 +241,8 @@ private func tokenize(_ text: String) -> [String] {
         // Engine 2 POPULATES words from token timings (C4 contract).
         #expect(result.segments.allSatisfy { $0.words != nil && !($0.words ?? []).isEmpty })
 
-        // Segmenter shape comparison against the one committed oracle
-        // (research/asr/out/fluidaudio_parakeet/icsi_excerpt.txt). Tolerant by
+        // Segmenter shape comparison against the one committed oracle.
+        // Tolerant by
         // necessity: research artifacts hold post-merge TEXT only, and
         // 0.15.2 is a different rev than the research checkout.
         let oracleTokens = tokenize(try String(contentsOf: oracleURL, encoding: .utf8))

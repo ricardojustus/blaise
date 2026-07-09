@@ -120,15 +120,21 @@ public struct CalendarAnchor: Sendable, Equatable {
 }
 
 public enum CalendarSuggestionBuilder {
-    /// Events whose start lies within ± this of now surface as suggestions.
-    public static let windowSeconds: TimeInterval = 15 * 60
+    /// A just-started meeting still surfaces if it began within this look-BACK
+    /// (you opened the menu a few minutes late).
+    public static let lookbackSeconds: TimeInterval = 15 * 60
+    /// Upcoming meetings surface this far AHEAD, so the menu is not empty unless
+    /// you happen to open it within minutes of a meeting. (The Upcoming list is
+    /// the comprehensive surface; the menu is the menu-bar quick-record glance.)
+    public static let lookaheadSeconds: TimeInterval = 2 * 60 * 60
     /// G11 §4 (v3.2): the lead before an event's start at which a start binds
     /// to it — widened from "start vicinity only" to the WHOLE scheduled span
     /// (a real Zoom meeting joined mid-way went undetected). A start binds when
     /// it falls within [event.start − 15 min, event.end].
     public static let bindLeadSeconds: TimeInterval = 15 * 60
 
-    /// Builds suggestions from event snapshots: events ±15 min from now that
+    /// Builds suggestions from event snapshots: current + upcoming events (a
+    /// short look-back through a 2-hour look-ahead) that
     /// have attendees or a meeting link. The user (matched by `userEmail`,
     /// case-insensitive) is excluded from the prefilled attendees — the user is
     /// not his own attendee. Source inferred from the link (meet code →
@@ -142,7 +148,10 @@ public enum CalendarSuggestionBuilder {
         let userEmailFolded = userEmail.lowercased()
         let selfExcludes = !userEmailFolded.isEmpty
         return events
-            .filter { abs($0.start.timeIntervalSince(now)) <= windowSeconds }
+            .filter {
+                let delta = $0.start.timeIntervalSince(now)
+                return delta >= -lookbackSeconds && delta <= lookaheadSeconds
+            }
             .compactMap { event -> MeetingSuggestion? in
                 let linkText = [event.location, event.notes, event.urlString]
                     .compactMap { $0 }.joined(separator: "\n")

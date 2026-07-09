@@ -60,6 +60,22 @@ public actor PreMeetingScheduler {
     }
 
     public func update(snapshots: [CalendarEventSnapshot]) async {
+        // Withdraw any posted Launch & Record notification whose event has
+        // VANISHED from the new snapshot set — e.g. the user hid or disabled its
+        // calendar. `evaluate()` only visits events still present, so a vanished
+        // one would otherwise linger until time-expiry. Clearing fired/withdrawn
+        // lets it re-post if the event later returns (un-hidden).
+        let presentKeys = Set(snapshots.map(Self.eventKey))
+        let posted = postedByCode  // copy to iterate while mutating the original
+        for (code, keys) in posted {
+            for key in keys where !presentKeys.contains(key) {
+                await notifier.withdrawCalendarUpcoming(eventKey: key)
+                postedByCode[code]?.remove(key)
+                fired.remove(key)
+                withdrawn.remove(key)
+            }
+        }
+        postedByCode = postedByCode.filter { !$0.value.isEmpty }
         self.snapshots = snapshots
         await evaluate()
     }

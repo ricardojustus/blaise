@@ -4,6 +4,7 @@ import GRDB
 public enum BlaiseDatabaseError: Error, Equatable {
     case meetingNotFound(MeetingID)
     case handoffItemNotFound(HandoffID)
+    case processingJobNotFound(String)
     /// `enqueue` requires the payload file already on disk (relative path under the data root).
     case missingPayloadFile(relativePath: String)
     /// `delivered` is terminal: no transition may leave it (impl audit F3).
@@ -142,7 +143,7 @@ public final class BlaiseDatabase: Sendable {
         // "fallback: input too long", cleared at the start of every run (C7).
         migrator.registerMigration("v3") { db in
             try db.create(table: "cloud_spend") { t in
-                t.primaryKey("month_key", .text) // "YYYY-MM" in America/Sao_Paulo
+                t.primaryKey("month_key", .text) // "YYYY-MM" in the system time zone
                 t.column("accumulated_usd", .double).notNull()
             }
             try db.alter(table: "meeting") { t in
@@ -421,6 +422,93 @@ public final class BlaiseDatabase: Sendable {
             try db.drop(table: "cloud_spend_receipt")
             try db.rename(table: "cloud_spend_receipt_new", to: "cloud_spend_receipt")
         }
+
+        // F1: the durable processing-queue substrate (additive; the pipeline
+        // body is unchanged). Mirrors handoff_queue. `created_seq` is the
+        // VACUUM-stable, clock-independent FIFO key; the partial unique index
+        // (raw SQL — no GRDB `create(indexOn:)` precedent for a WHERE clause) is
+        // the dedup constraint: at most one live job per meeting.
+        migrator.registerMigration("v15") { db in
+            try db.create(table: "processing_queue") { t in
+                t.primaryKey("id", .text)
+                t.column("meeting_id", .text).notNull()
+                    .references("meeting", onDelete: .cascade)
+                t.column("state", .text).notNull()
+                    .check { ProcessingJobState.allCases.map(\.rawValue).contains($0) }
+                t.column("origin", .text).notNull()
+                    .check { ProcessingJobOrigin.allCases.map(\.rawValue).contains($0) }
+                t.column("attempts", .integer).notNull().defaults(to: 0)
+                t.column("enqueued_at", .datetime).notNull()
+                t.column("started_at", .datetime)
+                t.column("finished_at", .datetime)
+                t.column("last_error", .text)
+                t.column("created_seq", .integer).notNull().unique()
+            }
+            try db.create(indexOn: "processing_queue", columns: ["state", "created_seq"])
+            try db.execute(
+                sql: "CREATE UNIQUE INDEX uniq_processing_live ON processing_queue(meeting_id) "
+                    + "WHERE state IN ('pending','running')")
+        }
+
+        // F2: full-text search over NOTES. A STANDALONE FTS5 table — NOT
+        // external-content. `transcript_fts` can be external-content because
+        // `transcript_segment` has an INTEGER-PK rowid alias (VACUUM-stable);
+        // `meeting_notes` has a TEXT primary key, so its hidden rowid is not
+        // VACUUM-stable, and the codebase prefers VACUUM-stable keys. So
+        // `notes_fts` stores `meeting_id` as a real column and is kept in sync
+        // by meeting_id-keyed triggers — search returns the meeting id directly,
+        // no rowid join. The triggers live in the schema, so the sacred finalize
+        // path (`MeetingNotes.upsert`) is untouched. The AFTER UPDATE trigger is
+        // the HOT path: note regeneration is a GRDB upsert
+        // (INSERT…ON CONFLICT DO UPDATE = a SQLite UPDATE), so without it a
+        // regenerated note would keep stale indexed text. It is unqualified (not
+        // `OF markdown`) and delete-then-insert (idempotent, self-healing). Raw
+        // SQL because GRDB's `t.synchronize` IS the external-content mechanism we
+        // are deliberately avoiding. Indexes the rendered `markdown` (NOT NULL).
+        migrator.registerMigration("v16") { db in
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE notes_fts USING fts5(
+                    meeting_id UNINDEXED,
+                    content,
+                    tokenize = "unicode61 remove_diacritics 2"
+                )
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER notes_fts_ai AFTER INSERT ON meeting_notes BEGIN
+                    INSERT INTO notes_fts(meeting_id, content) VALUES (new.meeting_id, new.markdown);
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER notes_fts_ad AFTER DELETE ON meeting_notes BEGIN
+                    DELETE FROM notes_fts WHERE meeting_id = old.meeting_id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER notes_fts_au AFTER UPDATE ON meeting_notes BEGIN
+                    DELETE FROM notes_fts WHERE meeting_id = old.meeting_id;
+                    INSERT INTO notes_fts(meeting_id, content) VALUES (new.meeting_id, new.markdown);
+                END
+                """)
+            // Backfill notes that already exist at migration time. This INSERTs
+            // into notes_fts (not meeting_notes), so it does NOT fire the
+            // triggers above — no double-indexing.
+            try db.execute(
+                sql: "INSERT INTO notes_fts(meeting_id, content) SELECT meeting_id, markdown FROM meeting_notes")
+        }
+
+        // T3.1 (md-v3) AC2: the FIRST-run scoped alias bindings persisted with
+        // the meeting so the bare digest-resume path (`digestOnlyBody`) — which
+        // reloads only the corrected transcript and CANNOT reconstruct the
+        // `AppliedCorrection` records — scopes IDENTICALLY to the first run.
+        // Additive, nullable JSON column (the `memory_digest`/v14 precedent): a
+        // pre-md-v3 row's NULL decodes to an empty set and re-materializes the
+        // payload byte-identically (the column is NOT a payload input). No FTS
+        // impact — the AFTER UPDATE trigger re-indexes `markdown` only.
+        migrator.registerMigration("v17") { db in
+            try db.alter(table: "meeting_notes") { t in
+                t.add(column: "scoped_alias_bindings", .text) // nullable; JSON [AliasPair]
+            }
+        }
         return migrator
     }
 
@@ -438,6 +526,15 @@ public final class BlaiseDatabase: Sendable {
                 sql: "UPDATE handoff_queue SET state = ? WHERE state = ?",
                 arguments: [HandoffState.pending.rawValue, HandoffState.delivering.rawValue]
             )
+            // F1: the twin sweep — a stale `running` processing job is an
+            // interrupted claim at DB open; reset it to `pending` so recovery +
+            // any kick drains it. This UNCONDITIONAL DB-open reset is the
+            // load-bearing one (the worker also re-checks in start()); without
+            // it, a launch via kick()-not-start() would strand the meeting (its
+            // uniq_processing_live slot stays occupied; claimNext sees only
+            // `pending`).
+            try db.execute(
+                sql: "UPDATE processing_queue SET state = 'pending', started_at = NULL WHERE state = 'running'")
             // G11 §3: a `recording` row with a non-nil `grace_until_ms` is
             // EXEMPTED from the flip — it was cleanly stopped-and-encoded by
             // construction (performAutoStop completed before grace was

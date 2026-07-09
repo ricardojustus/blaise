@@ -585,8 +585,11 @@ import Testing
             try db.execute(
                 sql: "UPDATE meeting SET status = 'cancelled' WHERE id = ?", arguments: [meeting.id])
         }
-        // Auto-kick (listener seam / sweep): refused.
-        await harness.pipeline.dispatch(meetingID: meeting.id)  // ProcessingDispatching, refuseCancelled
+        // Auto-kick (listener seam / sweep): refused. (F1 Inc2 removed the
+        // ProcessingDispatching conformance; the auto path is dispatchProcessing
+        // with refuseCancelled=true, which the queue executor reproduces via origin.)
+        _ = try? await harness.pipeline.dispatchProcessing(
+            meetingID: meeting.id, refuseCancelled: true)
         let afterAuto = try #require(try await harness.meeting(meeting.id))
         #expect(afterAuto.status == .cancelled, "auto-kick must refuse a cancelled meeting")
         // Explicit refuse via the parameter throws the right error.

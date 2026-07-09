@@ -276,8 +276,8 @@ struct PlaybackPlacementTests {
 // audio device, no private meeting audio — synthetic noise at the measured
 // FIELD levels: mic median ≈ −34 dBFS, system median ≈ −21 dBFS), then asserts
 // the system attenuation (`systemTrackPlaybackGain`) closes the residual gap to
-// ≤6 dB. Mirrors the offline re-measurement on the real meeting recorded in
-// audits/playback/r1_fix_neuter_checks.md (residual gap there ≈ 4.0 dB).
+// ≤6 dB. Mirrors the offline re-measurement on the real meeting (residual gap
+// there ≈ 4.0 dB).
 
 @Suite("Player mix balance (system attenuation)")
 struct PlaybackMixBalanceTests {

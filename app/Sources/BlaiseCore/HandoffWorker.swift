@@ -664,13 +664,15 @@ public actor HandoffWorker: HandoffKicking {
         return rebuilt.bytes
     }
 
-    /// Re-materializes from durable state. We don't persist which notes
-    /// user-action-items key form a queued payload used (no migration), so we
-    /// rebuild with the CURRENT key (`user_action_items`) and, only if that
-    /// fails to reproduce the stored hash, fall back to the LEGACY key
-    /// (`legacy_user_action_items`) for items minted before G4. The caller compares the
-    /// returned hash to `item.versionHash`; this just makes the legacy form
-    /// reachable so pre-G4 history can still recover instead of quarantining.
+    /// Re-materializes from durable state. We don't persist which digest
+    /// contract or notes user-action-items key form a queued payload used (no
+    /// migration), so we rebuild across BOTH axes — the SHIPPED digest version
+    /// then any prior one (md-v1, before the md-v2 bump), each with the CURRENT
+    /// then the LEGACY `ric_action_items` key — and return the first build whose
+    /// hash reproduces the stored `version_hash`. This keeps a pre-bump / pre-G4
+    /// queued payload recoverable instead of quarantining; a new payload matches
+    /// the first (shipped / current) combination. The digest axis is a no-op for
+    /// items carrying no memory_digest (those bytes don't change with it).
     private func rematerialize(_ item: HandoffItem) async -> EvidencePayloadBuilder.Payload? {
         guard
             let meeting = try? await MeetingRepository(database: database).fetch(item.meetingID),
@@ -679,14 +681,19 @@ public actor HandoffWorker: HandoffKicking {
         else { return nil }
         let user = (try? await settingsStore.get(UserIdentity.settingsKey, as: UserIdentity.self))
             ?? nil ?? UserIdentity.shippedDefault
-        let current = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: segments, notes: notes, user: user,
-            userActionItemsKey: .current)
-        if current.versionHash == item.versionHash { return current }
-        let legacy = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: segments, notes: notes, user: user,
-            userActionItemsKey: .legacy)
-        return legacy.versionHash == item.versionHash ? legacy : current
+        let digestVersions = [DigestPromptBuilder.shippedVersion]
+            + DigestPromptVersion.allCases.filter { $0 != DigestPromptBuilder.shippedVersion }
+        var firstBuild: EvidencePayloadBuilder.Payload?
+        for digestVersion in digestVersions {
+            for key in [EvidencePayloadBuilder.UserActionItemsKey.current, .legacy] {
+                let candidate = EvidencePayloadBuilder.build(
+                    meeting: meeting, segments: segments, notes: notes, user: user,
+                    userActionItemsKey: key, digestPromptVersion: digestVersion)
+                if candidate.versionHash == item.versionHash { return candidate }
+                if firstBuild == nil { firstBuild = candidate }
+            }
+        }
+        return firstBuild
     }
 
     private func quarantine(_ item: HandoffItem, detail: String) async {

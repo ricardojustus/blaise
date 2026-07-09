@@ -97,3 +97,18 @@ jobs:
           else
             echo "No tests skipped on this runner."
           fi
+
+  # c15 leak tripwire — the un-bypassable backstop to the local pre-commit hook.
+  # Scans the FULL tracked tree (not a diff) so the seed commit and any direct
+  # push are covered (the root commit has no diff base). Make this a REQUIRED
+  # status check on protected main AFTER it has reported once (job name must
+  # match exactly: "secret-scan").
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Leak tripwire (full tree)
+        run: bash scripts/tripwire.sh --tree

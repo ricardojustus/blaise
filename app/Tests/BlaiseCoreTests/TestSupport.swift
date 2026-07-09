@@ -134,6 +134,24 @@ extension BlaiseDatabase {
             try db.execute(sql: "INSERT INTO transcript_fts(transcript_fts, rank) VALUES('integrity-check', 1)")
         }
     }
+
+    func rawNotesFTSMatchCount(_ term: String) throws -> Int {
+        try pool.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH ?",
+                arguments: [term]
+            ) ?? -1
+        }
+    }
+
+    /// FTS5 integrity check for the standalone notes index — throws if the
+    /// index is internally inconsistent or out of sync with its stored content.
+    func checkNotesFTSIntegrity() throws {
+        try pool.write { db in
+            try db.execute(sql: "INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)")
+        }
+    }
 }
 
 struct FileIdentity: Equatable {

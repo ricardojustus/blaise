@@ -7,9 +7,9 @@ import os
 // C11: the real capture engine — Core Audio global process tap + default
 // input device composed into ONE private aggregate device (drift
 // compensation on both sub-entries), one IOProc delivering sample-aligned
-// mic + system buffers (research/c11_capture.md §1–2; validated call sequence,
-// extracted). Each track converts to 16 kHz mono Int16 and streams into a
-// crash-safe LPCM CAF (`CaptureCAFWriter`).
+// mic + system buffers (validated call sequence, extracted). Each track
+// converts to 16 kHz mono Int16 and streams into a crash-safe LPCM CAF
+// (`CaptureCAFWriter`).
 //
 // NOT exercised by unit tests (creating the tap/aggregate and starting IO
 // is what fires the TCC prompts); the gated capture integration test
@@ -186,11 +186,42 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 onEvent?(.micSilence(active: false))
             }
             let streams = Self.inputStreams(of: aggregateID)
-            let streamFormats: [AVAudioFormat] = try streams.map { stream in
-                guard var asbd = Self.streamVirtualFormat(stream),
-                    let format = AVAudioFormat(streamDescription: &asbd)
+            // B3: the aggregate delivers ALL streams at the master (mic) rate via
+            // drift compensation, but each stream's virtual format reports its OWN
+            // nominal rate (mic 48k / tap 44.1k). Building converters from that
+            // resamples by the wrong ratio — the 48000/44100 capture drift. Read
+            // ONE delivered rate from the aggregate + validate it against the mic's
+            // available rates; build BOTH converters from it, OR fall back
+            // all-or-nothing to the per-stream format (never a mixed graph; a
+            // drifted recording is recoverable, no recording is not — Floor 2).
+            let aggregateRate = Self.aggregateNominalSampleRate(aggregateID)
+            let plausibleRanges = Self.availableNominalSampleRates(inputDevice)
+            let deliveredRate = Self.resolvedConverterRate(aggregateRate: aggregateRate) {
+                Self.isPlausibleRate($0, within: plausibleRanges)
+            }
+            let streamASBDs: [AudioStreamBasicDescription] = try streams.map { stream in
+                guard let asbd = Self.streamVirtualFormat(stream)
                 else { throw CaptureSessionError.tapFormatUnavailable }
-                return format
+                return asbd
+            }
+            let streamFormats: [AVAudioFormat]
+            if let rate = deliveredRate {
+                logger.notice(
+                    "capture rate: aggregate Fs=\(rate, privacy: .public) streams=\(streams.count, privacy: .public) target=\(CaptureCAFWriter.sampleRate, privacy: .public)")
+                streamFormats = try streamASBDs.map { asbd in
+                    guard let format = Self.converterInputFormat(streamASBD: asbd, rate: rate)
+                    else { throw CaptureSessionError.tapFormatUnavailable }
+                    return format
+                }
+            } else {
+                logger.error(
+                    "aggregate nominal rate unavailable/implausible (got \(aggregateRate ?? -1, privacy: .public)); falling back to per-stream virtual format")
+                streamFormats = try streamASBDs.map { asbd in
+                    var mutable = asbd
+                    guard let format = AVAudioFormat(streamDescription: &mutable)
+                    else { throw CaptureSessionError.tapFormatUnavailable }
+                    return format
+                }
             }
             let target = CaptureCAFWriter.format
             let micConverter = streamFormats.indices.contains(0) && micStreamCount > 0
@@ -540,5 +571,78 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         guard AudioObjectGetPropertyData(streamID, &address, 0, nil, &size, &asbd) == noErr
         else { return nil }
         return asbd
+    }
+
+    // MARK: - B3: aggregate-delivered sample rate (drift root fix)
+
+    /// The aggregate's currently-delivered (master) sample rate. With the mic
+    /// pinned as master (B3), every stream is drift-compensated to this rate, so
+    /// it is the correct converter INPUT rate. nil if unreadable or <= 0.
+    static func aggregateNominalSampleRate(_ deviceID: AudioObjectID) -> Double? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var rate = Float64(0)
+        var size = UInt32(MemoryLayout<Float64>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate) == noErr,
+            rate > 0
+        else { return nil }
+        return rate
+    }
+
+    /// The device's advertised nominal-rate ranges (e.g. 44100, 48000). Empty if
+    /// unreadable — callers then fall back to a sane absolute bound.
+    static func availableNominalSampleRates(_ deviceID: AudioObjectID) -> [AudioValueRange] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyAvailableNominalSampleRates,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(0)
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr
+        else { return [] }
+        let stride = MemoryLayout<AudioValueRange>.stride
+        let count = Int(size) / stride
+        guard count > 0 else { return [] }
+        var ranges = [AudioValueRange](repeating: AudioValueRange(), count: count)
+        // Read EXACTLY count elements — never the raw HAL byte size, which (if it
+        // is not a whole multiple of the stride) would let CoreAudio write past
+        // the buffer. count == 0 already returned the sane-bound fallback above.
+        size = UInt32(count * stride)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &ranges) == noErr
+        else { return [] }
+        return ranges
+    }
+
+    /// A HAL-reported rate is plausible only inside the device's advertised
+    /// ranges (or, when those are unreadable, a sane absolute bound). B3-M3: a
+    /// garbage-but-nonzero rate fed to BOTH converters would mis-rate the pair
+    /// UNIFORMLY, evading the relative-drift playback safety net — so this is a
+    /// real Floor-1 boundary check, not gold-plating.
+    static func isPlausibleRate(_ rate: Double, within ranges: [AudioValueRange]) -> Bool {
+        guard rate >= 8000, rate <= 192_000 else { return false }
+        guard !ranges.isEmpty else { return true }
+        return ranges.contains { rate >= $0.mMinimum - 1 && rate <= $0.mMaximum + 1 }
+    }
+
+    /// The single all-or-nothing gate (B3-M1): the validated aggregate rate, or
+    /// nil to signal that BOTH converters fall back to per-stream formats.
+    static func resolvedConverterRate(
+        aggregateRate: Double?, plausible: (Double) -> Bool
+    ) -> Double? {
+        guard let rate = aggregateRate, rate > 0, plausible(rate) else { return nil }
+        return rate
+    }
+
+    /// A converter INPUT format: the stream's own channel count + PCM format,
+    /// with the sample rate overridden to the aggregate's delivered rate.
+    /// `mBytesPerFrame` is rate-independent for LPCM, so only `mSampleRate`
+    /// changes — safe for the format and the `data.count / bytesPerFrame` math.
+    static func converterInputFormat(
+        streamASBD: AudioStreamBasicDescription, rate: Double
+    ) -> AVAudioFormat? {
+        var asbd = streamASBD
+        asbd.mSampleRate = rate
+        return AVAudioFormat(streamDescription: &asbd)
     }
 }

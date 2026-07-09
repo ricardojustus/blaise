@@ -1,6 +1,6 @@
 import Foundation
 
-// The two engine seams mandated by Vision Appendix B-8 (ASR and
+// The two engine seams mandated by the product requirements (ASR and
 // summarization) as plain async request/response protocols. Pure types +
 // protocols; concrete engines arrive in C3/C6 and register at the
 // composition root. Engine identity = model + runtime (decision D5);
@@ -147,24 +147,55 @@ public struct NotesRequest: Codable, Sendable, Equatable {
     public var dominantLanguage: String
     public var vocabulary: [String]
     public var user: UserIdentity
+    /// #101: presence-gated grounded person-mention hints derived by app code
+    /// (`GroundedPersonHints.groundedPersonHints`) — never hand-authored. Empty
+    /// by default; an empty set renders NO hint block (byte-identical to no
+    /// block). Decoded via `decodeIfPresent ?? []` so payloads predating the
+    /// field round-trip unchanged.
+    public var groundedPersonHints: [GroundedPersonHint]
 
     public init(
         meeting: Meeting,
         transcript: [TranscriptSegment],
         dominantLanguage: String,
         vocabulary: [String],
-        user: UserIdentity
+        user: UserIdentity,
+        groundedPersonHints: [GroundedPersonHint] = []
     ) {
         self.meeting = meeting
         self.transcript = transcript
         self.dominantLanguage = dominantLanguage
         self.vocabulary = vocabulary
         self.user = user
+        self.groundedPersonHints = groundedPersonHints
     }
 
     enum CodingKeys: String, CodingKey {
         case meeting, transcript, vocabulary, user
         case dominantLanguage = "dominant_language"
+        case groundedPersonHints = "grounded_person_hints"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.meeting = try container.decode(Meeting.self, forKey: .meeting)
+        self.transcript = try container.decode([TranscriptSegment].self, forKey: .transcript)
+        self.dominantLanguage = try container.decode(String.self, forKey: .dominantLanguage)
+        self.vocabulary = try container.decode([String].self, forKey: .vocabulary)
+        self.user = try container.decode(UserIdentity.self, forKey: .user)
+        // Presence-preserving: payloads predating #101 carry no key → [].
+        self.groundedPersonHints =
+            try container.decodeIfPresent([GroundedPersonHint].self, forKey: .groundedPersonHints) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(meeting, forKey: .meeting)
+        try container.encode(transcript, forKey: .transcript)
+        try container.encode(dominantLanguage, forKey: .dominantLanguage)
+        try container.encode(vocabulary, forKey: .vocabulary)
+        try container.encode(user, forKey: .user)
+        try container.encode(groundedPersonHints, forKey: .groundedPersonHints)
     }
 }
 
@@ -178,7 +209,7 @@ public struct ActionItem: Codable, Sendable, Equatable {
     }
 }
 
-/// The meeting-type taxonomy (notes v2, research/notes_structure_v2.md §2):
+/// The meeting-type taxonomy (notes v2):
 /// a strict 8-value enum the LLM commits to BEFORE writing the notes
 /// (classify-then-write via schema property order). `general` is the
 /// explicit "no strong cue / cues conflict" escape — never force a type.
@@ -238,24 +269,31 @@ public struct NotesStructured: Codable, Sendable, Equatable {
         case actionItems = "action_items"
         case userActionItems = "user_action_items"
         /// G4: persisted notes rows predating the rename carry
-        /// `legacy_user_action_items`. The decoder accepts both keys forever (spec
+        /// `ric_action_items`. The decoder accepts both keys forever (spec
         /// §2, AC2); encoding emits only the new key (new rows new-key-only).
-        case legacyUserActionItemsKey = "legacy_user_action_items"
+        case ricActionItemsLegacy = "ric_action_items"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.title = try container.decodeIfPresent(String.self, forKey: .title)
         self.summary = try container.decode(String.self, forKey: .summary)
-        self.meetingType = try container.decodeIfPresent(MeetingType.self, forKey: .meetingType)
+        // Lenient: `meeting_type` is an OPTIONAL classification. The API/MLX engines
+        // get schema-enforced enum values, but the `claude -p` (Account) engine has
+        // NO server-side json_schema enforcement and can emit a free-text phrase here
+        // — an UNRECOGNIZED value decodes to nil (treated as `general` downstream)
+        // rather than failing the ENTIRE notes. A valid raw value still maps to its
+        // case, so this is a no-op for the schema-enforced engines.
+        self.meetingType = (try container.decodeIfPresent(String.self, forKey: .meetingType))
+            .flatMap(MeetingType.init(rawValue:))
         self.detailedNotes = try container.decode(String.self, forKey: .detailedNotes)
         self.decisions = try container.decode([String].self, forKey: .decisions)
         self.actionItems = try container.decode([ActionItem].self, forKey: .actionItems)
-        // Prefer the new key; fall back to legacy `legacy_user_action_items` for
+        // Prefer the new key; fall back to legacy `ric_action_items` for
         // pre-G4 persisted rows (spec §2, AC2).
         self.userActionItems =
             try container.decodeIfPresent([ActionItem].self, forKey: .userActionItems)
-            ?? container.decode([ActionItem].self, forKey: .legacyUserActionItemsKey)
+            ?? container.decode([ActionItem].self, forKey: .ricActionItemsLegacy)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -506,6 +544,14 @@ public protocol SummarizationEngine: Sendable {
     /// Weight class (D17): `.heavyweight` engines are never auto-loaded by
     /// the runtime fallback; declared explicitly by every engine.
     var loadProfile: EngineLoadProfile { get }
+    /// When the user has SELECTED this engine and it fails (after its own bounded
+    /// retries) with a fallback-trigger error, the pipeline must NOT silently fall
+    /// back to a metered/other engine — it leaves the meeting's notes PENDING with
+    /// a user-visible warning so it can be retried on the chosen engine. Default
+    /// `false` (the protocol extension below) → the cloud/local engines fall back
+    /// as before; ONLY the subscription `claude -p` Account engine overrides it to
+    /// `true` (staying free is a user choice that must not be silently spent past).
+    var suppressesAutoFallback: Bool { get }
     var costDescriptor: EngineCostDescriptor? { get }
     var configDescriptors: [EngineConfigDescriptor] { get }
     func availability() async -> EngineAvailability
@@ -518,7 +564,7 @@ public protocol SummarizationEngine: Sendable {
     /// G14: the SECOND synthesis call, fired AFTER the notes — produces the
     /// machine-facing `memory_digest`, taking the degarbled transcript + the
     /// just-produced notes as a salience guide (`DigestRequest`). Same engine
-    /// the user selected for notes (the swappable seam, Appendix B-8 — the
+    /// the user selected for notes (the swappable seam — the
     /// digest rides it). It carries a NEW bounded transient-retry built for it
     /// (one bounded re-issue on a 429/529/5xx/transient before the error
     /// escapes — a transient blip never becomes a memory gap on the first
@@ -529,6 +575,12 @@ public protocol SummarizationEngine: Sendable {
 
 extension SummarizationEngine {
     public func prepare() async throws {}
+
+    /// Default: engines DO participate in the runtime auto-fallback. Only the
+    /// subscription `claude -p` Account engine overrides this to `true` (see its
+    /// declaration) so a user who chose "stay free" is never silently switched to
+    /// a metered engine — the run goes notes-pending with a warning instead.
+    public var suppressesAutoFallback: Bool { false }
 
     /// Convenience for callers that don't attribute a purpose (bare engine
     /// tests, ad-hoc calls): defaults to `.generation` (spec §1).

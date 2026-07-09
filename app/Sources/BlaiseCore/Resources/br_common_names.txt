@@ -58,9 +58,8 @@ Adriana
 Patrícia
 Sandra
 Sérgio
-# Extensions (reviewed at C5 implementation; same membership rule).
-# Glossary staff first names that are common BR names (full-name entries stay in the
-# vocabulary; the bare first name is too ambiguous to claim):
+# Additional common Brazilian given names (a bare first name is too common to
+# treat as a distinctive vocabulary term, so it is suppressed here):
 Ricardo
 Guilherme
 Luiz

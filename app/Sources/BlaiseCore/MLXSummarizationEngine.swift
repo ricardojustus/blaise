@@ -17,7 +17,7 @@ public actor MLXSummarizationEngine: SummarizationEngine {
     public static let modelRepo = "mlx-community/gemma-4-26b-a4b-it-4bit"
     public static let venvPathKey = "venvPath"
     public static let hfHomePathKey = "hfHomePath"
-    /// KV-probe-calibrated input budget (C6 smoke gate, audits/c6/bakeoff.md):
+    /// KV-probe-calibrated input budget (C6 smoke gate):
     /// 24k-token prefill + 100 generated peaked 17.85 GB on the 32 GB
     /// machine (probe 2026-06-10, prompt_tps 454) — 24_000 holds with
     /// headroom, no halving needed. The helper's exact tokenizer count is
@@ -33,7 +33,7 @@ public actor MLXSummarizationEngine: SummarizationEngine {
     /// Per-engine suspect marker (shares `hfHome` with whisper's cache).
     static let suspectMarkerName = ".blaise-suspect-notes"
     /// Declared peak for the D17 weight class: the C6 KV probe
-    /// (audits/c6/bakeoff.md, 2026-06-10) measured a 17.85 GB peak for a
+    /// (2026-06-10) measured a 17.85 GB peak for a
     /// 24k-token prefill + 100 generated tokens on the 32 GB machine —
     /// declared as 18 GB.
     public static let estimatedPeakBytes: Int64 = 18 * 1_073_741_824

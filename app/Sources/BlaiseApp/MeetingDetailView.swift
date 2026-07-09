@@ -177,14 +177,13 @@ struct MeetingDetailView: View {
 
     private func regenerate() {
         regenerating = true
-        let pipeline = appEnv.pipeline
+        let queue = appEnv.processingQueue
         let id = meetingID
         Task {
-            // Status-dependent dispatch — the rule for every programmatic kick.
-            // The user's own Process / Regenerate is EXEMPT from the cancelled
-            // refusal (refuseCancelled defaults false): a cancelled meeting's
-            // Process flips it back to the normal dispatch entry.
-            _ = try? await pipeline.dispatchProcessing(meetingID: id)
+            // F1 Inc2: the user's Process / Regenerate ENQUEUES (origin .user →
+            // refuseCancelled=false, so a cancelled meeting's Process re-runs it).
+            // The worker drives the unchanged dispatchProcessing on the chain.
+            await queue.enqueue(id, origin: .user)
             regenerating = false
         }
     }
@@ -608,15 +607,19 @@ private struct NotesPane: View {
             MarkdownBlocksView(markdown: structured.summary)
         }
 
-        if !structured.userActionItems.isEmpty {
+        // Drop blank user action items (empty text) before the box renders.
+        let userActionItems = structured.userActionItems.filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if !userActionItems.isEmpty {
             // The load-bearing user-action box — visually unmissable, the one accent.
             // V1.1: click-to-toggle done; done items collapse into
             // "Completed" (keyed by normalized text hash — a regenerated
             // item whose text changed loses its mark, documented).
-            let open = structured.userActionItems.filter {
+            let open = userActionItems.filter {
                 !doneActionKeys.contains(ActionItemKey.key(for: $0.text))
             }
-            let completed = structured.userActionItems.filter {
+            let completed = userActionItems.filter {
                 doneActionKeys.contains(ActionItemKey.key(for: $0.text))
             }
             let userActionSection = NoteSection(
@@ -694,14 +697,23 @@ private struct NotesPane: View {
             }
         }
 
-        if !structured.actionItems.isEmpty {
+        // Skip blank action items (empty task text) so a stray "owner:" / ":"
+        // never renders; an item with text but no owner drops the prefix.
+        let actionItems = structured.actionItems.filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if !actionItems.isEmpty {
             NoteSection(title: portuguese ? "Itens de Ação" : "Action Items", kind: .actions) {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(structured.actionItems.enumerated()), id: \.offset) { _, item in
+                    ForEach(Array(actionItems.enumerated()), id: \.offset) { _, item in
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Text("•").foregroundStyle(Design.support)
-                            Text("\(item.owner): ").font(Design.readingFont(14, weight: .semibold))
-                                + Text(item.text).font(Design.readingFont(14))
+                            if item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text(item.text).font(Design.readingFont(14))
+                            } else {
+                                Text("\(item.owner): ").font(Design.readingFont(14, weight: .semibold))
+                                    + Text(item.text).font(Design.readingFont(14))
+                            }
                         }
                         .textSelection(.enabled)
                     }
@@ -1511,11 +1523,11 @@ struct AudioPlayerView: View {
     /// its `AVMutableAudioMixInputParameters`), so the stretch onto wall-clock
     /// is rate-COUPLED and the baked-in ~1.088× pitch error (the "squeak") is
     /// corrected at the same time as the timing — verified to ≤1% of true on
-    /// real meetings (DECISIONS.md, sync-fix H-1). Every NON-drifted track keeps
+    /// real meetings (sync-fix H-1). Every NON-drifted track keeps
     /// `.spectral` (pitch-preserving), so the 1×/1.5×/2× speed control stays
     /// pitch-preserved on those tracks. A varispeed track DOES pitch-shift under
     /// `player.rate` at 1.5×/2× — the accepted single-track tradeoff for getting
-    /// the default 1× pitch perfect (DECISIONS.md).
+    /// the default 1× pitch perfect.
     static func composition(
         for placements: [CaptureStitcher.PlaybackPlacement], durations: [URL: Double]
     ) async -> (asset: AVAsset, audioMix: AVAudioMix?, anyReadable: Bool) {
@@ -1732,8 +1744,8 @@ final class PlaybackSpeedStore {
 /// its native rate: the item's default `audioTimePitchAlgorithm` is `.spectral`.
 /// A clock-drift-corrected track is the exception — `composition(for:)` renders
 /// it with per-track `.varispeed` so the wall-clock stretch corrects its pitch
-/// at 1×; that one track therefore pitch-shifts at 1.5×/2× (accepted tradeoff,
-/// DECISIONS.md). Playback uses `player.rate` (not `play()`, which would reset
+/// at 1×; that one track therefore pitch-shifts at 1.5×/2× (accepted tradeoff).
+/// Playback uses `player.rate` (not `play()`, which would reset
 /// the rate to 1×).
 @MainActor @Observable
 private final class AudioPlayerController {
@@ -1931,9 +1943,9 @@ private struct MeetingInspector: View {
             // edited meeting, and the edited meeting is dispatched only if it
             // received something itself.
             for meetingID in await environment.ingestor.sweep(meetingCode: newCode) {
-                // G10 §1: an auto sweep dispatch — refuse a cancelled meeting.
-                _ = try? await environment.pipeline.dispatchProcessing(
-                    meetingID: meetingID, refuseCancelled: true)
+                // F1 Inc2: the code-edit sweep is an auto path → enqueue
+                // (origin .auto → refuseCancelled, never resurrects a cancelled meeting).
+                await environment.processingQueue.enqueue(meetingID, origin: .auto)
             }
         }
     }

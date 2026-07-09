@@ -197,6 +197,39 @@ public struct SearchResultItem: Identifiable, Equatable, Sendable {
     }
 }
 
+/// A NOTES hit (F2) joined with its meeting title and delimiter-mapped
+/// segments. Notes are one row per meeting, so `id` is the meeting id.
+public struct NotesSearchResultItem: Identifiable, Equatable, Sendable {
+    public var hit: NotesSearchHit
+    public var meetingTitle: String
+    public var startedAt: Date
+    public var segments: [SearchSnippetFormatter.Segment]
+
+    public var id: MeetingID { hit.meetingID }
+
+    public init(hit: NotesSearchHit, meetingTitle: String, startedAt: Date) {
+        self.hit = hit
+        self.meetingTitle = meetingTitle
+        self.startedAt = startedAt
+        self.segments = SearchSnippetFormatter.segments(hit.snippet)
+    }
+}
+
+/// The two labelled search surfaces (F2). bm25 is not comparable across the
+/// two FTS tables, so notes and transcript stay as separate, internally-ranked
+/// groups; the UI shows Notes first (notes are for humans — Floor 5).
+public struct SearchResults: Equatable, Sendable {
+    public var notes: [NotesSearchResultItem]
+    public var transcripts: [SearchResultItem]
+
+    public var isEmpty: Bool { notes.isEmpty && transcripts.isEmpty }
+
+    public init(notes: [NotesSearchResultItem] = [], transcripts: [SearchResultItem] = []) {
+        self.notes = notes
+        self.transcripts = transcripts
+    }
+}
+
 // MARK: - LibraryModel
 
 /// Drives the library window: ValueObservation over `meeting` +
@@ -341,17 +374,23 @@ public final class LibraryModel {
 
     // MARK: Search (the view-model path)
 
-    public func search(_ query: String) async -> [SearchResultItem] {
+    public func search(_ query: String) async -> SearchResults {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
+        guard !trimmed.isEmpty else { return SearchResults() }
+        let titles = Dictionary(
+            uniqueKeysWithValues: items.map { ($0.meeting.id, ($0.meeting.title, $0.meeting.startedAt)) })
         do {
-            let hits = try await TranscriptRepository(database: database).search(trimmed)
-            let titles = Dictionary(
-                uniqueKeysWithValues: items.map { ($0.meeting.id, ($0.meeting.title, $0.meeting.startedAt)) })
-            return try await withResolvedTitles(hits: hits, known: titles)
+            // Both reads run concurrently (GRDB pool allows parallel reads).
+            async let transcriptHitsTask = TranscriptRepository(database: database).search(trimmed)
+            async let notesHitsTask = NotesRepository(database: database).searchNotes(trimmed)
+            let transcriptHits = try await transcriptHitsTask
+            let notesHits = try await notesHitsTask
+            let transcripts = try await withResolvedTitles(hits: transcriptHits, known: titles)
+            let notes = try await withResolvedNotesTitles(hits: notesHits, known: titles)
+            return SearchResults(notes: notes, transcripts: transcripts)
         } catch {
             logger.error("search failed: \(error)")
-            return []
+            return SearchResults()
         }
     }
 
@@ -360,14 +399,36 @@ public final class LibraryModel {
     ) async throws -> [SearchResultItem] {
         var results: [SearchResultItem] = []
         for hit in hits {
-            if let (title, started) = known[hit.meetingID] {
+            if let (title, started) = try await resolveTitle(hit.meetingID, known: known) {
                 results.append(SearchResultItem(hit: hit, meetingTitle: title, startedAt: started))
-            } else if let meeting = try await MeetingRepository(database: database).fetch(hit.meetingID) {
-                results.append(
-                    SearchResultItem(hit: hit, meetingTitle: meeting.title, startedAt: meeting.startedAt))
             }
         }
         return results
+    }
+
+    private func withResolvedNotesTitles(
+        hits: [NotesSearchHit], known: [MeetingID: (String, Date)]
+    ) async throws -> [NotesSearchResultItem] {
+        var results: [NotesSearchResultItem] = []
+        for hit in hits {
+            if let (title, started) = try await resolveTitle(hit.meetingID, known: known) {
+                results.append(NotesSearchResultItem(hit: hit, meetingTitle: title, startedAt: started))
+            }
+        }
+        return results
+    }
+
+    /// Resolve a meeting's title + date: from the live in-memory rows if loaded,
+    /// else a direct fetch (a hit can reference a meeting not in the current
+    /// smart-group view).
+    private func resolveTitle(
+        _ meetingID: MeetingID, known: [MeetingID: (String, Date)]
+    ) async throws -> (String, Date)? {
+        if let hit = known[meetingID] { return hit }
+        if let meeting = try await MeetingRepository(database: database).fetch(meetingID) {
+            return (meeting.title, meeting.startedAt)
+        }
+        return nil
     }
 }
 

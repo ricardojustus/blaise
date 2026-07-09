@@ -1,8 +1,8 @@
 import CoreAudio
 import Foundation
 
-// C11: tap + aggregate construction recipes (research/c11_capture.md §1,
-// swiftc-verified against the MacOSX26.5 SDK; validated call sequence). These
+// C11: tap + aggregate construction recipes
+// (swiftc-verified against the MacOSX26.5 SDK; validated call sequence). These
 // are PURE descriptor builders — no HAL device is created here, so unit
 // tests can snapshot the exact parameter forms without touching audio
 // hardware or firing TCC prompts. `CaptureSession` feeds the results to
@@ -45,6 +45,13 @@ public enum CaptureDescriptors {
             kAudioAggregateDeviceNameKey as String: aggregateName,
             kAudioAggregateDeviceUIDKey as String: aggregateUID,
             kAudioAggregateDeviceIsPrivateKey as String: true,
+            // B3: pin the mic as the aggregate time source ("master", the
+            // current non-deprecated key). The tap is drift-compensated onto the
+            // mic's clock, so the single IOProc delivers BOTH streams at the
+            // mic's rate — removing the per-stream sample-rate mismatch that
+            // caused the 48000/44100 capture drift. CaptureSession reads the
+            // aggregate's nominal rate and builds both converters from it.
+            kAudioAggregateDeviceMainSubDeviceKey as String: inputDeviceUID,
             kAudioAggregateDeviceSubDeviceListKey as String: [
                 [
                     kAudioSubDeviceUIDKey as String: inputDeviceUID,

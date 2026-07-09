@@ -48,4 +48,27 @@ struct StatusBarGlyphTests {
         #expect(StatusBarController.symbolName(for: .grace(meetingTitle: "m", until: t), handoffWarning: false) == "pause.circle")
         #expect(StatusBarController.symbolName(for: .paused(meetingTitle: "m", accumulatedSeconds: 0), handoffWarning: false) == "pause.circle.fill")
     }
+
+    @Test("idle status item title shows the next upcoming meeting compactly")
+    func upcomingTitle() {
+        let start = Date(timeIntervalSince1970: 1_781_150_400)
+        let row = UpcomingMeetingRow(
+            eventIdentifier: "evt-next",
+            title: "Very Long Calendar Meeting Title",
+            start: start,
+            end: start.addingTimeInterval(1800),
+            attendeeCount: 2,
+            source: .meet,
+            meetingCode: "abc-defg-hij",
+            attendees: [],
+            urlString: "https://meet.google.com/abc-defg-hij")
+
+        let title = StatusBarController.upcomingTitle(
+            [row], now: start.addingTimeInterval(-60))
+
+        #expect(title?.contains("Very Long Calenda") == true)
+        #expect((title?.count ?? 0) <= 24)
+        #expect(
+            StatusBarController.upcomingTitle([row], now: row.end.addingTimeInterval(1)) == nil)
+    }
 }

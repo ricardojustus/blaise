@@ -7,7 +7,7 @@ import Testing
 /// this reason via `.enabled(if:)` — visible in the test report, never
 /// silently green.
 let keychainProbe: (accessible: Bool, reason: String) = {
-    let store = KeychainSecretStore(service: "app.blaise.mac.tests")
+    let store = KeychainSecretStore(service: "\(BlaiseBundle.identifier).tests")
     let probeKey = "probe.\(UUID().uuidString)"
     do {
         try store.set(key: probeKey, value: "probe")
@@ -46,9 +46,10 @@ let keychainProbe: (accessible: Bool, reason: String) = {
         )
     )
     func keychainStoreSetGetDeleteSmokeTest() throws {
-        // Dedicated test service: never touches the production
-        // `app.blaise.mac` items; unique key per run, cleaned up after.
-        let store = KeychainSecretStore(service: "app.blaise.mac.tests")
+        // Dedicated test service (derived from BlaiseBundle.identifier so it
+        // tracks the build override): never touches the production Keychain
+        // items; unique key per run, cleaned up after.
+        let store = KeychainSecretStore(service: "\(BlaiseBundle.identifier).tests")
         let key = "engine.mock.apiKey.\(UUID().uuidString)"
         defer { try? store.delete(key: key) }
 

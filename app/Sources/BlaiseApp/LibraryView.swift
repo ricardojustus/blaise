@@ -13,10 +13,11 @@ enum Theme {
 }
 
 struct LibraryView: View {
+    @Environment(AppEnvironment.self) private var appEnv
     @Environment(AppUIState.self) private var uiState
     @Environment(LibraryModel.self) private var library
     @Environment(PipelineActivityHolder.self) private var activity
-    @State private var searchResults: [SearchResultItem] = []
+    @State private var searchResults = SearchResults()
     @State private var searchTask: Task<Void, Never>?
     @FocusState private var searchFocused: Bool
     @FocusState private var listFocused: Bool
@@ -44,7 +45,7 @@ struct LibraryView: View {
                 }
             }
         }
-        .searchable(text: $uiState.searchText, placement: .toolbar, prompt: "Search transcripts")
+        .searchable(text: $uiState.searchText, placement: .toolbar, prompt: "Search notes & transcripts")
         .searchFocused($searchFocused)
         .onChange(of: uiState.searchFocusRequest) {
             searchFocused = true  // ⌘F (accessibility floor)
@@ -61,8 +62,11 @@ struct LibraryView: View {
             // overflowed. Hide it; the chip draws its own capsule whose
             // shape derives from the content.
             .sharedBackgroundVisibility(.hidden)
-            ToolbarItem(placement: .primaryAction) {
-                RecordToolbarButton()
+            // A GROUP, not a single ToolbarItem: macOS renders only the first
+            // control in a ToolbarItem, which silently dropped the End & Process
+            // button (leaving Pause as the only visible recording control).
+            ToolbarItemGroup(placement: .primaryAction) {
+                recordToolbarButtons
             }
         }
         // Window-level action-failure banner (rename, done toggle): the
@@ -179,6 +183,11 @@ struct LibraryView: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: Design.direction == .fluido ? 9 : 2) {
+                    if !appEnv.calendarSuggestions.upcomingRows.isEmpty {
+                        UpcomingMeetingsSection(rows: appEnv.calendarSuggestions.upcomingRows)
+                            .padding(.top, 12)
+                            .padding(.bottom, 8)
+                    }
                     ForEach(groups) { group in
                         DayGroupHeader(label: group.label, items: group.items)
                             .padding(.top, 16)
@@ -220,11 +229,14 @@ struct LibraryView: View {
                 listFocused = true
             }
         }
+        .task {
+            await appEnv.refreshCalendarSurfaces()
+        }
         .scrollEdgeEffectStyle(.soft, for: .top)
         .background(Design.listColumn.ignoresSafeArea())
         .navigationTitle(uiState.selectedGroup == .thisWeek ? "This Week" : "All Meetings")
         .overlay {
-            if library.items.isEmpty {
+            if library.items.isEmpty && appEnv.calendarSuggestions.upcomingRows.isEmpty {
                 ContentUnavailableView(
                     "No Meetings Yet", systemImage: "rectangle.stack",
                     description: Text("Import audio via File → Import Meeting Audio…"))
@@ -283,7 +295,7 @@ struct LibraryView: View {
     private func runSearch(_ query: String) {
         searchTask?.cancel()
         guard !query.trimmingCharacters(in: .whitespaces).isEmpty else {
-            searchResults = []
+            searchResults = SearchResults()
             return
         }
         searchTask = Task {
@@ -293,6 +305,210 @@ struct LibraryView: View {
             guard !Task.isCancelled else { return }
             searchResults = results
         }
+    }
+
+    // MARK: Recording controls (V1.1 mirror of the menu bar / ⌥⌘R)
+
+    /// The window-toolbar recording controls, routed through the SAME
+    /// `AppEnvironment` actions as the menu bar. Three states: recording →
+    /// Pause + End & Process; paused → Resume + End & Process; otherwise →
+    /// Record (a start is allowed from alarm and while a previous meeting still
+    /// processes — only a live session blocks it, enforced by the controller).
+    /// MUST live in a `ToolbarItemGroup`: a single `ToolbarItem` renders only
+    /// its first control, which silently hid End & Process.
+    @ViewBuilder private var recordToolbarButtons: some View {
+        let status = appEnv.captureStatus
+        if status.isRecording {
+            Button {
+                Task { await appEnv.pauseRecording() }
+            } label: {
+                Label("Pause", systemImage: "pause.circle.fill")
+            }
+            .help("Pause recording (resume later, or end & process now)")
+            .accessibilityLabel("Pause recording")
+            Button {
+                Task { await appEnv.stopRecording() }
+            } label: {
+                Label("End & Process", systemImage: "stop.circle.fill")
+                    .foregroundStyle(Design.recording)
+            }
+            .help("End the recording and process the meeting")
+            .accessibilityLabel("End and process the meeting")
+        } else if status.isPaused {
+            Button {
+                Task { await appEnv.resumePausedRecording() }
+            } label: {
+                Label("Resume", systemImage: "record.circle")
+            }
+            // M-8: disabled until the launch orphan-CAF sweep reports done.
+            .disabled(!appEnv.canResumePaused)
+            .help("Resume the paused recording")
+            .accessibilityLabel("Resume recording")
+            Button {
+                Task { await appEnv.endPausedRecording() }
+            } label: {
+                Label("End & Process", systemImage: "stop.circle.fill")
+                    .foregroundStyle(Design.recording)
+            }
+            .help("End the paused meeting and process it")
+            .accessibilityLabel("End and process the paused meeting")
+        } else {
+            Button {
+                Task { await appEnv.toggleRecording() }
+            } label: {
+                Label("Record", systemImage: "record.circle")
+            }
+            .help(recordHelp(status.state))
+            .accessibilityLabel("Start recording")
+        }
+    }
+
+    private func recordHelp(_ state: IndicatorState) -> String {
+        switch state {
+        case .idle:
+            return "Start recording (system audio + microphone)"
+        case .recording, .warning:
+            return "End the recording and process the meeting"
+        case .alarm(let message):
+            return "Start a new recording (previous capture failed: \(message))"
+        case .processing:
+            return "Start a new recording (the previous meeting is still processing)"
+        case .grace(let title, _):
+            return "Start a new recording (\(title) is waiting for rejoin)"
+        case .paused(let title, _):
+            return "Resume \(title), or end & process it"
+        }
+    }
+}
+
+// MARK: - Upcoming meetings
+
+struct UpcomingMeetingsSection: View {
+    @Environment(AppEnvironment.self) private var appEnv
+    @AppStorage("calendar.upcoming.collapsed") private var collapsed = false
+    let rows: [UpcomingMeetingRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Button {
+                withAnimation(.snappy(duration: 0.2)) { collapsed.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "calendar.badge.clock")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                        .accessibilityHidden(true)
+                    Text("Upcoming")
+                        .font(.system(size: 11, weight: .bold))
+                        .textCase(.uppercase)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(rows.count)")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(collapsed ? -90 : 0))
+                        .accessibilityHidden(true)
+                }
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(rows.count) upcoming meetings, \(collapsed ? "collapsed" : "expanded")")
+            .accessibilityHint(collapsed ? "Expand" : "Collapse")
+
+            if !collapsed {
+                ForEach(Array(rows.prefix(5))) { row in
+                    UpcomingMeetingRowView(row: row)
+                }
+            }
+        }
+    }
+}
+
+private struct UpcomingMeetingRowView: View {
+    @Environment(AppEnvironment.self) private var appEnv
+    let row: UpcomingMeetingRow
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: sourceIcon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.accent)
+                .frame(width: 16)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(row.title.isEmpty ? "Meeting" : row.title)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(Self.time(row.start))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Theme.accent)
+                }
+                Text(detailLine)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+
+            Button {
+                Task { await appEnv.startRecording(upcoming: row) }
+            } label: {
+                Image(systemName: "record.circle")
+                    .font(.system(size: 15, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .help("Record")
+            .accessibilityLabel("Record \(row.title)")
+
+            if row.offersLaunchAndRecord {
+                Button {
+                    Task { await appEnv.launchAndRecord(upcoming: row) }
+                } label: {
+                    Image(systemName: "play.circle")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .help("Launch and record")
+                .accessibilityLabel("Launch and record \(row.title)")
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .strokeBorder(Theme.accent.opacity(0.16), lineWidth: 1)
+        )
+    }
+
+    private var sourceIcon: String {
+        switch row.source {
+        case .meet: return "video"
+        case .zoom, .teams: return "person.2.wave.2"
+        case .inPerson: return "person.2"
+        case .imported: return "waveform"
+        }
+    }
+
+    private var detailLine: String {
+        let attendees = row.attendeeCount == 1 ? "1 attendee" : "\(row.attendeeCount) attendees"
+        if let code = row.meetingCode {
+            return "\(attendees) · \(code)"
+        }
+        return attendees
+    }
+
+    private static func time(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: date)
     }
 }
 
@@ -686,115 +902,50 @@ struct UserActionItemsList: View {
     }
 }
 
-// MARK: - Record button (V1.1: main-window mirror of the menu-bar action)
-
-/// Toolbar start/stop control routed through the SAME
-/// `AppEnvironment.toggleRecording` as the menu bar and ⌥⌘R. The label
-/// mirrors `captureStatus.state` honestly: recording/warning → Stop;
-/// idle/alarm/processing → Record (a start is allowed from alarm and while
-/// a previous meeting still processes — back-to-back meetings; only a live
-/// session blocks it, enforced by the controller).
-struct RecordToolbarButton: View {
-    @Environment(AppEnvironment.self) private var appEnv
-
-    var body: some View {
-        let status = appEnv.captureStatus
-        // G9 three-state model: recording → Pause + Stop; paused → Resume +
-        // End & process; otherwise → Record.
-        if status.isRecording {
-            Button {
-                Task { await appEnv.pauseRecording() }
-            } label: {
-                Label("Pause", systemImage: "pause.circle.fill")
-            }
-            .help("Pause recording (resume later, or end & process from pause)")
-            .accessibilityLabel("Pause recording")
-            Button {
-                Task { await appEnv.stopRecording() }
-            } label: {
-                Label("Stop", systemImage: "stop.circle.fill")
-                    .foregroundStyle(Design.recording)
-            }
-            .help("Stop recording and process the meeting")
-            .accessibilityLabel("Stop recording")
-        } else if status.isPaused {
-            Button {
-                Task { await appEnv.resumePausedRecording() }
-            } label: {
-                Label("Resume", systemImage: "record.circle")
-            }
-            // M-8: disabled until the launch orphan-CAF sweep reports done.
-            .disabled(!appEnv.canResumePaused)
-            .help("Resume the paused recording")
-            .accessibilityLabel("Resume recording")
-            Button {
-                Task { await appEnv.endPausedRecording() }
-            } label: {
-                Label("End & Process", systemImage: "stop.circle")
-            }
-            .help("End the paused meeting and process it")
-            .accessibilityLabel("End and process the paused meeting")
-        } else {
-            Button {
-                Task { await appEnv.toggleRecording() }
-            } label: {
-                Label("Record", systemImage: "record.circle")
-            }
-            .help(help(status.state))
-            .accessibilityLabel("Start recording")
-        }
-    }
-
-    private func help(_ state: IndicatorState) -> String {
-        switch state {
-        case .idle:
-            return "Start recording (system audio + microphone)"
-        case .recording, .warning:
-            return "Stop recording and process the meeting"
-        case .alarm(let message):
-            return "Start a new recording (previous capture failed: \(message))"
-        case .processing:
-            return "Start a new recording (the previous meeting is still processing)"
-        case .grace(let title, _):
-            return "Start a new recording (\(title) is waiting for rejoin)"
-        case .paused(let title, _):
-            return "Resume \(title), or end & process it"
-        }
-    }
-}
-
 // MARK: - Search results
 
 struct SearchResultsList: View {
     @Environment(AppUIState.self) private var uiState
-    let results: [SearchResultItem]
+    let results: SearchResults
 
     var body: some View {
-        List(results) { result in
-            Button {
-                uiState.selectedMeetingID = result.hit.meetingID
-                uiState.detailRequest = .init(
-                    meetingID: result.hit.meetingID,
-                    target: .transcript(segmentID: result.hit.segmentID))
-            } label: {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(result.meetingTitle)
-                            .font(.system(size: 12, weight: .semibold))
-                            .lineLimit(1)
-                        Spacer()
-                        Text(BlaiseDateFormat.dayMonthYear(result.startedAt))  // pinned DD/MM/YYYY (M-1)
-                            .font(.system(size: 11).monospacedDigit())
-                            .foregroundStyle(.tertiary)
+        List {
+            // Notes first: notes are for humans (Floor 5) and carry the most
+            // valuable output. bm25 is not comparable across the two FTS tables,
+            // so the surfaces are separate sections, each internally ranked.
+            if !results.notes.isEmpty {
+                Section("Notes") {
+                    ForEach(results.notes) { result in
+                        Button {
+                            uiState.selectedMeetingID = result.hit.meetingID
+                            uiState.detailRequest = .init(
+                                meetingID: result.hit.meetingID, target: .notes)
+                        } label: {
+                            resultRow(
+                                title: result.meetingTitle, startedAt: result.startedAt,
+                                segments: result.segments)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    snippetText(result.segments)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
                 }
-                .padding(.vertical, 3)
             }
-            .buttonStyle(.plain)
+            if !results.transcripts.isEmpty {
+                Section("Transcript") {
+                    ForEach(results.transcripts) { result in
+                        Button {
+                            uiState.selectedMeetingID = result.hit.meetingID
+                            uiState.detailRequest = .init(
+                                meetingID: result.hit.meetingID,
+                                target: .transcript(segmentID: result.hit.segmentID))
+                        } label: {
+                            resultRow(
+                                title: result.meetingTitle, startedAt: result.startedAt,
+                                segments: result.segments)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
         }
         .listStyle(.inset)
         .designListBackground()
@@ -804,6 +955,27 @@ struct SearchResultsList: View {
                 ContentUnavailableView.search
             }
         }
+    }
+
+    private func resultRow(
+        title: String, startedAt: Date, segments: [SearchSnippetFormatter.Segment]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                Spacer()
+                Text(BlaiseDateFormat.dayMonthYear(startedAt))  // pinned DD/MM/YYYY (M-1)
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            snippetText(segments)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+        }
+        .padding(.vertical, 3)
     }
 
     /// The pinned delimiters rendered as bold accent runs.

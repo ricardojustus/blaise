@@ -260,9 +260,26 @@ import Testing
         let lines = rendered.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         #expect(lines.filter { $0.hasPrefix("#") }.count == 6) // H1 + five H2 sections
     }
+
+    @Test func actionItemWithoutOwnerDropsTheEmptyColonPrefix() throws {
+        // An unresolved speaker leaves the owner blank — render "- text", never
+        // an empty "- **:** text".
+        var structured = fullStructured()
+        structured.actionItems = [
+            ActionItem(owner: "", text: "Introduce the partner to the team"),
+            ActionItem(owner: "   ", text: "Confirm the milestone notification"),
+            ActionItem(owner: "Anna", text: "Send the deck"),
+        ]
+        let rendered = try NotesRenderer.render(
+            structured, language: "en", meetingTitle: "t", userName: "Sam")
+        #expect(rendered.contains("- Introduce the partner to the team\n"))
+        #expect(rendered.contains("- Confirm the milestone notification\n"))
+        #expect(rendered.contains("- **Anna:** Send the deck\n"))  // named owner unchanged
+        #expect(!rendered.contains("**:**"))  // no empty owner prefix anywhere
+    }
 }
 
-// Impl-audit round-1 regression tests (audits/c2/impl_audit_round1.md)
+// Impl-audit round-1 regression tests
 @Suite struct NotesRendererHardeningTests {
     private func render(detailedNotes: String) throws -> String {
         let s = NotesStructured(
@@ -317,7 +334,7 @@ import Testing
     }
 }
 
-// Fix-verification round-2 regressions (N1–N5, audits/c2/impl_audit_round1.md)
+// Fix-verification round-2 regressions (N1–N5)
 @Suite struct NotesRendererFenceEdgeTests {
     private func render(_ detailedNotes: String) throws -> String {
         let s = NotesStructured(title: "T", summary: "S.", detailedNotes: detailedNotes,
@@ -398,5 +415,34 @@ import Testing
     @Test func loneCRSetextIsDemoted() throws {
         let out = try render("Injected\r===")
         #expect(out.contains("### Injected"))
+    }
+
+    /// Blank action items (empty / whitespace-only task text) must NOT render as
+    /// a "- **owner:** " line — the persistent ":" artifact. They are dropped.
+    @Test func blankActionItemsAreDropped() throws {
+        let structured = NotesStructured(
+            title: "Sync",
+            summary: "Summary.",
+            detailedNotes: "Notes.",
+            decisions: [],
+            actionItems: [
+                ActionItem(owner: "Anna", text: "Send the deck"),
+                ActionItem(owner: "Bob", text: "   "),  // whitespace-only → blank
+                ActionItem(owner: "", text: ""),         // wholly empty → blank
+            ],
+            userActionItems: [
+                ActionItem(owner: "Sam", text: "Reply to Ed"),
+                ActionItem(owner: "Sam", text: ""),      // blank
+            ]
+        )
+        let rendered = try NotesRenderer.render(
+            structured, language: "en-US", meetingTitle: "fallback", userName: "Sam")
+        // The real items survive…
+        #expect(rendered.contains("- **Anna:** Send the deck"))
+        #expect(rendered.contains("- **Sam:** Reply to Ed"))
+        // …and the blank-text items leave no trace (no "Bob:" colon line, no
+        // second "Sam:" with empty text).
+        #expect(!rendered.contains("Bob"))
+        #expect(rendered.components(separatedBy: "**Sam:**").count == 2)  // exactly one Sam line
     }
 }

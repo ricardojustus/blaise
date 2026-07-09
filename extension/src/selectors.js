@@ -8,8 +8,7 @@
 // Touchpoint (see extension/README.md, "Updating selectors").
 //
 // Source annotations: each strategy cites where it was observed and the date
-// it was last verified against a live source (research/c12_meet_extension.md
-// has the full evidence table).
+// it was last verified against a live source.
 //
 // Loaded as a classic script in the content-script world (globalThis
 // namespace) and as a CommonJS module under vitest.

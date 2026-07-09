@@ -61,6 +61,12 @@ public enum SpeakerResolver {
     /// Dominance: top vote strictly > 2× runner-up AND ≥ 5 s total.
     static let dominanceFactor = 2.0
     static let dominanceFloorSeconds = 5.0
+    /// Per-segment refinement (C4 v6): looser than cluster dominance because a
+    /// single transcript segment's window is short and usually one speaker — but
+    /// still requires a clear, sustained majority before it sets or overrides.
+    static let segmentDominanceFactor = 1.5
+    static let segmentCoverageFloor = 0.5
+    static let segmentMinOverlapSeconds = 0.5
 
     private static let logger = Logger(subsystem: BlaiseBundle.identifier, category: "speaker.resolver")
 
@@ -182,6 +188,130 @@ public enum SpeakerResolver {
         }
         // Normalize a float-noise offset like -2.0000000000000004 + 8*0.25.
         return (bestOffset * 4).rounded() / 4
+    }
+
+    // MARK: - Per-segment refinement (C4 v6)
+
+    /// After the cluster-level `resolve()`+`apply()`, refine attribution PER
+    /// SEGMENT from the SAME active-speaker timeline. For each segment, when one
+    /// speaker clearly dominated that segment's own [start,end] window, set or
+    /// CORRECT its `speakerName`. This fixes two cluster-granularity failures the
+    /// diarizer creates on a mixed remote stream: (a) BLEED — one acoustic
+    /// cluster spanning two people inherits a single name across the other's
+    /// words; (b) multi-speaker BLOBS that win no cluster-level name and stay
+    /// unnamed. Recall-safe: a segment with no confident dominant speaker is
+    /// returned UNCHANGED (it keeps the cluster pass's result); no events → a
+    /// no-op; the `user` mic track is immune. Names come ONLY from the timeline
+    /// (`eventNames`), so name invention stays impossible. Pure/deterministic.
+    public static func refineWithPerSegmentTimeline(
+        segments: [TranscriptSegment],
+        diarization: [DiarizedSegment],
+        hints: SpeakerHints,
+        audioDuration: Double,
+        eventNames: Set<String>
+    ) -> [TranscriptSegment] {
+        guard let events = hints.activeSpeakerEvents, !events.isEmpty,
+            let recordingStart = hints.recordingStartEpochMillis
+        else { return segments }
+
+        // Drop scraper noise (Meet UI captions the extension sometimes logs as a
+        // "speaker") from the COMPETITOR set entirely — left in, their phantom
+        // events both mis-name segments AND distort the drift offset. Recall-safe.
+        let relative: [(name: String, participantID: String?, start: Double, end: Double)] =
+            events
+            .filter { isPlausibleSpeakerName($0.displayName) }
+            .map {
+                (
+                    $0.displayName, $0.participantID,
+                    Double($0.startEpochMillis - recordingStart) / 1000.0,
+                    Double($0.endEpochMillis - recordingStart) / 1000.0
+                )
+            }
+        guard !relative.isEmpty else { return segments }
+        let clusters = diarization.filter { $0.speakerLabel != TranscriptSegment.unattributed }
+        // The SAME drift offset the cluster pass picks (identical inputs).
+        let offset = chooseOffset(clusters: clusters, events: relative, audioDuration: audioDuration)
+
+        // Same ambiguity rule as resolve(): a displayName shared by two distinct,
+        // time-overlapping participantIDs is ambiguous and never assigned.
+        var ambiguousNames: Set<String> = []
+        for (name, group) in Dictionary(grouping: relative, by: { $0.name }) {
+            let identified = group.filter { $0.participantID != nil }
+            outer: for i in identified.indices {
+                for j in identified.indices where j > i {
+                    guard identified[i].participantID != identified[j].participantID else { continue }
+                    if min(identified[i].end, identified[j].end)
+                        > max(identified[i].start, identified[j].start)
+                    {
+                        ambiguousNames.insert(name)
+                        break outer
+                    }
+                }
+            }
+        }
+
+        // Names may only come from the timeline (folded for comparison).
+        let allowedFolded = Set(eventNames.map { VocabNormalization.canonicalMode($0) })
+
+        return segments.map { segment in
+            // The reserved mic track is immune (named at creation).
+            guard segment.speakerLabel != TranscriptSegment.userLabel else { return segment }
+            let duration = segment.endSeconds - segment.startSeconds
+            guard duration > 0 else { return segment }
+
+            // Overlap of each speaker with THIS segment's window.
+            var overlapByName: [String: Double] = [:]
+            for event in relative {
+                let overlap = min(segment.endSeconds, event.end + offset)
+                    - max(segment.startSeconds, event.start + offset)
+                if overlap > 0 { overlapByName[event.name, default: 0] += overlap }
+            }
+            // No timeline activity in this window → no evidence either way; keep.
+            let ranked = overlapByName.sorted { ($0.value, $1.key) > ($1.value, $0.key) }
+            guard let top = ranked.first else { return segment }
+            let runnerUp = ranked.dropFirst().first?.value ?? 0
+
+            // A CONFIDENT dominant speaker covers a majority of the segment,
+            // clearly beats the runner-up, is not ambiguous, and is allowed.
+            let confident =
+                !ambiguousNames.contains(top.key)
+                && top.value >= segmentMinOverlapSeconds
+                && top.value >= segmentCoverageFloor * duration
+                && top.value > segmentDominanceFactor * runnerUp
+                && allowedFolded.contains(VocabNormalization.canonicalMode(top.key))
+
+            guard let current = segment.speakerName else {
+                // Unnamed → FILL only when confident; otherwise leave unnamed.
+                guard confident else { return segment }
+                var named = segment
+                named.speakerName = top.key
+                return named
+            }
+            // Named → KEEP when the timeline still supports this name here (even
+            // if someone else was louder) — protects real brief interjections.
+            let currentOverlap = overlapByName.first {
+                VocabNormalization.canonicalMode($0.key) == VocabNormalization.canonicalMode(current)
+            }?.value ?? 0
+            if currentOverlap >= segmentMinOverlapSeconds { return segment }
+            // BLEED: the timeline CONTRADICTS the current name (this person was
+            // absent during the segment). Replace with a confident dominant
+            // speaker; otherwise CLEAR to unknown — never knowingly keep a wrong
+            // attribution (policy b: better unattributed than mis-attributed).
+            var corrected = segment
+            corrected.speakerName = confident ? top.key : nil
+            return corrected
+        }
+    }
+
+    /// A scraped active-speaker "name" is a plausible participant iff it is short
+    /// (≤ 4 whitespace tokens) and carries no sentence punctuation — rejecting
+    /// Meet UI captions the extension sometimes logs as a speaker. Recall-safe: a
+    /// false reject merely means that speaker can't be assigned per-segment.
+    static func isPlausibleSpeakerName(_ name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.contains(where: { $0 == "." || $0 == "!" || $0 == "?" }) { return false }
+        return trimmed.split(whereSeparator: { $0 == " " }).count <= 4
     }
 }
 

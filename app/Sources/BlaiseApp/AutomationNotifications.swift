@@ -134,6 +134,21 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         withdraw(ids: ["blaise.watchdog.\(meetingID)"])
     }
 
+    /// Silence auto-pause: the `SilenceWatchdog` paused the recording after a
+    /// sustained dual-track silence, so the user is never left with a silently
+    /// missed capture. Informational (no action button): the meeting is held
+    /// open and Resume lives in the menu / main window — a notification button
+    /// would route through the grace path, which is the wrong resume here.
+    func postSilenceAutoPause(meetingID: MeetingID, title: String, minutes: Int) async {
+        let content = UNMutableNotificationContent()
+        content.title = "Recording auto-paused — \(minutes) min of silence"
+        content.body =
+            "\(title) — both audio tracks were silent. Resume from the Blaise menu if the meeting is still going."
+        content.interruptionLevel = .active
+        content.userInfo = ["meetingID": meetingID]
+        await post(id: "blaise.silenceautopause.\(meetingID)", content: content)
+    }
+
     func postNudge(meetingID: MeetingID, title: String) async {
         let content = UNMutableNotificationContent()
         content.title = "Recording running — no Meet signals yet"

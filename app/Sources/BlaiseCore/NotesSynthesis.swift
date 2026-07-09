@@ -20,8 +20,7 @@ import Foundation
 /// document to an empty skeleton — live-probed 2026-06-10). `meeting_type`
 /// sits deliberately BEFORE `detailed_notes`: the model commits to a
 /// classification before it writes the notes (classify-then-write, the same
-/// ordering mechanism pointed the right way; research/notes_structure_v2.md
-/// §4.1).
+/// ordering mechanism pointed the right way).
 public enum NotesResponseSchema {
     public static let json = """
         {
@@ -82,6 +81,10 @@ public enum NotesDecodingParameters {
     /// MLX/Outlines: temperature 0.2 + top_p 0.9.
     public static let temperature = 0.2
     public static let mlxTopP = 0.9
+    /// Digest decode: temperature 0 — the digest is a precision-first extraction
+    /// FROM the transcript (no creative latitude), so 0 minimizes the stochastic
+    /// fabrication tail the recall-gate surfaced. The notes path keeps 0.2.
+    public static let digestTemperature = 0.0
     // Claude: temperature ONLY — the API rejects requests carrying both
     // temperature and top_p on Claude 4+ models (asymmetry deliberate).
 }
@@ -99,11 +102,11 @@ public enum NotesPromptVersion: String, Sendable, CaseIterable {
     /// v1 + ONLY the user's two field fixes (no v2 restructuring): canonical
     /// names REPLACE mishearings outright everywhere (never "Misheard
     /// (Canonical)" parentheticals), and raw speaker labels never appear
-    /// as owners or pseudo-names in prose. audits/c6/notes_v11/.
+    /// as owners or pseudo-names in prose.
     case v11 = "c6-v1.1"
     /// Meeting-type-aware section plans (notes v2): classify-then-write,
     /// per-type section plans inside detailed_notes, canonical-name and
-    /// no-raw-label rules. research/notes_structure_v2.md.
+    /// no-raw-label rules.
     case v2 = "c6-v2"
 }
 
@@ -111,8 +114,8 @@ public enum NotesPromptBuilder {
     /// The SHIPPED default prompt version, decided by two blind validations
     /// on the pinned sample (pre-committed gates; a challenger ships as
     /// default only by passing the fabrication floor without losing a
-    /// criterion): v1-vs-v2 (audits/c6/notes_v2/verdict.md — v1 won on
-    /// faithfulness) and v1-vs-v1.1 (audits/c6/notes_v11/verdict.md, judge
+    /// criterion): v1-vs-v2 (v1 won on
+    /// faithfulness) and v1-vs-v1.1 (judge
     /// given the FULL model input — v1.1 FAILED the fabrication floor: its
     /// canonical-name rule induced owner/mapping over-attribution). v1 stays
     /// the default; v1.1 and v2 are selectable via `notes.promptVersion`.
@@ -187,7 +190,7 @@ public enum NotesPromptBuilder {
         SPEAKER LABELS ARE NOT NAMES (mandatory): raw speaker labels ("S0", "S1", …) NEVER appear in notes prose, in summaries, or as action-item owners. Refer to an unnamed speaker by their resolved name, by a name grounded in the transcript, or by a neutral descriptor in the dominant language (e.g. "the other participant" / "o outro participante"). A label may appear ONLY inside "speaker_name_mapping".
         """
 
-    /// Frozen v2 system prompt (notes v2, research/notes_structure_v2.md):
+    /// Frozen v2 system prompt (notes v2):
     /// v1's rules unchanged, PLUS meeting-type classification (classify
     /// before writing; `general` as the explicit escape), per-type section
     /// plans rendered as "##" headings inside detailed_notes (a MAXIMUM, not
@@ -253,6 +256,14 @@ public enum NotesPromptBuilder {
                     + request.vocabulary.joined(separator: ", "))
         }
 
+        // #101: presence-gated CONDITIONAL PERSON MENTIONS block, AFTER the
+        // CANONICAL VOCABULARY block. HARD presence guard (mirrors the
+        // vocabulary/ALIAS-RESOLUTION guards): empty hints → nothing appended →
+        // the user message is BYTE-IDENTICAL to before this feature.
+        if let hintBlock = GroundedPersonHints.synthesisBlock(request.groundedPersonHints) {
+            sections.append(hintBlock)
+        }
+
         var metadata: [String] = []
         metadata.append("Title: \(request.meeting.title)")
         metadata.append("Date: \(Self.formatDate(request.meeting.startedAt))")
@@ -275,11 +286,11 @@ public enum NotesPromptBuilder {
         return sections.joined(separator: "\n\n")
     }
 
-    /// DD/MM/YYYY in America/Sao_Paulo (Brazilian Portuguese conventions).
-    static func formatDate(_ date: Date) -> String {
+    /// DD/MM/YYYY in `timeZone` (default: the system time zone).
+    static func formatDate(_ date: Date, timeZone: TimeZone = .current) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "America/Sao_Paulo")
+        formatter.timeZone = timeZone
         formatter.dateFormat = "dd/MM/yyyy"
         return formatter.string(from: date)
     }
@@ -319,10 +330,10 @@ struct NotesEngineResponse: Decodable {
         case detailedNotes = "detailed_notes"
         case actionItems = "action_items"
         case userActionItems = "user_action_items"
-        /// G4: pre-rename payloads carry `legacy_user_action_items`. The decoder
+        /// G4: pre-rename payloads carry `ric_action_items`. The decoder
         /// accepts both keys forever (spec §2); new payloads carry only the
         /// new key.
-        case legacyUserActionItemsKey = "legacy_user_action_items"
+        case ricActionItemsLegacy = "ric_action_items"
         case speakerNameMapping = "speaker_name_mapping"
     }
 
@@ -330,16 +341,22 @@ struct NotesEngineResponse: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.title = try container.decodeIfPresent(String.self, forKey: .title)
         self.summary = try container.decode(String.self, forKey: .summary)
+        // Lenient: the API/MLX engines get a schema-enforced enum, but the
+        // `claude -p` (Account) engine has NO server-side json_schema enforcement and
+        // can emit a free-text phrase here — an UNRECOGNIZED (or absent) value maps to
+        // `.general` rather than throwing and failing the ENTIRE notes. `decodeIfPresent`
+        // only nils on an ABSENT key, so we decode the raw String and validate it.
         self.meetingType =
-            try container.decodeIfPresent(MeetingType.self, forKey: .meetingType) ?? .general
+            (try container.decodeIfPresent(String.self, forKey: .meetingType))
+            .flatMap(MeetingType.init(rawValue:)) ?? .general
         self.detailedNotes = try container.decode(String.self, forKey: .detailedNotes)
         self.decisions = try container.decode([String].self, forKey: .decisions)
         self.actionItems = try container.decode([Item].self, forKey: .actionItems)
-        // Prefer the new key; fall back to the legacy `legacy_user_action_items` key
+        // Prefer the new key; fall back to the legacy `ric_action_items` key
         // for payloads predating the G4 rename (spec §2, AC2).
         self.userActionItems =
             try container.decodeIfPresent([Item].self, forKey: .userActionItems)
-            ?? container.decode([Item].self, forKey: .legacyUserActionItemsKey)
+            ?? container.decode([Item].self, forKey: .ricActionItemsLegacy)
         self.speakerNameMapping = try container.decode([Mapping].self, forKey: .speakerNameMapping)
     }
 

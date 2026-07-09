@@ -4,7 +4,7 @@
 @preconcurrency import AVFoundation
 import Foundation
 
-/// C7-owned audio transcoding (research/c7_pipeline.md §1, probed):
+/// C7-owned audio transcoding (probed):
 /// - encode: import WAV → retained `audio.m4a` (D7: AAC-LC mono 32 kbps),
 ///   written via temp file + atomic rename;
 /// - decode: retained `audio.m4a` → temp 16 kHz mono Int16 WAV for the

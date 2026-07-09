@@ -12,6 +12,18 @@ The app is a pure Swift Package Manager project — there is no `.xcodeproj`. Th
 scripts invoke the Xcode toolchain's `swift` directly with an explicit SDK root,
 so the Xcode licence does not need to be accepted to build or test.
 
+**Activate the leak tripwire (one time, after cloning).** This repo ships a
+pre-commit hook that blocks accidental commits of confidential data. Git does
+not enable committed hooks automatically, so run once:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+A required CI `secret-scan` job runs the same checks on every push as an
+un-bypassable backstop, but activating the local hook catches issues before they
+leave your machine.
+
 ## Building
 
 ```sh

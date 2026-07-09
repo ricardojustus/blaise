@@ -170,7 +170,7 @@ import Testing
         // outright, and the byte-pin above already proves the new bytes.
         #expect(newText != oldText)
         // Independently parse BOTH payloads and confirm: the only key-set diff
-        // anywhere in the document is `user_action_items` ⇄ `legacy_user_action_items`
+        // anywhere in the document is `user_action_items` ⇄ `ric_action_items`
         // inside notes_structured, and that key's VALUE is byte-identical.
         let newParsed = try #require(
             try JSONSerialization.jsonObject(with: payload.bytes) as? [String: Any])
@@ -181,11 +181,11 @@ import Testing
         // The renamed key's value is byte-identical across the rename.
         #expect(
             (newStructured["user_action_items"] as? [[String: String]])
-                == (oldStructured["legacy_user_action_items"] as? [[String: String]]))
+                == (oldStructured["ric_action_items"] as? [[String: String]]))
         // The ONLY key-set difference anywhere is the renamed action-items key
         // inside notes_structured; top-level key sets are identical.
         #expect(Set(newStructured.keys).symmetricDifference(Set(oldStructured.keys))
-            == ["user_action_items", "legacy_user_action_items"])
+            == ["user_action_items", "ric_action_items"])
         #expect(Set(newParsed.keys) == Set(oldParsed.keys))
         // Whole-document byte-diff modulo the key token (AC3 / AC4): rename
         // BOTH streams' action-items key to a common placeholder, re-emit each
@@ -195,7 +195,7 @@ import Testing
         // survives the substitution and fails this — it is not vacuous.
         #expect(
             canonicalReemit(payload.bytes, replacingKey: "user_action_items", with: "z_action_items")
-                == canonicalReemit(oldPayload.bytes, replacingKey: "legacy_user_action_items", with: "z_action_items"))
+                == canonicalReemit(oldPayload.bytes, replacingKey: "ric_action_items", with: "z_action_items"))
     }
 
     /// Parse canonical JSON bytes, rename one object key wherever it appears,

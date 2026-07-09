@@ -85,6 +85,61 @@ import Testing
         #expect(try await harness.queueRows(meeting.id) == 1)
     }
 
+    @Test func suppressAutoFallbackPrimaryGoesPendingDespiteLightweightFallback() async throws {
+        // Decision B ("stay free, but not silent"): the user-SELECTED primary
+        // suppresses auto-fallback (the subscription `claude -p` engine). Even
+        // though a LIGHTWEIGHT fallback is registered (which would normally hop),
+        // a fallback-trigger failure leaves the notes PENDING with a warning — it
+        // is NEVER silently routed to the metered/other engine. The pending reason
+        // names the engine + cause so the marker is user-visible.
+        let harness = try await makePipelineHarness()
+        let meeting = try await harness.importTestMeeting()
+        harness.notesPrimary.state.withLock {
+            $0.suppressesAutoFallback = true
+            $0.error = .configurationMissing(key: "oauthToken")
+        }
+        let record = try await harness.pipeline.process(meetingID: meeting.id)
+
+        // Pending, not a fallback hop: the record carries the reason and NO
+        // fallback record; the fallback engine was never invoked.
+        #expect(record.notesPending != nil)
+        #expect(
+            record.notesPending?.contains("pipeline-mock-notes-primary") == true,
+            "the pending reason names the selected engine")
+        #expect(record.fallback == nil)
+        #expect(record.notesEngineID == nil)
+        #expect(
+            harness.notesFallback.state.withLock { $0.requests.isEmpty },
+            "the fallback engine is NEVER invoked when the primary suppresses auto-fallback")
+
+        // Meeting state mirrors the heavyweight-pending terminal: failed + marker,
+        // no notes, no handoff row.
+        let stored = try #require(try await harness.meeting(meeting.id))
+        #expect(stored.status == .failed)
+        #expect(NotesPendingClass.isPending(stored.lastProcessingError))
+        let notes = try await NotesRepository(database: harness.database)
+            .fetch(meetingID: meeting.id)
+        #expect(notes == nil)
+        #expect(try await harness.queueRows(meeting.id) == 0)
+    }
+
+    @Test func nonSuppressingPrimaryStillHopsToLightweightFallback() async throws {
+        // Control for the above: with `suppressesAutoFallback` left at the default
+        // `false`, the SAME trigger hops to the lightweight fallback (unchanged
+        // behavior for the cloud/local engines).
+        let harness = try await makePipelineHarness()
+        let meeting = try await harness.importTestMeeting()
+        harness.notesPrimary.state.withLock {
+            $0.error = .configurationMissing(key: "apiKey")
+        }
+        let record = try await harness.pipeline.process(meetingID: meeting.id)
+        #expect(record.notesPending == nil)
+        #expect(record.fallback?.fallbackEngineID == "pipeline-mock-notes-fallback")
+        #expect(!harness.notesFallback.state.withLock { $0.requests.isEmpty })
+        let stored = try #require(try await harness.meeting(meeting.id))
+        #expect(stored.status == .ready)
+    }
+
     @Test func deliberateHeavyweightPrimarySelectionStillRuns() async throws {
         // A heavyweight engine as the user-selected PRIMARY runs (its own
         // memory gate is the engine's concern, exercised in the MLX tests).

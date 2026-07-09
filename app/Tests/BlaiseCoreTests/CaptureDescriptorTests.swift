@@ -6,7 +6,7 @@ import Testing
 @testable import BlaiseCore
 
 // C11 AC1: tap/aggregate descriptor construction — parameter SNAPSHOT tests
-// against the research-verified forms (research/c11_capture.md §1). These
+// against the research-verified forms. These
 // construct description objects and dictionaries only; no HAL device is
 // created, no IO starts, no TCC prompt can fire.
 
@@ -32,7 +32,7 @@ struct CaptureDescriptorTests {
     func aggregateComposition() throws {
         let dict = CaptureDescriptors.aggregateComposition(
             tapUID: "TAP-UUID-STRING", inputDeviceUID: "BuiltInMicrophoneDevice",
-            aggregateUID: "app.blaise.mac.test")
+            aggregateUID: "test.aggregate.uid")
 
         // Key strings pinned to the SDK constants (the research-verified
         // forms; a constant drifting would break the recipe silently).
@@ -45,9 +45,14 @@ struct CaptureDescriptorTests {
         #expect(kAudioAggregateDeviceTapAutoStartKey == "tapautostart")
         #expect(kAudioAggregateDeviceIsPrivateKey == "private")
 
-        #expect(dict[kAudioAggregateDeviceUIDKey as String] as? String == "app.blaise.mac.test")
+        #expect(dict[kAudioAggregateDeviceUIDKey as String] as? String == "test.aggregate.uid")
         #expect(dict[kAudioAggregateDeviceNameKey as String] as? String == "Blaise Capture")
         #expect(dict[kAudioAggregateDeviceIsPrivateKey as String] as? Bool == true)
+        // B3: the mic is pinned as the aggregate time source ("master") so both
+        // tracks are delivered at one rate (drift root fix).
+        #expect(
+            dict[kAudioAggregateDeviceMainSubDeviceKey as String] as? String
+                == "BuiltInMicrophoneDevice")
         // Pinned FALSE: tap auto-start gates the whole aggregate's IO (mic
         // included) on another process playing audio — on a quiet system
         // nothing is captured at all (root-caused 10/06/2026, killMidCapture).
@@ -71,8 +76,59 @@ struct CaptureDescriptorTests {
     @Test("aggregate UID carries the cleanup prefix")
     func aggregateUIDPrefix() {
         let uid = CaptureDescriptors.makeAggregateUID()
-        #expect(uid.hasPrefix("app.blaise.mac."))
-        #expect(uid.count > "app.blaise.mac.".count)
+        #expect(uid.hasPrefix(BlaiseBundle.identifier + "."))
+        #expect(uid.count > (BlaiseBundle.identifier + ".").count)
+    }
+}
+
+/// B3: capture-drift converter-rate resolution — the deterministic, headless-
+/// testable parts of the fix. The WIRING in `CaptureSession.buildGraph` (which
+/// format each converter actually receives) is covered only by the deferred
+/// live-capture FFT / frames-vs-wallclock check (needs audio hardware + TCC).
+struct CaptureRateResolutionTests {
+
+    @Test("resolvedConverterRate: plausible Fs passes; nil/0/implausible -> nil (all-or-nothing fallback)")
+    func resolvedRate() {
+        let ok: (Double) -> Bool = { $0 == 48000 || $0 == 44100 }
+        #expect(CaptureSession.resolvedConverterRate(aggregateRate: 48000, plausible: ok) == 48000)
+        #expect(CaptureSession.resolvedConverterRate(aggregateRate: 44100, plausible: ok) == 44100)
+        #expect(CaptureSession.resolvedConverterRate(aggregateRate: nil, plausible: ok) == nil)
+        #expect(CaptureSession.resolvedConverterRate(aggregateRate: 0, plausible: ok) == nil)
+        #expect(CaptureSession.resolvedConverterRate(aggregateRate: 999_999, plausible: ok) == nil)
+        #expect(CaptureSession.resolvedConverterRate(aggregateRate: 1, plausible: ok) == nil)
+    }
+
+    @Test("isPlausibleRate: inside advertised ranges, or the sane bound when none advertised")
+    func plausible() {
+        let ranges = [
+            AudioValueRange(mMinimum: 44100, mMaximum: 44100),
+            AudioValueRange(mMinimum: 48000, mMaximum: 48000),
+        ]
+        #expect(CaptureSession.isPlausibleRate(48000, within: ranges))
+        #expect(CaptureSession.isPlausibleRate(44100, within: ranges))
+        #expect(!CaptureSession.isPlausibleRate(96000, within: ranges))  // not advertised
+        #expect(!CaptureSession.isPlausibleRate(1, within: ranges))
+        // No advertised ranges -> the sane absolute bound 8000...192000.
+        #expect(CaptureSession.isPlausibleRate(48000, within: []))
+        #expect(!CaptureSession.isPlausibleRate(5000, within: []))
+        #expect(!CaptureSession.isPlausibleRate(200_000, within: []))
+    }
+
+    @Test("converterInputFormat: overrides ONLY the sample rate; channels + format preserved")
+    func inputFormat() throws {
+        let base = try #require(
+            AVAudioFormat(
+                commonFormat: .pcmFormatInt16, sampleRate: 44100, channels: 1, interleaved: true))
+        let asbd = base.streamDescription.pointee
+        let overridden = try #require(
+            CaptureSession.converterInputFormat(streamASBD: asbd, rate: 48000))
+        #expect(overridden.sampleRate == 48000)
+        #expect(overridden.channelCount == 1)
+        #expect(overridden.streamDescription.pointee.mBytesPerFrame == asbd.mBytesPerFrame)
+        #expect(overridden.streamDescription.pointee.mFormatID == asbd.mFormatID)
+        let same = try #require(
+            CaptureSession.converterInputFormat(streamASBD: asbd, rate: 44100))
+        #expect(same.sampleRate == 44100)
     }
 }
 

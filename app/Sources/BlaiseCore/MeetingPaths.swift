@@ -102,8 +102,8 @@ public struct MeetingPaths: Sendable {
     }
 
     /// Crash-safe in-flight capture track (LPCM Int16 16 kHz mono CAF —
-    /// the ONLY probed format that survives kill -9, research/c11_capture.md
-    /// §3). Deleted exclusively by the audited verified-encode function.
+    /// the ONLY probed format that survives kill -9). Deleted exclusively by
+    /// the audited verified-encode function.
     public func captureCAFURL(_ meetingID: MeetingID, track: CaptureTrack) -> URL {
         meetingDirectory(meetingID).appendingPathComponent("capture_\(track.rawValue).caf")
     }

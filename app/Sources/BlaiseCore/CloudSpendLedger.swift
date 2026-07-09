@@ -5,7 +5,7 @@ import os
 /// B-2 cloud-spend accounting (C6 owns enforcement; C10 displays).
 ///
 /// Persists per-month accumulated USD in the `cloud_spend` table (migration
-/// v3): `{month_key "YYYY-MM" in America/Sao_Paulo, accumulated_usd}`.
+/// v3): `{month_key "YYYY-MM" in the system time zone, accumulated_usd}`.
 /// Month rollover "resets" by construction — a new month is a new row.
 ///
 /// `add(_:)` performs the read-modify-write inside ONE `pool.write`
@@ -47,10 +47,11 @@ public actor CloudSpendLedger {
         midReceiptTransactionHook = hook
     }
 
-    /// "YYYY-MM" in America/Sao_Paulo (the user's billing month boundary).
-    static func monthKey(for date: Date) -> String {
+    /// "YYYY-MM" in `timeZone` (default: the system time zone) — the billing
+    /// month boundary.
+    static func monthKey(for date: Date, timeZone: TimeZone = .current) -> String {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "America/Sao_Paulo") ?? .current
+        calendar.timeZone = timeZone
         let components = calendar.dateComponents([.year, .month], from: date)
         return String(format: "%04d-%02d", components.year ?? 0, components.month ?? 0)
     }

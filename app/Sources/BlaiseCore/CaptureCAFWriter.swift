@@ -1,8 +1,8 @@
 import AVFoundation
 import Foundation
 
-// C11: crash-safe in-flight track writer. PROBED FACT (research/c11_capture.md
-// §3, real kill -9 matrix): LPCM Int16 CAF is the ONLY format that survives a
+// C11: crash-safe in-flight track writer. PROBED FACT (real kill -9 matrix):
+// LPCM Int16 CAF is the ONLY format that survives a
 // kill -9 without finalize — CAF's data-chunk size is -1 ("rest of file")
 // until close and LPCM needs no packet table. AAC-m4a and AAC-CAF are dead
 // after a crash (no moov / no pakt). Each capture track records through this
