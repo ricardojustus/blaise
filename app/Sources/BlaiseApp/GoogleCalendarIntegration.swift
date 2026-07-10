@@ -230,6 +230,7 @@ final class GoogleCalendarModel {
         // hold when the browser flow finishes.
         let id = clientID
         let secret = clientSecret
+        let epoch = connectEpoch
         let task = Task { [client] in
             try await client.authorize(clientID: id, clientSecret: secret)
         }
@@ -241,6 +242,14 @@ final class GoogleCalendarModel {
                 try await task.value
             } onCancel: {
                 task.cancel()
+            }
+            guard epoch == connectEpoch else {
+                // Cancel/disconnect landed after authorization had already
+                // succeeded, so cancelling the task was a no-op — the result
+                // no longer applies. Revoke the fresh grant rather than leave
+                // it dangling at Google.
+                await client.revoke(refreshToken: refreshToken)
+                return
             }
             try secrets.set(key: Self.refreshTokenKey, value: refreshToken)
             connected = true
@@ -260,9 +269,15 @@ final class GoogleCalendarModel {
         }
     }
 
+    /// Bumped by `cancelConnect()` so an authorization that already succeeded
+    /// when the cancel/disconnect landed cannot apply its result afterwards
+    /// (task cancellation alone is a no-op on a completed task).
+    private var connectEpoch = 0
+
     /// Abort an in-flight `connect()` (e.g. Google showed an error page in the
     /// browser and the redirect will never come).
     func cancelConnect() {
+        connectEpoch += 1
         connectTask?.cancel()
     }
 
