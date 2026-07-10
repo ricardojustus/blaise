@@ -59,6 +59,9 @@ final class GoogleCalendarModel {
     private(set) var authorizing = false
     private(set) var refreshing = false
     private(set) var lastError: String?
+    /// Persistence (Keychain / settings-DB) failures, kept separate from
+    /// `lastError` so a later successful calendar refresh can't wipe them.
+    private(set) var settingsError: String?
     private(set) var lastRefresh: Date?
     /// Google calendar IDs the user has hidden (empty = all shown).
     private(set) var hiddenCalendarIDs: Set<String> = []
@@ -87,10 +90,12 @@ final class GoogleCalendarModel {
         clientID = stored.clientID
         do {
             clientSecret = try secrets.get(key: Self.clientSecretKey) ?? ""
+            secretLoadFailed = false
         } catch {
-            // A Keychain read *error* is not "no secret": leave the field
-            // untouched so a later Save can't turn a transient glitch into
-            // deletion of the stored secret.
+            // A Keychain read *error* is not "no secret": remember the failure
+            // so a later Save can't turn a transient glitch into deletion of
+            // the stored secret.
+            secretLoadFailed = true
         }
         persistedCredentials = (clientID, clientSecret)
         hiddenCalendarIDs = Set(
@@ -125,6 +130,7 @@ final class GoogleCalendarModel {
             googleCalendars = try await client.listCalendars(
                 clientID: normalized, clientSecret: normalizedClientSecret,
                 refreshToken: refreshToken)
+            lastError = nil
         } catch {
             // Keep the last list, but surface the failure — e.g. a legacy
             // Desktop-client setup whose token grants now need the missing
@@ -134,35 +140,61 @@ final class GoogleCalendarModel {
         }
     }
 
-    /// Last credential pair written to storage — used to invalidate the cached
-    /// access token when the user swaps credentials.
+    /// Last credential pair confirmed written to storage — used to invalidate
+    /// the cached access token when the user swaps credentials. Updated only
+    /// after the writes succeed.
     private var persistedCredentials: (id: String, secret: String) = ("", "")
+    /// Serializes persistence (same pattern as `hiddenPersistTask`) so
+    /// overlapping saves can't interleave their Keychain and settings-DB
+    /// writes into a mixed credential pair.
+    private var savePersistTask: Task<(any Error)?, Never>?
+    /// True while the Keychain read for the secret has failed — an empty field
+    /// then must not be treated as the user clearing the secret.
+    private var secretLoadFailed = false
 
     func saveSettings() async {
-        let normalized = normalizedClientID
-        clientID = normalized
-        clientSecret = normalizedClientSecret
-        if persistedCredentials != (clientID, clientSecret) {
-            // New credentials must not keep serving a token minted under the
-            // old ones — that hides a bad ID/secret until the token expires.
-            await client.clearAccessToken()
-        }
-        do {
-            // The client secret is a credential — it lives in the Keychain next
-            // to the refresh token, never in the settings database.
-            if clientSecret.isEmpty {
-                try secrets.delete(key: Self.clientSecretKey)
-            } else {
-                try secrets.set(key: Self.clientSecretKey, value: clientSecret)
+        // Snapshot everything before the first suspension point; the fields
+        // may change while a previous save is still in flight.
+        let id = normalizedClientID
+        let secret = normalizedClientSecret
+        clientID = id
+        clientSecret = secret
+        let snapshot = GoogleCalendarSettings(enabled: enabled, clientID: id)
+        let skipSecretDelete = secret.isEmpty && secretLoadFailed
+        let credentialsChanged = persistedCredentials != (id, secret)
+        let previous = savePersistTask
+        let task = Task { [settings, secrets, client] () -> (any Error)? in
+            _ = await previous?.value
+            do {
+                // The client secret is a credential — it lives in the Keychain
+                // next to the refresh token, never in the settings database.
+                if secret.isEmpty {
+                    if !skipSecretDelete {
+                        try secrets.delete(key: Self.clientSecretKey)
+                    }
+                } else {
+                    try secrets.set(key: Self.clientSecretKey, value: secret)
+                }
+                try await settings.set(Self.settingsKey, to: snapshot)
+            } catch {
+                return error
             }
-            persistedCredentials = (clientID, clientSecret)
-            try await settings.set(
-                Self.settingsKey,
-                to: GoogleCalendarSettings(enabled: enabled, clientID: normalized))
-        } catch {
+            if credentialsChanged {
+                // New credentials must not keep serving a token minted under
+                // the old ones — that hides a bad ID/secret until expiry.
+                await client.clearAccessToken()
+            }
+            return nil
+        }
+        savePersistTask = task
+        if let error = await task.value {
             // Persistence failures must be visible: a silently missing secret
             // resurfaces later as an inexplicable refresh failure.
-            lastError = Self.describe(error)
+            settingsError = Self.describe(error)
+        } else {
+            settingsError = nil
+            persistedCredentials = (id, secret)
+            if !secret.isEmpty { secretLoadFailed = false }
         }
     }
 
@@ -216,9 +248,10 @@ final class GoogleCalendarModel {
             lastError = nil
             clientID = id
             clientSecret = secret
-            // The access token cached by authorize() was minted under exactly
-            // this pair — don't let saveSettings' change-detection clear it.
-            persistedCredentials = (id, secret)
+            // saveSettings' change-detection will clear the access token that
+            // authorize() just cached — one redundant refresh-grant later, in
+            // exchange for never marking credentials persisted before their
+            // writes actually succeed.
             await saveSettings()
         } catch is CancellationError {
             lastError = nil
@@ -234,6 +267,9 @@ final class GoogleCalendarModel {
     }
 
     func disconnect() async {
+        // Abort any in-flight (re)connect first — a late authorization success
+        // must not write a fresh token and silently undo the disconnect.
+        cancelConnect()
         // Best-effort revoke at Google BEFORE forgetting the token locally, so a
         // disconnect tears down the grant itself — not just our copy of it.
         if let refreshToken = (try? secrets.get(key: Self.refreshTokenKey)) ?? nil {
@@ -349,6 +385,9 @@ actor GoogleCalendarClient {
         guard let authURL = components.url else {
             throw GoogleCalendarError.malformedResponse("could not build authorization URL")
         }
+        // A cancel that raced the listener becoming ready must not still open
+        // the browser.
+        try Task.checkCancellation()
         let opened = await MainActor.run {
             NSWorkspace.shared.open(authURL)
         }
@@ -609,6 +648,15 @@ private final class GoogleOAuthLoopbackReceiver: @unchecked Sendable {
             try await withCheckedThrowingContinuation { continuation in
                 lock.withLock {
                     readyContinuation = continuation
+                }
+                // Close the pre-registration race: if cancellation landed
+                // before the continuation was installed, onCancel had nothing
+                // to resume — don't depend on the already-cancelled listener
+                // still delivering a `.cancelled` state update.
+                guard !Task.isCancelled else {
+                    resumeReady(CancellationError())
+                    listener.cancel()
+                    return
                 }
                 listener.stateUpdateHandler = { [weak self] newState in
                     self?.handleListenerState(newState)

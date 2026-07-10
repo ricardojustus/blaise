@@ -232,6 +232,11 @@ struct AutomationTab: View {
                         .font(.callout)
                         .foregroundStyle(.orange)
                 }
+                if let error = google.settingsError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
                 if google.connected && google.enabled {
                     calendarPicker(
                         calendars: google.googleCalendars,

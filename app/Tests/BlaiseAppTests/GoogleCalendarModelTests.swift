@@ -53,4 +53,70 @@ struct GoogleCalendarModelTests {
         #expect(model.clientSecret.isEmpty)
         #expect(try secrets.get(key: GoogleCalendarModel.clientSecretKey) == nil)
     }
+
+    @Test("persistence failure is surfaced via settingsError, and success clears it")
+    func persistenceFailureSurfaces() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("blaise-gcal-tests-\(UUID().uuidString)")
+        let database = try BlaiseDatabase(rootURL: root)
+        let secrets = FlakySecretStore()
+        let model = GoogleCalendarModel(
+            settings: SettingsStore(database: database), secrets: secrets)
+
+        secrets.failWrites = true
+        model.clientSecret = "GOCSPX-will-fail"
+        await model.saveSettings()
+        #expect(model.settingsError != nil)
+
+        secrets.failWrites = false
+        await model.saveSettings()
+        #expect(model.settingsError == nil)
+        #expect(try secrets.get(key: GoogleCalendarModel.clientSecretKey) == "GOCSPX-will-fail")
+    }
+
+    @Test("a Keychain read failure at load never turns Save into secret deletion")
+    func readFailureDoesNotDeleteSecret() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("blaise-gcal-tests-\(UUID().uuidString)")
+        let database = try BlaiseDatabase(rootURL: root)
+        let secrets = FlakySecretStore()
+        try secrets.set(key: GoogleCalendarModel.clientSecretKey, value: "GOCSPX-precious")
+        let model = GoogleCalendarModel(
+            settings: SettingsStore(database: database), secrets: secrets)
+
+        secrets.failReads = true
+        await model.load()
+        #expect(model.clientSecret.isEmpty)
+
+        // Save with the (unreadable, hence blank) field must not delete the
+        // stored secret the read failed to retrieve.
+        secrets.failReads = false
+        await model.saveSettings()
+        #expect(try secrets.get(key: GoogleCalendarModel.clientSecretKey) == "GOCSPX-precious")
+    }
+}
+
+private struct FlakyError: Error {}
+
+/// Secret store whose reads/writes can be made to fail, for exercising the
+/// persistence-failure paths.
+private final class FlakySecretStore: SecretStore, @unchecked Sendable {
+    private let backing = InMemorySecretStore()
+    var failReads = false
+    var failWrites = false
+
+    func get(key: String) throws -> String? {
+        if failReads { throw FlakyError() }
+        return try backing.get(key: key)
+    }
+
+    func set(key: String, value: String) throws {
+        if failWrites { throw FlakyError() }
+        try backing.set(key: key, value: value)
+    }
+
+    func delete(key: String) throws {
+        if failWrites { throw FlakyError() }
+        try backing.delete(key: key)
+    }
 }
