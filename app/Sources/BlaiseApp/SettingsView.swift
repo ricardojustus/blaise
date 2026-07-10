@@ -160,8 +160,12 @@ struct AutomationTab: View {
                             google.setEnabled(value)
                             Task { await appEnv.calendarSourcesChanged() }
                         }))
+                // Credential edits are frozen while a sign-in is in flight: the
+                // refresh token must be persisted with the pair it was minted
+                // under, not values edited mid-flow.
                 TextField("OAuth desktop client ID", text: $google.clientID)
                     .textFieldStyle(.roundedBorder)
+                    .disabled(google.authorizing)
                     .onSubmit {
                         Task {
                             await google.saveSettings()
@@ -173,6 +177,7 @@ struct AutomationTab: View {
                 // alongside the client ID for most setups.
                 SecureField("OAuth client secret", text: $google.clientSecret)
                     .textFieldStyle(.roundedBorder)
+                    .disabled(google.authorizing)
                     .onSubmit {
                         Task {
                             await google.saveSettings()
@@ -186,6 +191,7 @@ struct AutomationTab: View {
                             await appEnv.calendarSourcesChanged()
                         }
                     }
+                    .disabled(google.authorizing)
                     Button(google.connected ? "Reconnect" : "Connect") {
                         Task {
                             await google.connect()
