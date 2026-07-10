@@ -32,7 +32,7 @@ private enum GoogleCalendarError: LocalizedError, Sendable {
         case .browserOpenFailed:
             return "Could not open the Google sign-in page."
         case .oauthCallbackTimedOut:
-            return "Google sign-in timed out."
+            return "Google sign-in timed out. If the browser showed an authorization error, check the OAuth client ID and secret."
         case .oauthCallbackFailed(let message):
             return message
         case .oauthStateMismatch:
@@ -49,10 +49,12 @@ private enum GoogleCalendarError: LocalizedError, Sendable {
 final class GoogleCalendarModel {
     static let settingsKey = "calendar.google.settings"
     static let refreshTokenKey = "calendar.google.refreshToken"
+    static let clientSecretKey = "calendar.google.clientSecret"
     static let hiddenKey = "calendar.google.hiddenCalendarIDs"
 
     var enabled = false
     var clientID = ""
+    var clientSecret = ""
     private(set) var connected = false
     private(set) var authorizing = false
     private(set) var refreshing = false
@@ -83,6 +85,7 @@ final class GoogleCalendarModel {
             ?? nil ?? .empty
         enabled = stored.enabled
         clientID = stored.clientID
+        clientSecret = ((try? secrets.get(key: Self.clientSecretKey)) ?? nil) ?? ""
         hiddenCalendarIDs = Set(
             (try? await settings.get(Self.hiddenKey, as: [String].self)) ?? nil ?? [])
         connected = ((try? secrets.get(key: Self.refreshTokenKey)) ?? nil) != nil
@@ -112,7 +115,8 @@ final class GoogleCalendarModel {
             return
         }
         if let fetched = try? await client.listCalendars(
-            clientID: normalized, refreshToken: refreshToken) {
+            clientID: normalized, clientSecret: normalizedClientSecret,
+            refreshToken: refreshToken) {
             googleCalendars = fetched
         }
     }
@@ -120,6 +124,14 @@ final class GoogleCalendarModel {
     func saveSettings() async {
         let normalized = normalizedClientID
         clientID = normalized
+        clientSecret = normalizedClientSecret
+        // The client secret is a credential — it lives in the Keychain next to
+        // the refresh token, never in the settings database.
+        if clientSecret.isEmpty {
+            try? secrets.delete(key: Self.clientSecretKey)
+        } else {
+            try? secrets.set(key: Self.clientSecretKey, value: clientSecret)
+        }
         try? await settings.set(
             Self.settingsKey,
             to: GoogleCalendarSettings(enabled: enabled, clientID: normalized))
@@ -130,24 +142,46 @@ final class GoogleCalendarModel {
         Task { await saveSettings() }
     }
 
+    private var connectTask: Task<String, any Error>?
+
     func connect() async {
         clientID = normalizedClientID
+        clientSecret = normalizedClientSecret
         guard !clientID.isEmpty else {
             lastError = GoogleCalendarError.missingClientID.localizedDescription
             return
         }
         authorizing = true
-        defer { authorizing = false }
+        defer {
+            authorizing = false
+            connectTask = nil
+        }
+        // Authorize in a child task the UI can cancel: Google renders
+        // pre-consent errors (bad client ID, access denied) in the browser and
+        // never hits the loopback redirect, so without Cancel the user would
+        // sit behind a disabled button until the callback timeout fires.
+        let task = Task { [client, clientID, clientSecret] in
+            try await client.authorize(clientID: clientID, clientSecret: clientSecret)
+        }
+        connectTask = task
         do {
-            let refreshToken = try await client.authorize(clientID: clientID)
+            let refreshToken = try await task.value
             try secrets.set(key: Self.refreshTokenKey, value: refreshToken)
             connected = true
             enabled = true
             lastError = nil
             await saveSettings()
+        } catch is CancellationError {
+            lastError = nil
         } catch {
             lastError = Self.describe(error)
         }
+    }
+
+    /// Abort an in-flight `connect()` (e.g. Google showed an error page in the
+    /// browser and the redirect will never come).
+    func cancelConnect() {
+        connectTask?.cancel()
     }
 
     func disconnect() async {
@@ -180,7 +214,8 @@ final class GoogleCalendarModel {
         defer { refreshing = false }
         do {
             let events = try await client.snapshots(
-                clientID: normalized, refreshToken: refreshToken,
+                clientID: normalized, clientSecret: normalizedClientSecret,
+                refreshToken: refreshToken,
                 hiddenCalendarIDs: hiddenCalendarIDs, from: start, to: end)
             connected = true
             lastError = nil
@@ -194,6 +229,10 @@ final class GoogleCalendarModel {
 
     private var normalizedClientID: String {
         clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var normalizedClientSecret: String {
+        clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func describe(_ error: any Error) -> String {
@@ -239,7 +278,7 @@ actor GoogleCalendarClient {
         clearAccessToken()
     }
 
-    func authorize(clientID: String) async throws -> String {
+    func authorize(clientID: String, clientSecret: String) async throws -> String {
         let state = try Self.randomURLSafe(byteCount: 24)
         let codeVerifier = try Self.randomURLSafe(byteCount: 48)
         let codeChallenge = Self.codeChallenge(for: codeVerifier)
@@ -267,13 +306,13 @@ actor GoogleCalendarClient {
         guard opened else { throw GoogleCalendarError.browserOpenFailed }
 
         let code = try await receiver.waitForCode(timeoutSeconds: 180)
-        let token = try await tokenRequest([
-            URLQueryItem(name: "client_id", value: clientID),
-            URLQueryItem(name: "code", value: code),
-            URLQueryItem(name: "code_verifier", value: codeVerifier),
-            URLQueryItem(name: "grant_type", value: "authorization_code"),
-            URLQueryItem(name: "redirect_uri", value: redirectURI),
-        ])
+        let token = try await tokenRequest(
+            Self.clientItems(clientID: clientID, clientSecret: clientSecret) + [
+                URLQueryItem(name: "code", value: code),
+                URLQueryItem(name: "code_verifier", value: codeVerifier),
+                URLQueryItem(name: "grant_type", value: "authorization_code"),
+                URLQueryItem(name: "redirect_uri", value: redirectURI),
+            ])
         guard let refreshToken = token.refreshToken, !refreshToken.isEmpty else {
             throw GoogleCalendarError.malformedResponse("missing refresh token")
         }
@@ -283,10 +322,12 @@ actor GoogleCalendarClient {
     }
 
     func snapshots(
-        clientID: String, refreshToken: String, hiddenCalendarIDs: Set<String>,
+        clientID: String, clientSecret: String, refreshToken: String,
+        hiddenCalendarIDs: Set<String>,
         from start: Date, to end: Date
     ) async throws -> [CalendarEventSnapshot] {
-        let accessToken = try await accessToken(clientID: clientID, refreshToken: refreshToken)
+        let accessToken = try await accessToken(
+            clientID: clientID, clientSecret: clientSecret, refreshToken: refreshToken)
         let calendars = try await calendarList(accessToken: accessToken)
         // F3: fetch only non-hidden calendars; the "primary" fallback fires only
         // when the list is empty AND nothing is hidden (see CalendarVisibility).
@@ -301,22 +342,40 @@ actor GoogleCalendarClient {
     }
 
     /// The user's Google calendars (id + name) for the Settings picker.
-    func listCalendars(clientID: String, refreshToken: String) async throws -> [CalendarChoice] {
-        let accessToken = try await accessToken(clientID: clientID, refreshToken: refreshToken)
+    func listCalendars(
+        clientID: String, clientSecret: String, refreshToken: String
+    ) async throws -> [CalendarChoice] {
+        let accessToken = try await accessToken(
+            clientID: clientID, clientSecret: clientSecret, refreshToken: refreshToken)
         return try await calendarList(accessToken: accessToken).map {
             CalendarChoice(id: $0.id, name: $0.summary?.nilIfEmpty ?? $0.id)
         }
     }
 
-    private func accessToken(clientID: String, refreshToken: String) async throws -> String {
+    /// Google's token endpoint requires `client_secret` for "Desktop app" OAuth
+    /// clients even with PKCE ("invalid_request: client_secret is missing" —
+    /// the installed-app secret is required but, per Google's docs, not treated
+    /// as confidential). Omitted only when the user left the field empty, for
+    /// client types that genuinely have no secret.
+    private static func clientItems(clientID: String, clientSecret: String) -> [URLQueryItem] {
+        var items = [URLQueryItem(name: "client_id", value: clientID)]
+        if !clientSecret.isEmpty {
+            items.append(URLQueryItem(name: "client_secret", value: clientSecret))
+        }
+        return items
+    }
+
+    private func accessToken(
+        clientID: String, clientSecret: String, refreshToken: String
+    ) async throws -> String {
         if let cachedAccessToken, let accessTokenExpiresAt, accessTokenExpiresAt > Date() {
             return cachedAccessToken
         }
-        let token = try await tokenRequest([
-            URLQueryItem(name: "client_id", value: clientID),
-            URLQueryItem(name: "refresh_token", value: refreshToken),
-            URLQueryItem(name: "grant_type", value: "refresh_token"),
-        ])
+        let token = try await tokenRequest(
+            Self.clientItems(clientID: clientID, clientSecret: clientSecret) + [
+                URLQueryItem(name: "refresh_token", value: refreshToken),
+                URLQueryItem(name: "grant_type", value: "refresh_token"),
+            ])
         cachedAccessToken = token.accessToken
         accessTokenExpiresAt = Date().addingTimeInterval(TimeInterval(max(0, token.expiresIn - 60)))
         return token.accessToken
@@ -527,18 +586,25 @@ private final class GoogleOAuthLoopbackReceiver: @unchecked Sendable {
     }
 
     private func waitForCodeOnly() async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            let pending: Result<String, any Error>? = lock.withLock {
-                if let pendingResult {
-                    self.pendingResult = nil
-                    return pendingResult
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let pending: Result<String, any Error>? = lock.withLock {
+                    if let pendingResult {
+                        self.pendingResult = nil
+                        return pendingResult
+                    }
+                    codeContinuation = continuation
+                    return nil
                 }
-                codeContinuation = continuation
-                return nil
+                if let pending {
+                    continuation.resume(with: pending)
+                }
             }
-            if let pending {
-                continuation.resume(with: pending)
-            }
+        } onCancel: {
+            // The checked continuation above is not cancellation-aware; without
+            // this, a cancelled connect would stay parked (listener still bound)
+            // until the callback timeout fired.
+            complete(.failure(CancellationError()))
         }
     }
 

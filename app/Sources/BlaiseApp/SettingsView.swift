@@ -168,6 +168,17 @@ struct AutomationTab: View {
                             await appEnv.calendarSourcesChanged()
                         }
                     }
+                // Google's token endpoint rejects Desktop-app grants without the
+                // client secret ("client_secret is missing"), so it's required
+                // alongside the client ID for most setups.
+                SecureField("OAuth client secret", text: $google.clientSecret)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        Task {
+                            await google.saveSettings()
+                            await appEnv.calendarSourcesChanged()
+                        }
+                    }
                 HStack {
                     Button("Save") {
                         Task {
@@ -183,6 +194,11 @@ struct AutomationTab: View {
                         }
                     }
                     .disabled(google.authorizing)
+                    if google.authorizing {
+                        Button("Cancel") {
+                            google.cancelConnect()
+                        }
+                    }
                     if google.connected {
                         Button("Disconnect") {
                             Task {
@@ -195,6 +211,11 @@ struct AutomationTab: View {
                         ProgressView()
                             .controlSize(.small)
                     }
+                }
+                if google.authorizing {
+                    Text("Waiting for Google sign-in in your browser…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
                 if google.connected {
                     Label("Connected", systemImage: "checkmark.circle")
