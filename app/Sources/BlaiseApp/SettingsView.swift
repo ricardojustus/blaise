@@ -160,8 +160,24 @@ struct AutomationTab: View {
                             google.setEnabled(value)
                             Task { await appEnv.calendarSourcesChanged() }
                         }))
+                // Credential edits are frozen while a sign-in is in flight: the
+                // refresh token must be persisted with the pair it was minted
+                // under, not values edited mid-flow.
                 TextField("OAuth desktop client ID", text: $google.clientID)
                     .textFieldStyle(.roundedBorder)
+                    .disabled(google.authorizing)
+                    .onSubmit {
+                        Task {
+                            await google.saveSettings()
+                            await appEnv.calendarSourcesChanged()
+                        }
+                    }
+                // Google's token endpoint rejects Desktop-app grants without the
+                // client secret ("client_secret is missing"), so it's required
+                // alongside the client ID for most setups.
+                SecureField("OAuth client secret", text: $google.clientSecret)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(google.authorizing)
                     .onSubmit {
                         Task {
                             await google.saveSettings()
@@ -175,6 +191,7 @@ struct AutomationTab: View {
                             await appEnv.calendarSourcesChanged()
                         }
                     }
+                    .disabled(google.authorizing)
                     Button(google.connected ? "Reconnect" : "Connect") {
                         Task {
                             await google.connect()
@@ -183,6 +200,11 @@ struct AutomationTab: View {
                         }
                     }
                     .disabled(google.authorizing)
+                    if google.authorizing {
+                        Button("Cancel") {
+                            google.cancelConnect()
+                        }
+                    }
                     if google.connected {
                         Button("Disconnect") {
                             Task {
@@ -196,11 +218,21 @@ struct AutomationTab: View {
                             .controlSize(.small)
                     }
                 }
+                if google.authorizing {
+                    Text("Waiting for Google sign-in in your browser…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 if google.connected {
                     Label("Connected", systemImage: "checkmark.circle")
                         .foregroundStyle(Theme.accent)
                 }
                 if let error = google.lastError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+                if let error = google.settingsError {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .font(.callout)
                         .foregroundStyle(.orange)

@@ -32,7 +32,7 @@ private enum GoogleCalendarError: LocalizedError, Sendable {
         case .browserOpenFailed:
             return "Could not open the Google sign-in page."
         case .oauthCallbackTimedOut:
-            return "Google sign-in timed out."
+            return "Google sign-in timed out. If the browser showed an authorization error, check the OAuth client ID and secret."
         case .oauthCallbackFailed(let message):
             return message
         case .oauthStateMismatch:
@@ -49,14 +49,19 @@ private enum GoogleCalendarError: LocalizedError, Sendable {
 final class GoogleCalendarModel {
     static let settingsKey = "calendar.google.settings"
     static let refreshTokenKey = "calendar.google.refreshToken"
+    static let clientSecretKey = "calendar.google.clientSecret"
     static let hiddenKey = "calendar.google.hiddenCalendarIDs"
 
     var enabled = false
     var clientID = ""
+    var clientSecret = ""
     private(set) var connected = false
     private(set) var authorizing = false
     private(set) var refreshing = false
     private(set) var lastError: String?
+    /// Persistence (Keychain / settings-DB) failures, kept separate from
+    /// `lastError` so a later successful calendar refresh can't wipe them.
+    private(set) var settingsError: String?
     private(set) var lastRefresh: Date?
     /// Google calendar IDs the user has hidden (empty = all shown).
     private(set) var hiddenCalendarIDs: Set<String> = []
@@ -83,6 +88,16 @@ final class GoogleCalendarModel {
             ?? nil ?? .empty
         enabled = stored.enabled
         clientID = stored.clientID
+        do {
+            clientSecret = try secrets.get(key: Self.clientSecretKey) ?? ""
+            secretLoadFailed = false
+        } catch {
+            // A Keychain read *error* is not "no secret": remember the failure
+            // so a later Save can't turn a transient glitch into deletion of
+            // the stored secret.
+            secretLoadFailed = true
+        }
+        persistedCredentials = (clientID, clientSecret)
         hiddenCalendarIDs = Set(
             (try? await settings.get(Self.hiddenKey, as: [String].self)) ?? nil ?? [])
         connected = ((try? secrets.get(key: Self.refreshTokenKey)) ?? nil) != nil
@@ -111,18 +126,76 @@ final class GoogleCalendarModel {
             googleCalendars = []
             return
         }
-        if let fetched = try? await client.listCalendars(
-            clientID: normalized, refreshToken: refreshToken) {
-            googleCalendars = fetched
+        do {
+            googleCalendars = try await client.listCalendars(
+                clientID: normalized, clientSecret: normalizedClientSecret,
+                refreshToken: refreshToken)
+            lastError = nil
+        } catch {
+            // Keep the last list, but surface the failure — e.g. a legacy
+            // Desktop-client setup whose token grants now need the missing
+            // client secret would otherwise sit silently behind a green
+            // "Connected" badge.
+            lastError = Self.describe(error)
         }
     }
 
+    /// Last credential pair confirmed written to storage — used to invalidate
+    /// the cached access token when the user swaps credentials. Updated only
+    /// after the writes succeed.
+    private var persistedCredentials: (id: String, secret: String) = ("", "")
+    /// Serializes persistence (same pattern as `hiddenPersistTask`) so
+    /// overlapping saves can't interleave their Keychain and settings-DB
+    /// writes into a mixed credential pair.
+    private var savePersistTask: Task<(any Error)?, Never>?
+    /// True while the Keychain read for the secret has failed — an empty field
+    /// then must not be treated as the user clearing the secret.
+    private var secretLoadFailed = false
+
     func saveSettings() async {
-        let normalized = normalizedClientID
-        clientID = normalized
-        try? await settings.set(
-            Self.settingsKey,
-            to: GoogleCalendarSettings(enabled: enabled, clientID: normalized))
+        // Snapshot everything before the first suspension point; the fields
+        // may change while a previous save is still in flight.
+        let id = normalizedClientID
+        let secret = normalizedClientSecret
+        clientID = id
+        clientSecret = secret
+        let snapshot = GoogleCalendarSettings(enabled: enabled, clientID: id)
+        let skipSecretDelete = secret.isEmpty && secretLoadFailed
+        let credentialsChanged = persistedCredentials != (id, secret)
+        let previous = savePersistTask
+        let task = Task { [settings, secrets, client] () -> (any Error)? in
+            _ = await previous?.value
+            do {
+                // The client secret is a credential — it lives in the Keychain
+                // next to the refresh token, never in the settings database.
+                if secret.isEmpty {
+                    if !skipSecretDelete {
+                        try secrets.delete(key: Self.clientSecretKey)
+                    }
+                } else {
+                    try secrets.set(key: Self.clientSecretKey, value: secret)
+                }
+                try await settings.set(Self.settingsKey, to: snapshot)
+            } catch {
+                return error
+            }
+            if credentialsChanged {
+                // New credentials must not keep serving a token minted under
+                // the old ones — that hides a bad ID/secret until expiry.
+                await client.clearAccessToken()
+            }
+            return nil
+        }
+        savePersistTask = task
+        if let error = await task.value {
+            // Persistence failures must be visible: a silently missing secret
+            // resurfaces later as an inexplicable refresh failure.
+            settingsError = Self.describe(error)
+        } else {
+            settingsError = nil
+            persistedCredentials = (id, secret)
+            if !secret.isEmpty { secretLoadFailed = false }
+        }
     }
 
     func setEnabled(_ value: Bool) {
@@ -130,27 +203,88 @@ final class GoogleCalendarModel {
         Task { await saveSettings() }
     }
 
+    private var connectTask: Task<String, any Error>?
+
     func connect() async {
+        // Re-entry guard: the UI disables Connect while authorizing, but an
+        // overlapping call would clobber connectTask and let two flows race
+        // over the refresh token and connection state.
+        guard !authorizing else { return }
         clientID = normalizedClientID
+        clientSecret = normalizedClientSecret
         guard !clientID.isEmpty else {
             lastError = GoogleCalendarError.missingClientID.localizedDescription
             return
         }
         authorizing = true
-        defer { authorizing = false }
+        defer {
+            authorizing = false
+            connectTask = nil
+        }
+        // Authorize in an unstructured task so the Cancel button can abort it:
+        // Google renders pre-consent errors (bad client ID, access denied) in
+        // the browser and never hits the loopback redirect, so without Cancel
+        // the user would sit behind a disabled button until the callback
+        // timeout fires. Credentials are snapshotted here — the token must be
+        // persisted with the pair it was minted under, not whatever the fields
+        // hold when the browser flow finishes.
+        let id = clientID
+        let secret = clientSecret
+        let epoch = connectEpoch
+        let task = Task { [client] in
+            try await client.authorize(clientID: id, clientSecret: secret)
+        }
+        connectTask = task
         do {
-            let refreshToken = try await client.authorize(clientID: clientID)
+            // Forward ambient cancellation into the unstructured task, which
+            // `await task.value` alone would not do.
+            let refreshToken = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            guard epoch == connectEpoch else {
+                // Cancel/disconnect landed after authorization had already
+                // succeeded, so cancelling the task was a no-op — the result
+                // no longer applies. Revoke the fresh grant rather than leave
+                // it dangling at Google.
+                await client.revoke(refreshToken: refreshToken)
+                return
+            }
             try secrets.set(key: Self.refreshTokenKey, value: refreshToken)
             connected = true
             enabled = true
             lastError = nil
+            clientID = id
+            clientSecret = secret
+            // saveSettings' change-detection will clear the access token that
+            // authorize() just cached — one redundant refresh-grant later, in
+            // exchange for never marking credentials persisted before their
+            // writes actually succeed.
             await saveSettings()
+        } catch is CancellationError {
+            lastError = nil
         } catch {
             lastError = Self.describe(error)
         }
     }
 
+    /// Bumped by `cancelConnect()` so an authorization that already succeeded
+    /// when the cancel/disconnect landed cannot apply its result afterwards
+    /// (task cancellation alone is a no-op on a completed task).
+    private var connectEpoch = 0
+
+    /// Abort an in-flight `connect()` (e.g. Google showed an error page in the
+    /// browser and the redirect will never come).
+    func cancelConnect() {
+        connectEpoch += 1
+        connectTask?.cancel()
+    }
+
     func disconnect() async {
+        // Abort any in-flight (re)connect first — a late authorization success
+        // must not write a fresh token and silently undo the disconnect.
+        cancelConnect()
         // Best-effort revoke at Google BEFORE forgetting the token locally, so a
         // disconnect tears down the grant itself — not just our copy of it.
         if let refreshToken = (try? secrets.get(key: Self.refreshTokenKey)) ?? nil {
@@ -180,7 +314,8 @@ final class GoogleCalendarModel {
         defer { refreshing = false }
         do {
             let events = try await client.snapshots(
-                clientID: normalized, refreshToken: refreshToken,
+                clientID: normalized, clientSecret: normalizedClientSecret,
+                refreshToken: refreshToken,
                 hiddenCalendarIDs: hiddenCalendarIDs, from: start, to: end)
             connected = true
             lastError = nil
@@ -194,6 +329,10 @@ final class GoogleCalendarModel {
 
     private var normalizedClientID: String {
         clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var normalizedClientSecret: String {
+        clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func describe(_ error: any Error) -> String {
@@ -239,7 +378,7 @@ actor GoogleCalendarClient {
         clearAccessToken()
     }
 
-    func authorize(clientID: String) async throws -> String {
+    func authorize(clientID: String, clientSecret: String) async throws -> String {
         let state = try Self.randomURLSafe(byteCount: 24)
         let codeVerifier = try Self.randomURLSafe(byteCount: 48)
         let codeChallenge = Self.codeChallenge(for: codeVerifier)
@@ -261,19 +400,22 @@ actor GoogleCalendarClient {
         guard let authURL = components.url else {
             throw GoogleCalendarError.malformedResponse("could not build authorization URL")
         }
+        // A cancel that raced the listener becoming ready must not still open
+        // the browser.
+        try Task.checkCancellation()
         let opened = await MainActor.run {
             NSWorkspace.shared.open(authURL)
         }
         guard opened else { throw GoogleCalendarError.browserOpenFailed }
 
         let code = try await receiver.waitForCode(timeoutSeconds: 180)
-        let token = try await tokenRequest([
-            URLQueryItem(name: "client_id", value: clientID),
-            URLQueryItem(name: "code", value: code),
-            URLQueryItem(name: "code_verifier", value: codeVerifier),
-            URLQueryItem(name: "grant_type", value: "authorization_code"),
-            URLQueryItem(name: "redirect_uri", value: redirectURI),
-        ])
+        let token = try await tokenRequest(
+            Self.clientItems(clientID: clientID, clientSecret: clientSecret) + [
+                URLQueryItem(name: "code", value: code),
+                URLQueryItem(name: "code_verifier", value: codeVerifier),
+                URLQueryItem(name: "grant_type", value: "authorization_code"),
+                URLQueryItem(name: "redirect_uri", value: redirectURI),
+            ])
         guard let refreshToken = token.refreshToken, !refreshToken.isEmpty else {
             throw GoogleCalendarError.malformedResponse("missing refresh token")
         }
@@ -283,10 +425,12 @@ actor GoogleCalendarClient {
     }
 
     func snapshots(
-        clientID: String, refreshToken: String, hiddenCalendarIDs: Set<String>,
+        clientID: String, clientSecret: String, refreshToken: String,
+        hiddenCalendarIDs: Set<String>,
         from start: Date, to end: Date
     ) async throws -> [CalendarEventSnapshot] {
-        let accessToken = try await accessToken(clientID: clientID, refreshToken: refreshToken)
+        let accessToken = try await accessToken(
+            clientID: clientID, clientSecret: clientSecret, refreshToken: refreshToken)
         let calendars = try await calendarList(accessToken: accessToken)
         // F3: fetch only non-hidden calendars; the "primary" fallback fires only
         // when the list is empty AND nothing is hidden (see CalendarVisibility).
@@ -301,22 +445,40 @@ actor GoogleCalendarClient {
     }
 
     /// The user's Google calendars (id + name) for the Settings picker.
-    func listCalendars(clientID: String, refreshToken: String) async throws -> [CalendarChoice] {
-        let accessToken = try await accessToken(clientID: clientID, refreshToken: refreshToken)
+    func listCalendars(
+        clientID: String, clientSecret: String, refreshToken: String
+    ) async throws -> [CalendarChoice] {
+        let accessToken = try await accessToken(
+            clientID: clientID, clientSecret: clientSecret, refreshToken: refreshToken)
         return try await calendarList(accessToken: accessToken).map {
             CalendarChoice(id: $0.id, name: $0.summary?.nilIfEmpty ?? $0.id)
         }
     }
 
-    private func accessToken(clientID: String, refreshToken: String) async throws -> String {
+    /// Google's token endpoint requires `client_secret` for "Desktop app" OAuth
+    /// clients even with PKCE ("invalid_request: client_secret is missing" —
+    /// the installed-app secret is required but, per Google's docs, not treated
+    /// as confidential). Omitted only when the user left the field empty, for
+    /// client types that genuinely have no secret.
+    private static func clientItems(clientID: String, clientSecret: String) -> [URLQueryItem] {
+        var items = [URLQueryItem(name: "client_id", value: clientID)]
+        if !clientSecret.isEmpty {
+            items.append(URLQueryItem(name: "client_secret", value: clientSecret))
+        }
+        return items
+    }
+
+    private func accessToken(
+        clientID: String, clientSecret: String, refreshToken: String
+    ) async throws -> String {
         if let cachedAccessToken, let accessTokenExpiresAt, accessTokenExpiresAt > Date() {
             return cachedAccessToken
         }
-        let token = try await tokenRequest([
-            URLQueryItem(name: "client_id", value: clientID),
-            URLQueryItem(name: "refresh_token", value: refreshToken),
-            URLQueryItem(name: "grant_type", value: "refresh_token"),
-        ])
+        let token = try await tokenRequest(
+            Self.clientItems(clientID: clientID, clientSecret: clientSecret) + [
+                URLQueryItem(name: "refresh_token", value: refreshToken),
+                URLQueryItem(name: "grant_type", value: "refresh_token"),
+            ])
         cachedAccessToken = token.accessToken
         accessTokenExpiresAt = Date().addingTimeInterval(TimeInterval(max(0, token.expiresIn - 60)))
         return token.accessToken
@@ -497,17 +659,33 @@ private final class GoogleOAuthLoopbackReceiver: @unchecked Sendable {
     }
 
     func start() async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            lock.withLock {
-                readyContinuation = continuation
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.withLock {
+                    readyContinuation = continuation
+                }
+                // Close the pre-registration race: if cancellation landed
+                // before the continuation was installed, onCancel had nothing
+                // to resume — don't depend on the already-cancelled listener
+                // still delivering a `.cancelled` state update.
+                guard !Task.isCancelled else {
+                    resumeReady(CancellationError())
+                    listener.cancel()
+                    return
+                }
+                listener.stateUpdateHandler = { [weak self] newState in
+                    self?.handleListenerState(newState)
+                }
+                listener.newConnectionHandler = { [weak self] connection in
+                    self?.handle(connection)
+                }
+                listener.start(queue: queue)
             }
-            listener.stateUpdateHandler = { [weak self] newState in
-                self?.handleListenerState(newState)
-            }
-            listener.newConnectionHandler = { [weak self] connection in
-                self?.handle(connection)
-            }
-            listener.start(queue: queue)
+        } onCancel: {
+            // A cancel that lands before the listener is ready must not leave
+            // start() parked (and must not let the browser open afterwards).
+            resumeReady(CancellationError())
+            listener.cancel()
         }
     }
 
@@ -527,18 +705,25 @@ private final class GoogleOAuthLoopbackReceiver: @unchecked Sendable {
     }
 
     private func waitForCodeOnly() async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            let pending: Result<String, any Error>? = lock.withLock {
-                if let pendingResult {
-                    self.pendingResult = nil
-                    return pendingResult
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let pending: Result<String, any Error>? = lock.withLock {
+                    if let pendingResult {
+                        self.pendingResult = nil
+                        return pendingResult
+                    }
+                    codeContinuation = continuation
+                    return nil
                 }
-                codeContinuation = continuation
-                return nil
+                if let pending {
+                    continuation.resume(with: pending)
+                }
             }
-            if let pending {
-                continuation.resume(with: pending)
-            }
+        } onCancel: {
+            // The checked continuation above is not cancellation-aware; without
+            // this, a cancelled connect would stay parked (listener still bound)
+            // until the callback timeout fired.
+            complete(.failure(CancellationError()))
         }
     }
 
@@ -551,7 +736,12 @@ private final class GoogleOAuthLoopbackReceiver: @unchecked Sendable {
             resumeReady(error)
             complete(.failure(error))
         case .cancelled:
-            complete(.failure(GoogleCalendarError.oauthCallbackTimedOut))
+            // External cancellation can kill the listener before `.ready`
+            // (start()'s onCancel may have run before the continuation was
+            // registered) — resume both waits so neither parks forever. After
+            // a normal completion both are already nil and this is a no-op.
+            resumeReady(CancellationError())
+            complete(.failure(CancellationError()))
         default:
             break
         }
