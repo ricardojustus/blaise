@@ -38,6 +38,9 @@ actor MeetEventsListener {
             logger.notice(
                 "meet-events listener disabled: BLAISE_DATA_ROOT override active (set BLAISE_MEET_LISTENER=1 to opt in)"
             )
+            Task { @MainActor [status] in
+                status.state = .disabledForIsolatedData
+            }
             return
         }
         bind()
@@ -75,7 +78,7 @@ actor MeetEventsListener {
         switch state {
         case .ready:
             logger.info("meet-events listener bound on 127.0.0.1:\(Self.port)")
-            await MainActor.run { status.banner = nil }
+            await MainActor.run { status.state = .listening }
         case .failed(let error):
             handleBindFailure("\(error)")
         default:
@@ -87,8 +90,8 @@ actor MeetEventsListener {
         logger.error("meet-events port \(Self.port) unavailable: \(detail, privacy: .public) — retrying in 60 s")
         let status = status
         Task { @MainActor in
-            status.banner =
-                "Another process is using port \(Self.port); Meet extension events are buffering. Retrying every 60 s."
+            status.state = .unavailable(
+                "Another process is using port \(Self.port); Meet extension events are buffering. Retrying every 60 s.")
         }
         listener?.cancel()
         listener = nil
@@ -110,7 +113,9 @@ actor MeetEventsListener {
             try? await send(connection, status: 404, headers: [:])
             return
         }
+        await MainActor.run { status.noteRequest() }
         let response = await ingestor.handle(body: request.body)
+        await MainActor.run { status.noteResponse(status: response.status) }
         var headers: [String: String] = [:]
         if let ack = response.ackHeaderValue {
             headers[MeetEventsCrypto.ackHeader] = ack

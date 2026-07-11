@@ -228,17 +228,20 @@ struct ProcessingQueueCommands: Commands {
 struct MainWindow: View {
     @Environment(AppEnvironment.self) private var appEnv
     @Environment(AppUIState.self) private var uiState
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         @Bindable var uiState = uiState
         LibraryView()
             .frame(minWidth: 1100, minHeight: 640)
-            // Capture this window so the AppKit StatusBarController can raise the
-            // EXACT main window for "Open Blaise" / notification routing (the
-            // popover can't use SwiftUI's openWindow). Fully-closed-window reopen
-            // remains the accepted v1 limitation.
+            // Capture this window so the AppKit StatusBarController can raise
+            // the exact live window. Also retain the WindowGroup action below,
+            // which can create a fresh one after a full close.
             .background(WindowAccessor { appEnv.mainWindow = $0 })
+            .onAppear {
+                appEnv.reopenMainWindow = { openWindow(id: "main") }
+            }
             .task {
                 // Screenshot scaffolding (active only under --seed-demo).
                 if CommandLine.arguments.contains("--seed-demo") {

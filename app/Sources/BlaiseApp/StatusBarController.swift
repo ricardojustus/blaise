@@ -41,6 +41,7 @@ final class StatusBarController: NSObject {
 
         if let button = statusItem.button {
             button.imagePosition = .imageLeading
+            button.imageScaling = .scaleProportionallyDown
             button.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .regular)
             button.target = self
             button.action = #selector(togglePopover(_:))
@@ -49,6 +50,19 @@ final class StatusBarController: NSObject {
         render()
         observe()
         observeWindowRequests()
+
+        // Visual-smoke seam only: a native status item is not addressable by
+        // the app window's accessibility tree while its popover is closed.
+        // Auto-open the isolated --seed-demo scene; normal launches never run
+        // this branch.
+        if CommandLine.arguments.contains("--seed-demo"),
+            ProcessInfo.processInfo.environment["BLAISE_DEMO_SCENE"] == "automationmenu"
+        {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(1))
+                self?.showPopover()
+            }
+        }
     }
 
     // No deinit: the controller is retained for the app's lifetime, the
@@ -65,11 +79,15 @@ final class StatusBarController: NSObject {
         guard let button = statusItem.button else { return }
         let state = environment.captureStatus.state
         let warning = environment.handoffStatus.snapshot.warning != nil
-        button.image = Self.glyph(for: state, handoffWarning: warning)
+        let detected = environment.captureStatus.detectedMeeting
+        button.image = Self.glyph(
+            for: state, handoffWarning: warning, meetingDetected: detected != nil)
 
         switch RecordingTimerModel.display(for: state, now: Date()) {
         case .glyph:
-            if case .idle = state, !warning,
+            if detected != nil, Self.canPromoteMeetingDetection(in: state) {
+                button.title = " Meet detected"
+            } else if case .idle = state, !warning,
                 let upcoming = Self.upcomingTitle(environment.calendarSuggestions.upcomingRows)
             {
                 button.title = " \(upcoming)"
@@ -79,7 +97,13 @@ final class StatusBarController: NSObject {
         case .recording(let formatted), .paused(let formatted):
             button.title = " \(formatted)"
         }
-        button.toolTip = Self.upcomingTooltip(environment.calendarSuggestions.upcomingRows)
+        if let detected, Self.canPromoteMeetingDetection(in: state) {
+            button.toolTip = "Meeting detected: \(detected.title ?? detected.code). Click to record."
+        } else if environment.listenerStatus.isUnavailable {
+            button.toolTip = "Blaise Meet listener unavailable — extension events are buffering."
+        } else {
+            button.toolTip = Self.upcomingTooltip(environment.calendarSuggestions.upcomingRows)
+        }
 
         // Tick only while the elapsed readout actually advances.
         switch state {
@@ -114,8 +138,10 @@ final class StatusBarController: NSObject {
     private func observe() {
         withObservationTracking {
             _ = environment.captureStatus.state
+            _ = environment.captureStatus.detectedMeeting
             _ = environment.handoffStatus.snapshot.warning
             _ = environment.calendarSuggestions.upcomingRows
+            _ = environment.listenerStatus.state
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -147,23 +173,32 @@ final class StatusBarController: NSObject {
         // heuristic NSApp.windows match (which could front Settings or another
         // window), and never the popover's own window (touching its view here
         // would also force the popover's SwiftUI tree to load offscreen). If the
-        // main window was fully closed (WindowGroup torn down) the weak ref is
-        // nil and we no-op — the accepted v1 limitation.
-        environment.mainWindow?.makeKeyAndOrderFront(nil)
+        // main window was fully closed (WindowGroup torn down), use the
+        // WindowGroup action captured by MainWindow to create a fresh instance.
+        if let mainWindow = environment.mainWindow {
+            mainWindow.makeKeyAndOrderFront(nil)
+        } else {
+            environment.reopenMainWindow?()
+        }
         closeMenu()
     }
 
     // MARK: - Popover
 
     @objc private func togglePopover(_ sender: Any?) {
-        guard let button = statusItem.button else { return }
+        guard statusItem.button != nil else { return }
         if popover.isShown {
             popover.performClose(sender)
         } else {
-            NSApp.activate(ignoringOtherApps: true)
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+            showPopover()
         }
+    }
+
+    private func showPopover() {
+        guard let button = statusItem.button else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
     }
 
     /// Dismiss the popover (called after a menu action that navigates away).
@@ -180,7 +215,12 @@ final class StatusBarController: NSObject {
     /// would hide a lost-recording state. This matches the pre-AppKit label's
     /// precedence and deliberately does NOT use `RecordingTimerModel.isQuietState`,
     /// which classifies `.alarm`/`.paused` differently than this glyph needs.
-    static func symbolName(for state: IndicatorState, handoffWarning: Bool) -> String {
+    static func symbolName(
+        for state: IndicatorState, handoffWarning: Bool, meetingDetected: Bool = false
+    ) -> String {
+        if meetingDetected, canPromoteMeetingDetection(in: state) {
+            return "video.circle.fill"
+        }
         let handoffBadgeAllowed: Bool
         switch state {
         case .idle, .processing, .grace, .paused: handoffBadgeAllowed = true
@@ -198,24 +238,21 @@ final class StatusBarController: NSObject {
         }
     }
 
-    static func glyph(for state: IndicatorState, handoffWarning: Bool = false) -> NSImage? {
-        let name = symbolName(for: state, handoffWarning: handoffWarning)
-        // Tint the load-bearing states so "am I recording / did it fail?" reads
-        // at a glance; everything else is a template glyph (adapts to light/dark).
-        let color: NSColor?
-        switch name {
-        case "record.circle": color = .systemRed
-        case "exclamationmark.circle", "exclamationmark.triangle", "exclamationmark.triangle.fill":
-            color = .systemOrange
-        case "pause.circle.fill": color = .controlAccentColor
-        default: color = nil
+    static func glyph(
+        for state: IndicatorState, handoffWarning: Bool = false,
+        meetingDetected: Bool = false
+    ) -> NSImage? {
+        BlaiseStatusIcon.image(
+            for: BlaiseStatusIcon.visualState(
+                for: state, handoffWarning: handoffWarning,
+                meetingDetected: meetingDetected))
+    }
+
+    static func canPromoteMeetingDetection(in state: IndicatorState) -> Bool {
+        switch state {
+        case .idle, .processing: true
+        case .recording, .warning, .alarm, .grace, .paused: false
         }
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: "Blaise status")
-        if let color {
-            return image?.withSymbolConfiguration(.init(paletteColors: [color]))
-        }
-        image?.isTemplate = true
-        return image
     }
 
     static func upcomingTitle(_ rows: [UpcomingMeetingRow], now: Date = Date()) -> String? {

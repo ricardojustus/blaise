@@ -2,6 +2,51 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [1.4.0] — 10/07/2026
+
+A polish and reliability release: live recording feedback, clearer menu-bar state,
+search highlighting, faster meeting notifications, and a community fix for the
+Google Calendar connection.
+
+### Added
+- **OAuth client secret field** for Google Calendar. Google's token endpoint requires
+  `client_secret` for "Desktop app" OAuth clients even with PKCE, so token exchange
+  always failed without it. The secret is stored in the Keychain (never the settings
+  database) and sent only on token grants. Thanks to **@arthursoares** (#2, #3).
+- **Cancellable Google sign-in.** A Cancel button and a "Waiting for Google sign-in…"
+  status while authorizing; pre-consent errors in the browser no longer leave
+  Settings stuck behind a disabled button.
+- **Menu-bar status states.** Distinct icons for ready, meeting detected, recording,
+  paused, processing, and warning, with a rebuilt menu-bar layout and recording
+  controls.
+- **Search-term highlighting.** Matching query terms are highlighted throughout
+  notes, action items, decisions, and transcript text, with punctuation- and
+  diacritic-normalized matching.
+
+### Changed
+- **Live recording visualization.** The mic and system level meters now reflect live
+  audio instead of sitting low.
+- **Faster meeting notifications.** Meet start/end events are evaluated on arrival
+  instead of waiting for a later sweep; meeting detection is visible in the menu and
+  sidebar even when notification delivery fails.
+- **Reason-aware meeting-end handling.** Explicitly leaving a call stops the
+  recording after a visible 5-second countdown; a tab close or reload keeps the
+  25-second reconnect cushion. Reconnecting cancels the pending stop.
+- **Visual pass.** Transparent native window chrome, refined design tokens and
+  cards, responsive toolbar behavior, and transient overlay scroll indicators.
+- **Notification actions.** Rebuilt categories and actions (Record, Launch & Record,
+  Resume, Open Blaise) with observable delivery diagnostics.
+- **Chrome extension.** Meet start/end signal lifecycle, selectors, and event
+  batching hardened.
+- Build numbers are now monotonic (derived from the commit count) instead of
+  hardcoded.
+
+### Fixed
+- Google Calendar token exchange for Desktop-app OAuth clients (see Added).
+- Calendar connection errors are surfaced in Settings instead of hiding behind a
+  green "Connected" badge, and credential persistence failures are reported.
+- First day-group header spacing under the transparent chrome.
+
 ## [1.3.0] — 2026-07-09
 
 The first feature release since the initial public 1.2. Focus: notes and digest
@@ -39,5 +84,6 @@ synthesis option.
 - Stuck "Processing" indicator in some states.
 - Escaping and formatting edge cases in account-engine notes output.
 
+[1.4.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.4.0
 [1.3.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.3.0
 [1.2.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.2.0

@@ -295,6 +295,93 @@ describe("cold-start concurrency (H-1)", () => {
     expect(await m.bufferedEventCount()).toBe(2);
     expect(storage._store.get(E.STORAGE_KEY).pending).toHaveLength(2);
   });
+
+  it("serializes storage writes so a delayed older snapshot cannot erase a newer batch", async () => {
+    let releaseFirst;
+    let setCalls = 0;
+    let persisted;
+    const storage = {
+      async get() { return undefined; }, // no secret: persist, then remain buffered
+      async set(obj) {
+        const snapshot = JSON.parse(JSON.stringify(obj[E.STORAGE_KEY]));
+        setCalls += 1;
+        if (setCalls === 1) {
+          await new Promise((resolve) => {
+            releaseFirst = () => {
+              persisted = snapshot;
+              resolve();
+            };
+          });
+          return;
+        }
+        persisted = snapshot;
+      },
+    };
+    const m = makeManager({ fetchFn: async () => { throw new TypeError("unused"); }, storage });
+
+    const first = m.enqueue(batchOf(event(1)));
+    while (setCalls < 1) await new Promise((resolve) => setTimeout(resolve, 1));
+    const second = m.enqueue(batchOf(event(2)));
+
+    // The second snapshot is queued behind the held first write, not racing it.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(setCalls).toBe(1);
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(setCalls).toBe(2);
+    expect(persisted.pending).toHaveLength(2);
+    expect(await m.bufferedEventCount()).toBe(2);
+  });
+});
+
+describe("runtime message lifetime", () => {
+  it("keeps the channel open and acknowledges only after enqueue settles", async () => {
+    let settle;
+    const manager = {
+      enqueue: vi.fn(() => new Promise((resolve) => { settle = resolve; })),
+    };
+    const responses = [];
+    const handler = E.createRuntimeMessageHandler(manager, vi.fn());
+
+    const keepAlive = handler(
+      { type: "blaiseBatch", batch: batchOf(event(1)), volatile: false },
+      {},
+      (response) => responses.push(response),
+    );
+
+    expect(keepAlive).toBe(true);
+    expect(responses).toEqual([]);
+    settle();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(responses).toEqual([{ accepted: true }]);
+  });
+
+  it("reports a rejected durable acceptance to the content script", async () => {
+    const manager = {
+      enqueue: vi.fn(() => Promise.reject(new Error("storage failed"))),
+    };
+    const logError = vi.fn();
+    const responses = [];
+    const handler = E.createRuntimeMessageHandler(manager, logError);
+
+    expect(handler(
+      { type: "blaiseBatch", batch: batchOf(event(1)), volatile: false },
+      {},
+      (response) => responses.push(response),
+    )).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(responses).toEqual([{ accepted: false }]);
+    expect(logError).toHaveBeenCalledOnce();
+  });
+
+  it("ignores unrelated runtime messages synchronously", () => {
+    const manager = { enqueue: vi.fn() };
+    const handler = E.createRuntimeMessageHandler(manager, vi.fn());
+    expect(handler({ type: "other" }, {}, vi.fn())).toBe(false);
+    expect(manager.enqueue).not.toHaveBeenCalled();
+  });
 });
 
 describe("ring eviction vs in-flight POST (H-2)", () => {
@@ -352,7 +439,7 @@ describe("batch-count cap and storage-write failures (M-1)", () => {
     expect(storage._store.get(E.STORAGE_KEY).pending).toHaveLength(200);
   });
 
-  it("a storage write failure surfaces (badge + counter) instead of an uncaught throw", async () => {
+  it("a storage write failure rejects durable acceptance and surfaces badge + counter", async () => {
     const failingStorage = {
       async get(key) {
         return key === "blaiseSecret" ? SECRET : undefined;
@@ -364,10 +451,40 @@ describe("batch-count cap and storage-write failures (M-1)", () => {
     const badge = vi.fn();
     const app = mockApp({ status: 503, sign: "valid" }); // batch stays buffered
     const m = makeManager({ fetchFn: app.fetchFn, storage: failingStorage, onBadge: badge });
-    await expect(m.enqueue(batchOf(event(1)))).resolves.toBeUndefined();
+    let acceptanceError;
+    try {
+      await m.enqueue(batchOf(event(1)));
+    } catch (error) {
+      acceptanceError = error;
+    }
+    expect(acceptanceError?.message).toBe("Blaise: could not persist Meet batch");
     expect(badge).toHaveBeenCalledWith("storage-error");
     expect(m.persistFailures).toBeGreaterThanOrEqual(1);
     expect(await m.bufferedEventCount()).toBe(1); // still usable in memory
+  });
+
+  it("a storage failure still makes a best-effort direct delivery while reporting non-durable acceptance", async () => {
+    const failingStorage = {
+      async get(key) {
+        return key === "blaiseSecret" ? SECRET : undefined;
+      },
+      async set() {
+        throw new Error("transient storage failure");
+      },
+    };
+    const app = mockApp({ status: 200, sign: "valid" });
+    const m = makeManager({ fetchFn: app.fetchFn, storage: failingStorage });
+
+    let acceptanceError;
+    try {
+      await m.enqueue(batchOf(event(1)));
+    } catch (error) {
+      acceptanceError = error;
+    }
+
+    expect(acceptanceError?.message).toBe("Blaise: could not persist Meet batch");
+    expect(app.wires).toHaveLength(1);
+    expect(await m.bufferedEventCount()).toBe(0);
   });
 });
 

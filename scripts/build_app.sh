@@ -12,6 +12,10 @@ cd "$ROOT/app"
 APP="$ROOT/dist/Blaise.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# A production-signed build has the same bundle identifier as the installed
+# app. Keep build output out of Spotlight discovery so Launch Services does not
+# register `dist/Blaise.app` as a second install merely because it exists.
+touch "$ROOT/dist/.metadata_never_index"
 cp "$ROOT/app/.build/release/Blaise" "$APP/Contents/MacOS/Blaise"
 
 # SwiftPM resource bundles (Bundle.module looks for them in the main
@@ -45,14 +49,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<string>Blaise</string>
 	<key>CFBundleIdentifier</key>
 	<string>__BLAISE_BUNDLE_ID__</string>
+	<key>CFBundleDisplayName</key>
+	<string>__BLAISE_DISPLAY_NAME__</string>
 	<key>CFBundleName</key>
-	<string>Blaise</string>
+	<string>__BLAISE_DISPLAY_NAME__</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>__BLAISE_BUILD_NUMBER__</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2.1</string>
+	<string>1.4.0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.1</string>
 	<key>NSHighResolutionCapable</key>
@@ -76,8 +82,27 @@ if [[ ! "$BLAISE_BUNDLE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
     echo "error: BLAISE_BUNDLE_ID '$BLAISE_BUNDLE_ID' is not a valid bundle id" >&2
     exit 1
 fi
+if [[ ! "$BLAISE_APP_DISPLAY_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._\ -]*$ ]]; then
+    echo "error: BLAISE_APP_DISPLAY_NAME contains unsupported characters" >&2
+    exit 1
+fi
 sed -i '' "s/__BLAISE_BUNDLE_ID__/$BLAISE_BUNDLE_ID/" "$APP/Contents/Info.plist"
+sed -i '' "s/__BLAISE_DISPLAY_NAME__/$BLAISE_APP_DISPLAY_NAME/g" "$APP/Contents/Info.plist"
+
+# Launch Services and Notification Center both cache app identity by bundle
+# version. Replacing many different binaries while hard-coding build `2` left
+# stale notification sources pointing at old/rollback bundles. Use the Git
+# commit count by default (stable for one source revision, monotonically
+# increasing on main), with an explicit numeric override for release tooling.
+BUILD_NUMBER="${BLAISE_BUILD_NUMBER:-$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || true)}"
+if [[ ! "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: BLAISE_BUILD_NUMBER must be a positive integer (got '${BUILD_NUMBER:-<empty>}')" >&2
+    exit 1
+fi
+sed -i '' "s/__BLAISE_BUILD_NUMBER__/$BUILD_NUMBER/" "$APP/Contents/Info.plist"
 echo "bundle id: $BLAISE_BUNDLE_ID"
+echo "display name: $BLAISE_APP_DISPLAY_NAME"
+echo "build number: $BUILD_NUMBER"
 if [[ "$BLAISE_BUNDLE_ID" == "app.blaise.mac" ]]; then
     echo "WARNING: built with the PUBLIC bundle id — TCC (mic/system-audio/calendar)" >&2
     echo "WARNING: + Keychain items key to this id; a PRODUCTION build needs" >&2

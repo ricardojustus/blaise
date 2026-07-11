@@ -29,7 +29,7 @@ struct LibraryView: View {
                 .navigationSplitViewColumnWidth(min: 190, ideal: 220)
         } content: {
             contentColumn
-                .navigationSplitViewColumnWidth(min: 300, ideal: 340)
+                .navigationSplitViewColumnWidth(min: 320, ideal: 360)
         } detail: {
             if let id = uiState.selectedMeetingID {
                 MeetingDetailView(meetingID: id)
@@ -54,13 +54,17 @@ struct LibraryView: View {
             runSearch(uiState.searchText)
         }
         .toolbar {
+            // NavigationSplitView's supplementary/detail divider extends
+            // through the unified titlebar, but toolbar placements know
+            // nothing about that divider. Reserve the old status item's
+            // center footprint as a transparent exclusion zone: the divider
+            // may pass through it, while every visible action stays to its
+            // right in the original, preferred arrangement.
             ToolbarItem(placement: .status) {
-                RecordingIndicatorView()
+                Color.clear
+                    .frame(width: 190, height: 1)
+                    .accessibilityHidden(true)
             }
-            // V3 chip fix, part 2: the system's shared toolbar glass for
-            // a status item is an icon-sized blob the "Idle" text
-            // overflowed. Hide it; the chip draws its own capsule whose
-            // shape derives from the content.
             .sharedBackgroundVisibility(.hidden)
             // A GROUP, not a single ToolbarItem: macOS renders only the first
             // control in a ToolbarItem, which silently dropped the End & Process
@@ -69,6 +73,15 @@ struct LibraryView: View {
                 recordToolbarButtons
             }
         }
+        // This must be explicit. Previously the demo's delayed window resize
+        // happened to invalidate AppKit's initial gray toolbar material, so it
+        // looked transparent only after launch/resize. Keep the native toolbar
+        // and its drag region, but never draw the separate gray background.
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        // The sidebar selection already names the current surface. On a
+        // transparent toolbar, repeating "All Meetings" / "Search" here reads
+        // as leftover chrome rather than useful orientation.
+        .toolbar(removing: .title)
         // Window-level action-failure banner (rename, done toggle): the
         // split-view analog of the menu bar's `lastActionError` line —
         // visible wherever the failed action happened, dismissible, replaced
@@ -101,8 +114,12 @@ struct LibraryView: View {
         // floor 8): calm and dismissible per failure episode, floating over
         // the top of the split view. Clears silently on delivery.
         .overlay(alignment: .top) {
-            HandoffWarningBanner()
+            VStack(spacing: 6) {
+                DetectedMeetingBanner()
+                HandoffWarningBanner()
+            }
         }
+        .transientScrollIndicators()
     }
 
     /// Smart-group rows: title, symbol, icon tint per direction.
@@ -147,6 +164,62 @@ struct LibraryView: View {
             }
         }
         .listStyle(.sidebar)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            sidebarHeader
+        }
+    }
+
+    private var sidebarHeader: some View {
+        let visualState = BlaiseStatusIcon.visualState(
+            for: appEnv.captureStatus.state,
+            handoffWarning: appEnv.handoffStatus.snapshot.warning != nil,
+            meetingDetected: appEnv.captureStatus.detectedMeeting != nil)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(nsImage: BlaiseStatusIcon.image(for: visualState))
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 24, height: 24)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Blaise")
+                        .font(Design.displayFont(16))
+                    Text(sidebarStatusLabel)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(sidebarStatusTint)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            if appEnv.captureStatus.isRecording {
+                LevelMeterView(holder: appEnv.levelMeter)
+                    .padding(.leading, 34)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(.regularMaterial)
+        .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+        .accessibilityElement(children: .combine)
+        .animation(.smooth(duration: 0.18), value: appEnv.captureStatus.isRecording)
+    }
+
+    private var sidebarStatusLabel: String {
+        if appEnv.captureStatus.meetingEndPendingUntil != nil { return "Meeting ended — stopping" }
+        if appEnv.captureStatus.isRecording { return "Recording now" }
+        if appEnv.captureStatus.isPaused { return "Recording paused" }
+        if appEnv.captureStatus.detectedMeeting != nil { return "Meeting detected" }
+        if appEnv.listenerStatus.isUnavailable { return "Meet listener offline" }
+        if case .processing = appEnv.captureStatus.state { return "Processing meeting" }
+        return "Ready"
+    }
+
+    private var sidebarStatusTint: AnyShapeStyle {
+        if appEnv.captureStatus.isRecording { return AnyShapeStyle(Design.recording) }
+        if appEnv.listenerStatus.isUnavailable { return AnyShapeStyle(Color.orange) }
+        if appEnv.captureStatus.detectedMeeting != nil { return AnyShapeStyle(Design.accent) }
+        return AnyShapeStyle(.secondary)
     }
 
     @ViewBuilder
@@ -182,15 +255,21 @@ struct LibraryView: View {
         let groups = LibraryModel.dayGroups(library.items(in: uiState.selectedGroup))
         return ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: Design.direction == .fluido ? 9 : 2) {
+                LazyVStack(alignment: .leading, spacing: Design.direction == .fluido ? 9 : 6) {
                     if !appEnv.calendarSuggestions.upcomingRows.isEmpty {
                         UpcomingMeetingsSection(rows: appEnv.calendarSuggestions.upcomingRows)
                             .padding(.top, 12)
                             .padding(.bottom, 8)
                     }
-                    ForEach(groups) { group in
+                    ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
                         DayGroupHeader(label: group.label, items: group.items)
-                            .padding(.top, 16)
+                            // With the toolbar material hidden, the old uniform
+                            // 16 pt chapter gap makes the first group look as if
+                            // the entire middle column has slipped down. Keep
+                            // the generous separation between later days, but
+                            // seat the first visible group against the native
+                            // scroll-content inset.
+                            .padding(.top, index == 0 ? 4 : 16)
                             .padding(.horizontal, 6)
                         ForEach(group.items) { item in
                             meetingRow(item)
@@ -198,7 +277,7 @@ struct LibraryView: View {
                         }
                     }
                 }
-                .padding(.horizontal, 10)
+                .padding(.horizontal, 12)
                 .padding(.bottom, 12)
             }
             .focusable()
@@ -280,12 +359,19 @@ struct LibraryView: View {
                 runningStage: activity.activeRuns[item.id]?.stage,
                 justReady: library.recentlyReady.contains(item.id)
             )
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                selected ? Design.accent.opacity(0.16) : .clear,
-                in: RoundedRectangle(cornerRadius: 7))
-            .contentShape(Rectangle())
+                selected ? Design.selectionFill : Design.surface,
+                in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(
+                        selected ? Design.selectionBorder : Design.surfaceBorder,
+                        lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
         .accessibilityElement(children: .combine)
@@ -605,7 +691,7 @@ struct MeetingRowView: View {
                     .font(Design.metaFont)
                     .foregroundStyle(
                         Design.direction == .estudio || Design.direction == .fluido
-                            ? AnyShapeStyle(Design.accent.opacity(0.7)) : AnyShapeStyle(.tertiary))
+                            ? AnyShapeStyle(Design.accent.opacity(0.82)) : AnyShapeStyle(.secondary))
             }
             if let summary = item.summary, !summary.isEmpty {
                 Text(summary)
@@ -652,9 +738,9 @@ struct MeetingRowView: View {
                     .accessibilityLabel("\(item.userActionItemCount) action items for you")
                 }
             }
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.secondary.opacity(0.78))
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, 3)
         .padding(.horizontal, Design.direction == .estudio ? 4 : 0)
         // Estúdio hover lift: the row rises slightly under the pointer.
         .background(
@@ -748,6 +834,7 @@ struct FluidoMeetingCard: View {
     }
 
     var body: some View {
+        let motionIsReduced = reduceMotion
         Button(action: action) {
             MeetingRowView(item: item, runningStage: runningStage, justReady: justReady)
                 .padding(.horizontal, 11)
@@ -769,9 +856,9 @@ struct FluidoMeetingCard: View {
         // Scroll-edge lift/fade is movement: identity under Reduce Motion.
         .scrollTransition(.interactive) { content, phase in
             content
-                .opacity(reduceMotion || phase.isIdentity ? 1 : 0.45)
-                .scaleEffect(reduceMotion || phase.isIdentity ? 1 : 0.965)
-                .offset(y: reduceMotion ? 0 : phase.value * 9)
+                .opacity(motionIsReduced || phase.isIdentity ? 1 : 0.45)
+                .scaleEffect(motionIsReduced || phase.isIdentity ? 1 : 0.965)
+                .offset(y: motionIsReduced ? 0 : phase.value * 9)
         }
         .animation(reduceMotion ? nil : .smooth(duration: 0.18), value: selected)
         // VoiceOver: combined children (title, time, summary, status, the user
@@ -909,46 +996,48 @@ struct SearchResultsList: View {
     let results: SearchResults
 
     var body: some View {
-        List {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 10) {
             // Notes first: notes are for humans (Floor 5) and carry the most
             // valuable output. bm25 is not comparable across the two FTS tables,
             // so the surfaces are separate sections, each internally ranked.
             if !results.notes.isEmpty {
-                Section("Notes") {
-                    ForEach(results.notes) { result in
-                        Button {
-                            uiState.selectedMeetingID = result.hit.meetingID
-                            uiState.detailRequest = .init(
-                                meetingID: result.hit.meetingID, target: .notes)
-                        } label: {
-                            resultRow(
-                                title: result.meetingTitle, startedAt: result.startedAt,
-                                segments: result.segments)
-                        }
-                        .buttonStyle(.plain)
+                searchSectionHeader("Notes", systemImage: "doc.richtext")
+                ForEach(results.notes) { result in
+                    resultButton(
+                        title: result.meetingTitle, startedAt: result.startedAt,
+                        source: "Notes", systemImage: "doc.richtext",
+                        segments: result.segments
+                    ) {
+                        uiState.selectedMeetingID = result.hit.meetingID
+                        uiState.detailRequest = .init(
+                            meetingID: result.hit.meetingID, target: .notes,
+                            searchTerms: SearchSnippetFormatter.matchTerms(result.segments))
                     }
                 }
             }
             if !results.transcripts.isEmpty {
-                Section("Transcript") {
-                    ForEach(results.transcripts) { result in
-                        Button {
-                            uiState.selectedMeetingID = result.hit.meetingID
-                            uiState.detailRequest = .init(
-                                meetingID: result.hit.meetingID,
-                                target: .transcript(segmentID: result.hit.segmentID))
-                        } label: {
-                            resultRow(
-                                title: result.meetingTitle, startedAt: result.startedAt,
-                                segments: result.segments)
-                        }
-                        .buttonStyle(.plain)
+                searchSectionHeader("Transcript", systemImage: "text.quote")
+                    .padding(.top, results.notes.isEmpty ? 0 : 12)
+                ForEach(results.transcripts) { result in
+                    resultButton(
+                        title: result.meetingTitle, startedAt: result.startedAt,
+                        source: "Transcript · \(Self.timestamp(result.hit.startSeconds))",
+                        systemImage: "text.quote", segments: result.segments
+                    ) {
+                        uiState.selectedMeetingID = result.hit.meetingID
+                        uiState.detailRequest = .init(
+                            meetingID: result.hit.meetingID,
+                            target: .transcript(segmentID: result.hit.segmentID),
+                            searchTerms: SearchSnippetFormatter.matchTerms(result.segments))
                     }
                 }
             }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 14)
         }
-        .listStyle(.inset)
-        .designListBackground()
+        .background(Design.listColumn.ignoresSafeArea())
         .navigationTitle("Search")
         .overlay {
             if results.isEmpty {
@@ -957,127 +1046,126 @@ struct SearchResultsList: View {
         }
     }
 
-    private func resultRow(
-        title: String, startedAt: Date, segments: [SearchSnippetFormatter.Segment]
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(title)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
-                Spacer()
-                Text(BlaiseDateFormat.dayMonthYear(startedAt))  // pinned DD/MM/YYYY (M-1)
-                    .font(.system(size: 11).monospacedDigit())
-                    .foregroundStyle(.tertiary)
-            }
-            snippetText(segments)
-                .font(.system(size: 12))
+    private func searchSectionHeader(_ title: String, systemImage: String) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: systemImage)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Theme.accent)
+            Text(title.uppercased())
+                .font(.system(size: 10.5, weight: .bold))
+                .kerning(1.1)
                 .foregroundStyle(.secondary)
-                .lineLimit(3)
+            Spacer()
+            Text(title == "Notes" ? "\(results.notes.count)" : "\(results.transcripts.count)")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary)
         }
-        .padding(.vertical, 3)
+        .padding(.horizontal, 2)
+        .accessibilityAddTraits(.isHeader)
     }
 
-    /// The pinned delimiters rendered as bold accent runs.
-    private func snippetText(_ segments: [SearchSnippetFormatter.Segment]) -> Text {
-        segments.reduce(Text("")) { accumulated, segment in
-            accumulated
-                + Text(segment.text)
-                .fontWeight(segment.isMatch ? .bold : .regular)
-                .foregroundColor(segment.isMatch ? Theme.accent : nil)
+    private func resultButton(
+        title: String, startedAt: Date, source: String, systemImage: String,
+        segments: [SearchSnippetFormatter.Segment], action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(title)
+                        .font(Design.rowTitleFont)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(BlaiseDateFormat.dayMonthYear(startedAt))
+                        .font(Design.metaFont)
+                        .foregroundStyle(.tertiary)
+                }
+                Text(snippetAttributed(segments))
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, minHeight: 34, alignment: .topLeading)
+                Label(source, systemImage: systemImage)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Design.surface, in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Design.surfaceBorder, lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10))
         }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens the matching \(source.lowercased()) text")
+    }
+
+    /// The pinned delimiters rendered as exact, non-color-only match runs.
+    private func snippetAttributed(
+        _ segments: [SearchSnippetFormatter.Segment]
+    ) -> AttributedString {
+        var output = AttributedString()
+        for segment in segments {
+            var run = AttributedString(segment.text)
+            run.font = .system(size: 12.5, weight: segment.isMatch ? .bold : .regular)
+            run.foregroundColor = segment.isMatch ? Theme.accent : .secondary
+            if segment.isMatch {
+                run.backgroundColor = Theme.accent.opacity(0.16)
+                run.underlineStyle = .single
+            }
+            output.append(run)
+        }
+        return output
+    }
+
+    private static func timestamp(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds))
+        return String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
     }
 }
 
-// MARK: - In-window recording indicator (C11: live, fills the C10 slot)
-
-struct RecordingIndicatorView: View {
+/// A second, in-window meeting-start surface. Notification Center can be
+/// denied, muted by Focus, or configured without banners; this action remains
+/// visible whenever Blaise itself is open.
+private struct DetectedMeetingBanner: View {
     @Environment(AppEnvironment.self) private var appEnv
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var breathing = false
 
     var body: some View {
-        let state = appEnv.captureStatus.state
-        let recording = appEnv.captureStatus.isRecording
-        HStack(spacing: 5) {
-            Image(systemName: glyph(state))
-                .font(.system(size: 11))
-                .foregroundStyle(tint(state))
-                // Live pulse: while recording the dot breathes — a soft
-                // glow swelling and settling, never blinking.
-                .shadow(
-                    color: recording ? Design.recording.opacity(breathing ? 0.9 : 0.25) : .clear,
-                    radius: breathing ? 6 : 2
-                )
-                .scaleEffect(recording && breathing ? 1.12 : 1.0)
-            Text(label(state))
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .fixedSize()
-            // G12 §2: while recording, the two-channel level meter replaces the
-            // static "is it hearing me?" guesswork — its holder is read inside
-            // the LevelMeterView leaf, so a ≤ 10 Hz publish invalidates only
-            // that subview.
-            if recording {
-                LevelMeterView(holder: appEnv.levelMeter)
+        if let detected = appEnv.captureStatus.detectedMeeting,
+            StatusBarController.canPromoteMeetingDetection(in: appEnv.captureStatus.state)
+        {
+            HStack(spacing: 10) {
+                Image(nsImage: BlaiseStatusIcon.image(for: .meetingDetected))
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 17, height: 17)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Meeting detected")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(detected.title ?? detected.code)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Button("Not This Meeting") {
+                    Task { await appEnv.dismissDetectedMeeting(code: detected.code) }
+                }
+                .controlSize(.small)
+                Button("Record Now") {
+                    Task { await appEnv.recordDetectedMeeting(code: detected.code) }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
-        }
-        // V3 fix (the user: "the Idle text doesn't fit the circle it's in"): the
-        // macOS 26 toolbar wrapped this status item in an icon-sized glass
-        // blob the text overflowed, and the old nested GlassCapsule stacked
-        // a second glass inside it. Now the toolbar's shared background is
-        // hidden (sharedBackgroundVisibility, at the ToolbarItem) and the
-        // chip draws exactly ONE capsule whose shape derives from content.
-        .padding(.horizontal, 11)
-        .padding(.vertical, 5)
-        .modifier(GlassCapsule())
-        .accessibilityLabel("Recording indicator: \(label(state))")
-        .onChange(of: recording, initial: true) {
-            guard recording, !reduceMotion else {
-                breathing = false
-                return
-            }
-            withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) {
-                breathing = true
-            }
-        }
-    }
-
-    private func glyph(_ state: IndicatorState) -> String {
-        switch state {
-        case .idle: return "record.circle"
-        case .recording: return "record.circle.fill"
-        case .warning: return "exclamationmark.circle"
-        case .alarm: return "exclamationmark.triangle.fill"
-        case .processing: return "arrow.triangle.2.circlepath.circle"
-        case .grace: return "pause.circle"
-        case .paused: return "pause.circle.fill"
-        }
-    }
-
-    private func tint(_ state: IndicatorState) -> AnyShapeStyle {
-        switch state {
-        case .idle: return AnyShapeStyle(.tertiary)
-        case .recording: return AnyShapeStyle(Design.recording)
-        case .warning, .alarm: return AnyShapeStyle(Color.orange)
-        case .processing: return AnyShapeStyle(.secondary)
-        case .grace: return AnyShapeStyle(.secondary)
-        // G9: static accent (calm, not the loud recording red).
-        case .paused: return AnyShapeStyle(Theme.accent)
-        }
-    }
-
-    private func label(_ state: IndicatorState) -> String {
-        switch state {
-        case .idle: return "Idle"
-        case .recording: return "Recording"
-        case .warning(_, let message): return message
-        case .alarm(let message): return message
-        case .processing: return "Processing"
-        case .grace: return "Waiting for rejoin"
-        // G9: accumulated recorded time with "paused".
-        case .paused(_, let seconds):
-            return "Paused — \(RecordingMenuView.duration(seconds)) recorded"
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .modifier(GlassCapsule())
+            .padding(.top, 10)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Meeting detected: \(detected.title ?? detected.code)")
         }
     }
 }

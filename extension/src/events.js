@@ -141,6 +141,10 @@
       this.flushing = false;
       this.inFlight = null; // batch currently riding a POST (eviction skips it)
       this.persistFailures = 0; // consecutive storage-write failures
+      // chrome.storage writes may complete out of order. Capture immutable
+      // snapshots at each call site and serialize the actual writes so an older
+      // save can never land after a newer one and erase a just-accepted batch.
+      this.persistTail = Promise.resolve();
     }
 
     /** Load state from storage exactly once: concurrent callers on a cold
@@ -170,15 +174,28 @@
     }
 
     /** Persist state. Write failures (e.g. storage quota) are surfaced via
-     * counter + badge, never thrown into fire-and-forget callers; the state
-     * stays valid in memory for this worker's lifetime. */
+     * counter + badge and reported to the caller. The state stays valid in
+     * memory for this worker's lifetime, but it is not durable yet. */
     async #persist() {
+      // `this.state` keeps mutating while an earlier write is in flight. Chrome
+      // serializes extension-storage values, so mirror that boundary explicitly
+      // here: every queued write owns the state as it looked when #persist was
+      // called, and writes execute in call order.
+      const snapshot = JSON.parse(JSON.stringify(this.state));
+      const write = this.persistTail.then(() =>
+        this.storage.set({ [STORAGE_KEY]: snapshot }),
+      );
+      // Keep the chain usable after a failed write; this caller still awaits the
+      // original promise below so its badge/counter semantics stay unchanged.
+      this.persistTail = write.catch(() => {});
       try {
-        await this.storage.set({ [STORAGE_KEY]: this.state });
+        await write;
         this.persistFailures = 0;
+        return true;
       } catch {
         this.persistFailures += 1;
         this.onBadge("storage-error");
+        return false;
       }
     }
 
@@ -211,7 +228,15 @@
       }
       s.pending.push(newest);
       this.#evictToCaps(s, newest);
-      await this.#persist();
+      const persisted = await this.#persist();
+      if (!persisted) {
+        // Preserve the old best-effort behavior: if Blaise is reachable, the
+        // in-memory batch can still be delivered during this worker event.
+        // The caller still receives `accepted: false` because no durable local
+        // copy exists if the network attempt also fails.
+        await this.flush();
+        throw new Error("Blaise: could not persist Meet batch");
+      }
       await this.flush();
     }
 
@@ -375,6 +400,26 @@
     }
   }
 
+  /**
+   * MV3 runtime-message adapter. Returning literal `true` keeps the message
+   * channel (and therefore the service worker) alive until the batch has passed
+   * through DeliveryManager's durable-acceptance path. The content script gets
+   * an explicit result instead of firing into an unknowable void.
+   */
+  function createRuntimeMessageHandler(manager, logError = console.error) {
+    return (message, _sender, sendResponse) => {
+      if (message?.type !== "blaiseBatch") return false;
+      manager.enqueue(message.batch, { volatile: !!message.volatile }).then(
+        () => sendResponse({ accepted: true }),
+        (error) => {
+          logError("Blaise: enqueue failed", error);
+          sendResponse({ accepted: false });
+        },
+      );
+      return true;
+    };
+  }
+
   const BlaiseEvents = {
     MERGE_GAP_MS,
     MIN_UTTERANCE_MS,
@@ -390,6 +435,7 @@
     dedupeID,
     Coalescer,
     DeliveryManager,
+    createRuntimeMessageHandler,
   };
 
   globalThis.BlaiseEvents = BlaiseEvents;

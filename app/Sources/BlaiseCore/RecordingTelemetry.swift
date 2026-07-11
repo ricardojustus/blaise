@@ -111,6 +111,38 @@ public enum AudioRMS {
     }
 }
 
+// MARK: - Perceptual meter presentation
+
+/// Display-only mapping for audio meters. Capture and silence detection use
+/// linear RMS because thresholds must remain stable; a visual meter needs a
+/// logarithmic scale because ordinary speech occupies only a small fraction
+/// of the linear 0...1 range.
+public enum LevelMeterPresentation {
+    /// The quiet edge of the visible meter. Values at or below this level are
+    /// rendered empty rather than letting microphone noise keep a bar alive.
+    public static let floorDecibels = -60.0
+    /// The loud edge of the visible meter. Headroom above this level is
+    /// intentionally clamped so normal speech can use most of the track.
+    public static let ceilingDecibels = -6.0
+
+    /// Converts a linear RMS sample to dBFS. Zero is represented as negative
+    /// infinity, matching the physical meaning of digital silence.
+    public static func decibels(rms: Double) -> Double {
+        let clamped = min(1, max(0, rms))
+        guard clamped > 0 else { return -.infinity }
+        return 20 * log10(clamped)
+    }
+
+    /// A perceptual 0...1 display fraction. This is deliberately independent
+    /// from `LevelMeterChannel.silenceFloor`; changing the visual scale must
+    /// never change capture, silence warnings, or automatic pausing.
+    public static func fraction(rms: Double) -> Double {
+        let dB = decibels(rms: rms)
+        guard dB.isFinite else { return 0 }
+        return min(1, max(0, (dB - floorDecibels) / (ceilingDecibels - floorDecibels)))
+    }
+}
+
 // MARK: - Two-channel level meter (§2)
 
 /// One channel's published meter level: a smoothed 0…1 magnitude plus the

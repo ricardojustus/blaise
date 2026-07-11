@@ -55,13 +55,53 @@ final class AppUIState {
 
         var meetingID: MeetingID
         var target: Target
+        /// Actual stored spellings wrapped by the FTS snippet. Destination
+        /// views use these only for scrolling/highlighting; persistence,
+        /// notes content, digest generation, and handoff are untouched.
+        var searchTerms: [String] = []
     }
 }
 
-/// Listener resilience surface (port collision banner in Settings).
+enum MeetListenerState: Equatable {
+    case starting
+    case listening
+    /// Expected for isolated/demo data roots so they can never steal the live
+    /// app's fixed loopback port.
+    case disabledForIsolatedData
+    case unavailable(String)
+}
+
+struct MeetListenerReceipt: Equatable {
+    var status: Int
+    var receivedAt: Date
+}
+
+/// Observable health of the Chrome-extension ingress. This deliberately stops
+/// at the app-side acceptance boundary; it does not alter or reinterpret the
+/// Meet batch, recording correlation, evidence payload, or handoff path.
 @MainActor @Observable
 final class ListenerStatusHolder {
-    var banner: String?
+    var state: MeetListenerState = .starting
+    var lastRequestAt: Date?
+    var lastResponse: MeetListenerReceipt?
+
+    var banner: String? {
+        guard case .unavailable(let detail) = state else { return nil }
+        return detail
+    }
+
+    var isUnavailable: Bool {
+        if case .unavailable = state { return true }
+        return false
+    }
+
+    func noteRequest(at date: Date = Date()) {
+        lastRequestAt = date
+    }
+
+    func noteResponse(status: Int, at date: Date = Date()) {
+        lastResponse = MeetListenerReceipt(status: status, receivedAt: date)
+    }
 }
 
 @MainActor @Observable
@@ -72,6 +112,10 @@ final class AppEnvironment {
     /// for "Open Blaise" / notification routing (not a heuristic match). Weak
     /// (the window may close) and observation-ignored (read imperatively).
     @ObservationIgnored weak var mainWindow: NSWindow?
+    /// Captured from the main WindowGroup's SwiftUI environment while a window
+    /// exists. Unlike the weak NSWindow reference, this can create a fresh main
+    /// window after the user fully closes the previous one.
+    @ObservationIgnored var reopenMainWindow: (@MainActor () -> Void)?
     let registry: EngineRegistry
     let settings: SettingsStore
     let secrets: KeychainSecretStore
@@ -308,6 +352,7 @@ final class AppEnvironment {
                 guard let self else { return }
                 switch event {
                 case .started(_, let at):
+                    self.captureStatus.meetingEndPendingUntil = nil
                     self.captureStatus.apply(.captureStarted(at: at))
                     self.startLongSessionTicker()
                     // G12 §2: arm the level meter for this live session (each
@@ -362,6 +407,7 @@ final class AppEnvironment {
                     // The encode may take a while — reflect "processing"
                     // immediately, before `.stopped` arrives.
                     self.tickerTask?.cancel()
+                    self.captureStatus.meetingEndPendingUntil = nil
                     self.captureStatus.apply(.captureStopping)
                     // G12 §2: tear down the live meter so the toolbar settles.
                     self.levelMeterModel = nil
@@ -387,6 +433,7 @@ final class AppEnvironment {
                     // stops (no live capture); the indicator shows the
                     // accumulated recorded time with "paused".
                     self.tickerTask?.cancel()
+                    self.captureStatus.meetingEndPendingUntil = nil
                     self.captureStatus.pausedMeetingID = id
                     let title = self.captureStatus.activeMeetingTitle ?? "Recording"
                     self.captureStatus.apply(
@@ -459,6 +506,10 @@ final class AppEnvironment {
                     if self.captureStatus.detectedMeeting?.code == code {
                         self.captureStatus.detectedMeeting = nil
                     }
+                case .meetingEndPending(_, let until):
+                    self.captureStatus.meetingEndPendingUntil = until
+                case .meetingEndPendingCleared:
+                    self.captureStatus.meetingEndPendingUntil = nil
                 case .nudge(_, let title):
                     self.captureStatus.nudgeMessage =
                         "Recording running — no Meet signals yet — \(title)"
@@ -489,11 +540,15 @@ final class AppEnvironment {
             }
         }
         Task { [notificationAdapter, settings, captureStatus] in
-            if await AutomationSettings.enabled(from: settings) {
+            // Screenshot/demo bundles must not create a real notification TCC
+            // decision for their throwaway bundle identity.
+            if !CommandLine.arguments.contains("--seed-demo"),
+                await AutomationSettings.enabled(from: settings)
+            {
                 await notificationAdapter.requestAuthorization()
             }
-            let denied = await notificationAdapter.authorizationDenied()
-            await MainActor.run { captureStatus.notificationsDenied = denied }
+            let health = await notificationAdapter.notificationHealth()
+            await MainActor.run { captureStatus.notificationHealth = health }
         }
         await googleCalendar.load()
         await calendarSuggestions.load()
@@ -969,6 +1024,33 @@ final class AppEnvironment {
         await tracker.recordActionClicked(code: code)
     }
 
+    /// Hide the standing in-app offer without changing the tracker's per-call
+    /// suppression record. Later heartbeats from this same call therefore do
+    /// not nag again; call-ended still clears the mirror idempotently.
+    func dismissDetectedMeeting(code: String) async {
+        await notificationAdapter.withdrawMeetStart(code: code)
+        if captureStatus.detectedMeeting?.code == code {
+            captureStatus.detectedMeeting = nil
+        }
+    }
+
+    func dismissCalendarReminder(eventKey: String) async {
+        await notificationAdapter.withdrawCalendarUpcoming(eventKey: eventKey)
+    }
+
+    /// Re-read System Settings whenever the menu opens. Notification settings
+    /// can change while Blaise is running, and `add` success alone cannot tell
+    /// us whether macOS is configured to present a banner.
+    func refreshAutomationSurfaceStatus() async {
+        let health = await notificationAdapter.notificationHealth()
+        captureStatus.notificationHealth = health
+    }
+
+    func sendNotificationTest() async {
+        await notificationAdapter.postDiagnosticsTest()
+        await refreshAutomationSurfaceStatus()
+    }
+
     /// The calendar Launch & Record action: open the Meet link in Google
     /// Chrome (NEVER the default browser — the extension lives in Chrome),
     /// then start a correlated recording with the event's title/attendees.
@@ -1146,6 +1228,11 @@ final class AppEnvironment {
             uiState.selectedMeetingID.map(seedDemoAudio)
             captureStatus.activeMeetingTitle = "Demo recording"
             captureStatus.apply(.captureStarted(at: Date().addingTimeInterval(-127)))
+            // Display-only fixture so the isolated screenshot scene exercises
+            // the perceptual mapping without opening an audio capture device.
+            levelMeter.levels = MeterLevels(
+                you: ChannelLevel(level: 0.08),
+                others: ChannelLevel(level: 0.025))
         case "paused":
             // G9 shot: the three-state model in its PAUSED rendering
             // (indicator mirror only — no capture session): toolbar shows
@@ -1158,6 +1245,17 @@ final class AppEnvironment {
             captureStatus.launchSweepComplete = true  // sweep done → Resume enabled
             captureStatus.apply(
                 .meetingPaused(meetingTitle: "Demo recording", accumulatedSeconds: 127))
+        case "automationmenu":
+            // Isolated visual-smoke scene for the menu's load-bearing
+            // notification fallback. No tracker input, listener bind, capture,
+            // or external delivery: UI mirror state only.
+            captureStatus.detectedMeeting = (
+                code: "abc-defg-hij", title: "Weekly product review")
+            captureStatus.notificationHealth = .alertsDisabled
+            captureStatus.lastNotificationReceipt = AutomationNotificationReceipt(
+                title: "Meeting in progress",
+                submittedAt: Date().addingTimeInterval(-45),
+                acceptedBySystem: true)
         case "motion":
             // PROPOSALS_V3 screen recording: a timed self-driving tour —
             // select (settle), demo-record (mesh warm), stop, open the PT

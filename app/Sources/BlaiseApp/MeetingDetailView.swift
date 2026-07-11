@@ -23,6 +23,8 @@ struct MeetingDetailView: View {
     @State private var model: MeetingDetailModel?
     @State private var tab: Tab = .notes
     @State private var scrollTarget: Int64?
+    @State private var searchTerms: [String] = []
+    @State private var notesSearchRequest = 0
     @State private var userActionBoxRequest = 0
     @State private var showInspector = false
     @State private var regenerating = false
@@ -38,6 +40,7 @@ struct MeetingDetailView: View {
             if let model {
                 DetailContent(
                     model: model, tab: $tab, scrollTarget: $scrollTarget,
+                    searchTerms: $searchTerms, notesSearchRequest: notesSearchRequest,
                     userActionBoxRequest: userActionBoxRequest,
                     activeStage: activity.activeRuns[meetingID]?.stage,
                     heroArmed: $heroArmed)
@@ -93,35 +96,40 @@ struct MeetingDetailView: View {
                     .help("Re-run transcription and notes from the retained audio")
                 }
             }
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    regenerate()
-                } label: {
-                    Label("Regenerate", systemImage: "arrow.clockwise")
-                }
-                .disabled(regenerating || activity.activeRuns[meetingID] != nil)
-                .help("Re-run transcription and notes from the retained audio with the selected engines")
-            }
-            // G10 §2: Delete (with the two-step confirm). Refused only for a
-            // recording meeting; an in-flight run resolves via Cancel & Delete
-            // in the dialog.
-            if model?.meeting?.status != .recording {
-                ToolbarItem(placement: .primaryAction) {
-                    Button(role: .destructive) {
-                        showDeleteConfirm = true
+            // Keep the toolbar's hierarchy calm: the current view and any
+            // active Cancel/Process action stay direct; maintenance, info, and
+            // destructive actions live together here instead of competing as
+            // three equally prominent icon buttons.
+            ToolbarItem(placement: .secondaryAction) {
+                Menu {
+                    Button {
+                        regenerate()
                     } label: {
-                        Label("Delete", systemImage: "trash")
+                        Label("Regenerate", systemImage: "arrow.clockwise")
                     }
-                    .help("Permanently delete this meeting from this Mac")
-                }
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    showInspector.toggle()
+                    .disabled(regenerating || activity.activeRuns[meetingID] != nil)
+
+                    Button {
+                        showInspector.toggle()
+                    } label: {
+                        Label("Meeting Info", systemImage: "info.circle")
+                    }
+
+                    // G10 §2: Delete (with the two-step confirm). Refused only
+                    // for a recording meeting; an in-flight run resolves via
+                    // Cancel & Delete in the dialog.
+                    if model?.meeting?.status != .recording {
+                        Divider()
+                        Button(role: .destructive) {
+                            showDeleteConfirm = true
+                        } label: {
+                            Label("Delete Meeting…", systemImage: "trash")
+                        }
+                    }
                 } label: {
-                    Label("Info", systemImage: "info.circle")
+                    Label("Meeting Actions", systemImage: "ellipsis.circle")
                 }
-                .help("Meeting info (Meet code)")
+                .help("Regenerate, view meeting info, or delete")
             }
         }
         .confirmationDialog(
@@ -162,9 +170,11 @@ struct MeetingDetailView: View {
 
     private func applyDetailRequest() {
         guard let request = uiState.detailRequest, request.meetingID == meetingID else { return }
+        searchTerms = request.searchTerms
         switch request.target {
         case .notes:
             tab = .notes
+            notesSearchRequest += 1
         case .userActions:
             tab = .notes
             userActionBoxRequest += 1  // scroll to the user-action box
@@ -221,6 +231,8 @@ private struct DetailContent: View {
     @Bindable var model: MeetingDetailModel
     @Binding var tab: MeetingDetailView.Tab
     @Binding var scrollTarget: Int64?
+    @Binding var searchTerms: [String]
+    var notesSearchRequest = 0
     var userActionBoxRequest = 0
     let activeStage: PipelineStage?
     @Binding var heroArmed: Bool
@@ -233,14 +245,16 @@ private struct DetailContent: View {
                     NotesPane(
                         meeting: meeting, notes: model.notes,
                         resolvedSpeakers: model.resolvedSpeakerNames,
-                        doneActionKeys: model.doneActionKeys, userActionBoxRequest: userActionBoxRequest,
+                        doneActionKeys: model.doneActionKeys,
+                        searchTerms: searchTerms, searchRequest: notesSearchRequest,
+                        userActionBoxRequest: userActionBoxRequest,
                         heroArmed: $heroArmed)
                 case .transcript:
                     TranscriptPane(
                         meeting: meeting,
                         segments: model.segments, renames: model.speakerRenames,
                         hasDiarizationArtifact: model.hasDiarizationArtifact,
-                        scrollTarget: $scrollTarget,
+                        scrollTarget: $scrollTarget, searchTerms: searchTerms,
                         portuguese: (meeting.dominantLanguage ?? "").lowercased().hasPrefix("pt"))
                 }
             } else if !model.loaded {
@@ -280,6 +294,10 @@ private struct NotesPane: View {
     var resolvedSpeakers: [String] = []
     /// `ActionItemKey`s marked done (live from the detail observation).
     var doneActionKeys: Set<String> = []
+    /// Stored FTS spellings to highlight. Display-only; never mutates notes.
+    var searchTerms: [String] = []
+    /// Monotonic request token so repeated clicks on the same result re-scroll.
+    var searchRequest = 0
     var userActionBoxRequest = 0
     /// Fluido: the header's one-shot settle entrance (armed per selection).
     @Binding var heroArmed: Bool
@@ -301,14 +319,22 @@ private struct NotesPane: View {
                 .onChange(of: userActionBoxRequest) {
                     withAnimation { proxy.scrollTo(Self.userActionBoxAnchor, anchor: .top) }
                 }
+                .onChange(of: searchRequest) {
+                    scrollToFirstSearchMatch(proxy, animated: true)
+                }
                 .onAppear {
-                    if userActionBoxRequest > 0 {
+                    if !searchTerms.isEmpty {
+                        scrollToFirstSearchMatch(proxy, animated: false)
+                    } else if userActionBoxRequest > 0 {
                         proxy.scrollTo(Self.userActionBoxAnchor, anchor: .top)
                     }
                 }
                 .onChange(of: notes?.generatedAt) { previous, current in
                     if Design.direction == .fluido, current != nil, previous != current {
                         shineTick += 1
+                    }
+                    if !searchTerms.isEmpty, current != nil {
+                        scrollToFirstSearchMatch(proxy, animated: false)
                     }
                 }
                 .onChange(of: library.recentlyReady.contains(meeting.id), initial: true) { _, isNew in
@@ -335,6 +361,10 @@ private struct NotesPane: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 header
+
+                if !searchTerms.isEmpty {
+                    SearchDestinationBanner(terms: searchTerms, location: "notes")
+                }
 
                 if let note = meeting.processingNote, !note.isEmpty {
                     HStack(alignment: .top, spacing: 8) {
@@ -403,6 +433,55 @@ private struct NotesPane: View {
             .frame(maxWidth: 740, alignment: .leading)  // C's generous measure (~68ch)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private func scrollToFirstSearchMatch(_ proxy: ScrollViewProxy, animated: Bool) {
+        guard let anchor = firstSearchAnchor else { return }
+        Task { @MainActor in
+            // Let the tab switch and highlighted block IDs land before the
+            // ScrollViewReader resolves the destination.
+            await Task.yield()
+            if animated {
+                withAnimation(.easeOut(duration: 0.22)) {
+                    proxy.scrollTo(anchor, anchor: .center)
+                }
+            } else {
+                proxy.scrollTo(anchor, anchor: .center)
+            }
+        }
+    }
+
+    private var firstSearchAnchor: String? {
+        guard let structured = notes?.structured, !searchTerms.isEmpty else { return nil }
+        if let block = MarkdownBlocks.parse(structured.summary).first(where: {
+            SearchTextMatcher.contains(String($0.text.characters), terms: searchTerms)
+        }) {
+            return "notes-summary-\(block.id)"
+        }
+        if structured.userActionItems.contains(where: {
+            SearchTextMatcher.contains($0.text, terms: searchTerms)
+        }) {
+            return Self.userActionBoxAnchor
+        }
+        if let index = structured.decisions.firstIndex(where: {
+            SearchTextMatcher.contains($0, terms: searchTerms)
+        }) {
+            return "notes-decision-\(index)"
+        }
+        let visibleActionItems = structured.actionItems.filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if let index = visibleActionItems.firstIndex(where: {
+            SearchTextMatcher.contains("\($0.owner) \($0.text)", terms: searchTerms)
+        }) {
+            return "notes-action-\(index)"
+        }
+        if let block = MarkdownBlocks.parse(structured.detailedNotes).first(where: {
+            SearchTextMatcher.contains(String($0.text.characters), terms: searchTerms)
+        }) {
+            return "notes-detailed-\(block.id)"
+        }
+        return nil
     }
 
     /// The meeting's hue (aquarela identity; the accent elsewhere).
@@ -511,6 +590,7 @@ private struct NotesPane: View {
                 }
             }
         }
+        .transientScrollIndicators()
     }
 
     private var timeAndDuration: String {
@@ -544,7 +624,6 @@ private struct NotesPane: View {
         }
     }
 
-    @ViewBuilder
     /// G3 name-driven section title: `<name> — Action Items` / `<name> —
     /// Itens de Ação`; an empty (pre-onboarding) identity → neutral
     /// "My action items" / "Minhas ações".
@@ -581,7 +660,7 @@ private struct NotesPane: View {
             .buttonStyle(.plain)
             .accessibilityLabel(done ? "Mark not done: \(item.text)" : "Mark done: \(item.text)")
             .help(done ? "Mark as not done" : "Mark as done")
-            Text(item.text)
+            SearchHighlightedText(source: AttributedString(item.text), terms: searchTerms)
                 .font(Design.readingFont(14, weight: done ? .regular : .medium))
                 .strikethrough(done)
                 .foregroundStyle(done ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
@@ -604,7 +683,9 @@ private struct NotesPane: View {
         }
 
         NoteSection(title: portuguese ? "Resumo" : "Summary", kind: .summary) {
-            MarkdownBlocksView(markdown: structured.summary)
+            MarkdownBlocksView(
+                markdown: structured.summary, searchTerms: searchTerms,
+                anchorPrefix: "notes-summary")
         }
 
         // Drop blank user action items (empty text) before the box renders.
@@ -681,17 +762,19 @@ private struct NotesPane: View {
         if !structured.decisions.isEmpty {
             NoteSection(title: portuguese ? "Decisões" : "Decisions", kind: .decisions) {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(structured.decisions.enumerated()), id: \.offset) { _, decision in
+                    ForEach(Array(structured.decisions.enumerated()), id: \.offset) { index, decision in
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Image(systemName: "checkmark.seal.fill")
                                 .font(.system(size: 11))
                                 .foregroundStyle(Design.support)
                                 .accessibilityHidden(true)
-                            Text(decision)
+                            SearchHighlightedText(
+                                source: AttributedString(decision), terms: searchTerms)
                                 .font(Design.readingFont(14))
                                 .lineSpacing(Design.readingLineSpacing - 2)
                                 .textSelection(.enabled)
                         }
+                        .id("notes-decision-\(index)")
                     }
                 }
             }
@@ -705,17 +788,18 @@ private struct NotesPane: View {
         if !actionItems.isEmpty {
             NoteSection(title: portuguese ? "Itens de Ação" : "Action Items", kind: .actions) {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(actionItems.enumerated()), id: \.offset) { _, item in
+                    ForEach(Array(actionItems.enumerated()), id: \.offset) { index, item in
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Text("•").foregroundStyle(Design.support)
-                            if item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                Text(item.text).font(Design.readingFont(14))
-                            } else {
-                                Text("\(item.owner): ").font(Design.readingFont(14, weight: .semibold))
-                                    + Text(item.text).font(Design.readingFont(14))
-                            }
+                            SearchHighlightedText(
+                                source: AttributedString(
+                                    item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                        ? item.text : "\(item.owner): \(item.text)"),
+                                terms: searchTerms)
+                            .font(Design.readingFont(14))
                         }
                         .textSelection(.enabled)
+                        .id("notes-action-\(index)")
                     }
                 }
             }
@@ -724,7 +808,9 @@ private struct NotesPane: View {
         let detailed = structured.detailedNotes.trimmingCharacters(in: .whitespacesAndNewlines)
         if !detailed.isEmpty {
             NoteSection(title: portuguese ? "Notas Detalhadas" : "Detailed Notes", kind: .detailed) {
-                MarkdownBlocksView(markdown: detailed)
+                MarkdownBlocksView(
+                    markdown: detailed, searchTerms: searchTerms,
+                    anchorPrefix: "notes-detailed")
             }
         }
     }
@@ -897,15 +983,85 @@ private struct UserActionBoxChrome: ViewModifier {
 
 // MARK: - Block-level markdown view (pinned: .full keeps raw HTML literal)
 
+/// Renders exact destination matches with three cues: stronger weight,
+/// underline, and a quiet accent field. When no search is active the original
+/// AttributedString is returned unchanged, preserving Markdown inline styles.
+private struct SearchHighlightedText: View {
+    let source: AttributedString
+    let terms: [String]
+
+    var body: some View {
+        Text(highlighted)
+            .accessibilityHint(containsMatch ? "Contains the current search match" : "")
+    }
+
+    private var containsMatch: Bool {
+        SearchTextMatcher.contains(String(source.characters), terms: terms)
+    }
+
+    private var highlighted: AttributedString {
+        guard !terms.isEmpty else { return source }
+        var output = AttributedString()
+        for segment in SearchTextMatcher.segments(String(source.characters), matching: terms) {
+            var run = AttributedString(segment.text)
+            if segment.isMatch {
+                run.inlinePresentationIntent = .stronglyEmphasized
+                run.foregroundColor = Design.accent
+                run.backgroundColor = Design.accent.opacity(0.2)
+                run.underlineStyle = .single
+            }
+            output.append(run)
+        }
+        return output
+    }
+}
+
+private struct SearchDestinationBanner: View {
+    let terms: [String]
+    let location: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Design.accent)
+            Text("Showing \(location) match")
+                .font(.system(size: 11, weight: .semibold))
+            Text(terms.joined(separator: ", "))
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(Design.accent)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Design.accent.opacity(0.09), in: Capsule())
+        .overlay(Capsule().strokeBorder(Design.accent.opacity(0.24), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Showing \(location) search match: \(terms.joined(separator: ", "))")
+    }
+}
+
 struct MarkdownBlocksView: View {
     let markdown: String
+    var searchTerms: [String] = []
+    var anchorPrefix: String?
 
     var body: some View {
         let blocks = MarkdownBlocks.parse(markdown)
         VStack(alignment: .leading, spacing: 8) {
             ForEach(blocks) { block in
-                blockView(block)
+                anchoredBlock(block)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func anchoredBlock(_ block: MarkdownBlock) -> some View {
+        if let anchorPrefix {
+            blockView(block)
+                .id("\(anchorPrefix)-\(block.id)")
+        } else {
+            blockView(block)
         }
     }
 
@@ -913,13 +1069,13 @@ struct MarkdownBlocksView: View {
     private func blockView(_ block: MarkdownBlock) -> some View {
         switch block.kind {
         case .paragraph, .blockQuote:
-            Text(block.text)
+            SearchHighlightedText(source: block.text, terms: searchTerms)
                 .font(Design.readingFont(14))
                 .lineSpacing(Design.readingLineSpacing)
                 .foregroundStyle(.primary.opacity(0.9))
                 .textSelection(.enabled)
         case .header:
-            Text(block.text)
+            SearchHighlightedText(source: block.text, terms: searchTerms)
                 .font(Design.readingFont(14, weight: .semibold))
                 .padding(.top, 4)
                 .textSelection(.enabled)
@@ -928,7 +1084,7 @@ struct MarkdownBlocksView: View {
                 Text(ordinal.map { "\($0)." } ?? "•")
                     .font(.system(size: 13).monospacedDigit())
                     .foregroundStyle(Design.direction == .caderno ? AnyShapeStyle(Design.accent.opacity(0.7)) : AnyShapeStyle(.tertiary))
-                Text(block.text)
+                SearchHighlightedText(source: block.text, terms: searchTerms)
                     .font(Design.readingFont(14))
                     .lineSpacing(Design.readingLineSpacing - 2)
                     .foregroundStyle(.primary.opacity(0.88))
@@ -936,7 +1092,7 @@ struct MarkdownBlocksView: View {
             }
             .padding(.leading, CGFloat(max(0, depth - 1)) * 16)
         case .codeBlock:
-            Text(block.text)
+            SearchHighlightedText(source: block.text, terms: searchTerms)
                 .font(.system(size: 12.5, design: .monospaced))
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -959,6 +1115,7 @@ private struct TranscriptPane: View {
     /// rename popover's honest "applies after regenerate" copy).
     var hasDiarizationArtifact = true
     @Binding var scrollTarget: Int64?
+    var searchTerms: [String] = []
     /// Copy-button labels follow the meeting's dominant language, matching
     /// the notes pane's section titles.
     var portuguese = false
@@ -970,6 +1127,15 @@ private struct TranscriptPane: View {
         return segments.filter {
             $0.text.localizedCaseInsensitiveContains(needle)
                 || ($0.speakerName?.localizedCaseInsensitiveContains(needle) ?? false)
+        }
+    }
+
+    private var destinationMatchIDs: [Int64] {
+        segments.compactMap { segment in
+            guard let id = segment.id,
+                SearchTextMatcher.contains(segment.text, terms: searchTerms)
+            else { return nil }
+            return id
         }
     }
 
@@ -998,6 +1164,36 @@ private struct TranscriptPane: View {
             .padding(.horizontal, 20)
             .padding(.top, 12)
 
+            if !searchTerms.isEmpty {
+                HStack(spacing: 10) {
+                    SearchDestinationBanner(terms: searchTerms, location: "transcript")
+                    Spacer()
+                    Text("\(destinationMatchIDs.count) match\(destinationMatchIDs.count == 1 ? "" : "es")")
+                        .font(.system(size: 10.5).monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    Button {
+                        moveSearchMatch(by: -1)
+                    } label: {
+                        Image(systemName: "chevron.up")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(destinationMatchIDs.isEmpty)
+                    .help("Previous search match")
+                    .accessibilityLabel("Previous search match")
+                    Button {
+                        moveSearchMatch(by: 1)
+                    } label: {
+                        Image(systemName: "chevron.down")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(destinationMatchIDs.isEmpty)
+                    .help("Next search match")
+                    .accessibilityLabel("Next search match")
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+            }
+
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
@@ -1006,6 +1202,7 @@ private struct TranscriptPane: View {
                                 meeting: meeting, segment: segment,
                                 rename: renames[segment.speakerLabel],
                                 hasDiarizationArtifact: hasDiarizationArtifact,
+                                searchTerms: searchTerms,
                                 highlighted: segment.id == scrollTarget)
                                 .id(segment.id ?? -1)  // non-optional: must match scrollTo(Int64)
                         }
@@ -1015,6 +1212,7 @@ private struct TranscriptPane: View {
                     .frame(maxWidth: 820, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .transientScrollIndicators()
                 .onChange(of: scrollTarget) {
                     if let target = scrollTarget {
                         withAnimation { proxy.scrollTo(target, anchor: .center) }
@@ -1033,6 +1231,15 @@ private struct TranscriptPane: View {
             }
         }
     }
+
+    private func moveSearchMatch(by delta: Int) {
+        let ids = destinationMatchIDs
+        guard !ids.isEmpty else { return }
+        let current = scrollTarget.flatMap { ids.firstIndex(of: $0) }
+        let origin = current ?? (delta > 0 ? -1 : 0)
+        let next = (origin + delta + ids.count) % ids.count
+        scrollTarget = ids[next]
+    }
 }
 
 private struct TranscriptRow: View {
@@ -1044,6 +1251,7 @@ private struct TranscriptRow: View {
     var rename: SpeakerRename?
     /// G2 §4 (L-6): whether a persisted diarization artifact exists.
     var hasDiarizationArtifact = true
+    var searchTerms: [String] = []
     let highlighted: Bool
 
     @State private var showRename = false
@@ -1071,7 +1279,10 @@ private struct TranscriptRow: View {
             .frame(width: 52, alignment: .trailing)
             VStack(alignment: .leading, spacing: 2) {
                 speakerLabelView
-                Text(segment.text.trimmingCharacters(in: .whitespaces))
+                SearchHighlightedText(
+                    source: AttributedString(
+                        segment.text.trimmingCharacters(in: .whitespaces)),
+                    terms: searchTerms)
                     .font(.system(size: 13, design: .rounded))
                     .lineSpacing(3)
                     .foregroundStyle(.primary.opacity(0.88))

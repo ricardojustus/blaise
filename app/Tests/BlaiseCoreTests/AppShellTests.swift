@@ -108,6 +108,29 @@ import Testing
         #expect(SearchSnippetFormatter.segments("sem matches")
             == [.init(text: "sem matches", isMatch: false)])
     }
+
+    @Test func extractsUniqueStoredMatchSpellings() {
+        let segments: [SearchSnippetFormatter.Segment] = [
+            .init(text: "…", isMatch: false),
+            .init(text: "OrbitVR", isMatch: true),
+            .init(text: " and ", isMatch: false),
+            .init(text: "orbitvr", isMatch: true),
+            .init(text: " decisões", isMatch: true),
+        ]
+        #expect(SearchSnippetFormatter.matchTerms(segments) == ["OrbitVR", "decisões"])
+    }
+
+    @Test func destinationMatcherHighlightsEveryCaseAndDiacriticInsensitiveOccurrence() {
+        let segments = SearchTextMatcher.segments(
+            "OrbitVR reviewed ORBITVR decisões", matching: ["orbitvr", "decisoes"])
+        #expect(segments == [
+            .init(text: "OrbitVR", isMatch: true),
+            .init(text: " reviewed ", isMatch: false),
+            .init(text: "ORBITVR", isMatch: true),
+            .init(text: " ", isMatch: false),
+            .init(text: "decisões", isMatch: true),
+        ])
+    }
 }
 
 // MARK: - Engine settings model (immediate write + prepare state machine)

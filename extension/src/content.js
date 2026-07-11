@@ -148,6 +148,15 @@
         ...(lifecycle ? { lifecycle } : {}),
       },
       volatile,
+    }).then((response) => {
+      if (response?.accepted === false) {
+        console.warn("Blaise: background worker did not accept a Meet batch");
+      }
+    }).catch((error) => {
+      // The background ring owns retry after acceptance. This is the narrower
+      // content→worker failure boundary (extension reload/context loss), which
+      // must at least be observable instead of becoming an unhandled rejection.
+      console.warn("Blaise: could not hand Meet batch to background worker", error);
     });
   };
 
@@ -217,9 +226,7 @@
     if (tile) surfaces.push(tile);
     const captions = document.querySelector('div[role="region"][tabindex="0"]');
     if (captions) surfaces.push(captions);
-    const controlBar = document.querySelector(
-      S.LEAVE_BUTTON_ARIA_LABELS.map((l) => `button[aria-label="${l}"]`).join(","),
-    )?.parentElement;
+    const controlBar = S.findLeaveButton(document)?.parentElement;
     if (controlBar) surfaces.push(controlBar);
 
     let html = `<!-- SANITIZED Meet snapshot (${new Date().toISOString()}). Allowlist-serialized; synthetic names. -->\n`;

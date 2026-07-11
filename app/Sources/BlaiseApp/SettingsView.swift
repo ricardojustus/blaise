@@ -47,6 +47,7 @@ struct AutomationTab: View {
     @State private var silenceAutoPauseEnabled = SilenceAutoPauseSettings.defaultEnabled
     @State private var silenceThresholdMinutes = Int(SilenceAutoPauseSettings.defaultThresholdSeconds / 60)
     @State private var deniedBannerDismissed = false
+    @State private var notificationTestSent = false
     @State private var loaded = false
 
     private static let deniedBannerKey = "automation.deniedBannerDismissed"
@@ -65,6 +66,33 @@ struct AutomationTab: View {
                     }
                 Text(
                     "A notification offers Record when a Meet call starts; the recording stops by itself when the meeting ends. Manual start/stop always works."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Section("Notifications & connection") {
+                LabeledContent("Notifications") {
+                    Label(notificationStatusTitle, systemImage: notificationStatusIcon)
+                        .foregroundStyle(notificationStatusTint)
+                }
+                LabeledContent("Meet extension") {
+                    Label(listenerStatusTitle, systemImage: listenerStatusIcon)
+                        .foregroundStyle(listenerStatusTint)
+                }
+                HStack {
+                    Button("Send Test Notification") {
+                        notificationTestSent = true
+                        Task { await appEnv.sendNotificationTest() }
+                    }
+                    Spacer()
+                    if notificationTestSent {
+                        Text("Test sent to macOS")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(
+                    "The test only checks banners and the Open Blaise action. It never creates a meeting, recording, evidence payload, or handoff."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -247,13 +275,12 @@ struct AutomationTab: View {
                     }
                 }
             }
-            if appEnv.captureStatus.notificationsDenied && !deniedBannerDismissed {
+            if appEnv.captureStatus.notificationHealth.needsAttention && !deniedBannerDismissed {
                 Section {
                     QuietBanner(
-                        text:
-                            "Notifications are off, so the meeting-start, resume, and calendar reminders cannot appear. Auto-stop and the rejoin window still work; the menu-bar menu carries every surface. Re-enable in System Settings → Notifications → Blaise (Allow Notifications, banners on).",
+                        text: notificationBannerText,
                         systemImage: "bell.slash", tint: .orange,
-                        accessibilityPrefix: "Notifications denied")
+                        accessibilityPrefix: "Notification presentation")
                     Button("Dismiss") {
                         deniedBannerDismissed = true
                         Task {
@@ -265,6 +292,7 @@ struct AutomationTab: View {
         }
         .formStyle(.grouped)
         .task {
+            await appEnv.refreshAutomationSurfaceStatus()
             await appEnv.googleCalendar.load()
             await appEnv.googleCalendar.listCalendars()
             await appEnv.calendarSuggestions.load()
@@ -278,6 +306,69 @@ struct AutomationTab: View {
                 (try? await appEnv.settings.get(Self.deniedBannerKey, as: Bool.self))
                 ?? nil ?? false
             loaded = true
+        }
+    }
+
+    private var notificationBannerText: String {
+        switch appEnv.captureStatus.notificationHealth {
+        case .alertsDisabled:
+            return "macOS has authorized Blaise, but banners or Notification Center presentation are off. Meeting actions still stay visible in the menu-bar menu. Re-enable alerts in System Settings → Notifications → Blaise if you want banners too."
+        case .denied:
+            return "Notifications are denied, so meeting-start, resume, and calendar banners cannot appear. Auto-stop and the rejoin window still work, and the menu-bar menu carries every action. Re-enable Blaise in System Settings → Notifications."
+        case .notDetermined:
+            return "macOS has not recorded a notification choice for Blaise yet. Meeting actions remain available in the menu-bar menu."
+        case .unavailable:
+            return "Blaise could not read macOS notification settings. Meeting actions remain available in the menu-bar menu."
+        case .checking, .available:
+            return "Meeting actions remain available in the menu-bar menu."
+        }
+    }
+
+    private var notificationStatusTitle: String {
+        switch appEnv.captureStatus.notificationHealth {
+        case .checking: return "Checking"
+        case .available: return "Banners allowed"
+        case .alertsDisabled: return "Banners off"
+        case .denied: return "Denied"
+        case .notDetermined: return "Not authorized"
+        case .unavailable: return "Unavailable"
+        }
+    }
+
+    private var notificationStatusIcon: String {
+        appEnv.captureStatus.notificationHealth == .available
+            ? "bell.badge.fill" : "bell.slash.fill"
+    }
+
+    private var notificationStatusTint: AnyShapeStyle {
+        appEnv.captureStatus.notificationHealth == .available
+            ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Color.orange)
+    }
+
+    private var listenerStatusTitle: String {
+        switch appEnv.listenerStatus.state {
+        case .starting: return "Starting"
+        case .listening:
+            return appEnv.listenerStatus.lastResponse?.status == 200 ? "Connected" : "Listening"
+        case .disabledForIsolatedData: return "Off in isolated build"
+        case .unavailable: return "Unavailable"
+        }
+    }
+
+    private var listenerStatusIcon: String {
+        switch appEnv.listenerStatus.state {
+        case .listening: return "antenna.radiowaves.left.and.right"
+        case .disabledForIsolatedData: return "checkmark.shield"
+        case .starting: return "ellipsis.circle"
+        case .unavailable: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var listenerStatusTint: AnyShapeStyle {
+        switch appEnv.listenerStatus.state {
+        case .unavailable: return AnyShapeStyle(Color.orange)
+        case .listening: return AnyShapeStyle(Theme.accent)
+        case .starting, .disabledForIsolatedData: return AnyShapeStyle(.secondary)
         }
     }
 

@@ -151,4 +151,74 @@ public enum SearchSnippetFormatter {
         if !current.isEmpty { segments.append(Segment(text: current, isMatch: inMatch)) }
         return segments
     }
+
+    /// The actual stored spellings wrapped by FTS5 (not the user's possibly
+    /// unaccented/prefix query). These are safe to carry into the destination
+    /// view for exact visual highlighting.
+    public static func matchTerms(_ segments: [Segment]) -> [String] {
+        var seen = Set<String>()
+        return segments.compactMap { segment in
+            guard segment.isMatch else { return nil }
+            let term = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !term.isEmpty else { return nil }
+            let key = term.folding(
+                options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            guard seen.insert(key).inserted else { return nil }
+            return term
+        }
+    }
+}
+
+/// Splits destination text around one or more FTS match spellings. The match
+/// style is owned by SwiftUI; this pure model only identifies ranges so Notes,
+/// Transcript, accessibility labels, and tests share the same semantics.
+public enum SearchTextMatcher {
+    public typealias Segment = SearchSnippetFormatter.Segment
+
+    public static func contains(_ text: String, terms: [String]) -> Bool {
+        !segments(text, matching: terms).allSatisfy { !$0.isMatch }
+    }
+
+    public static func segments(_ text: String, matching terms: [String]) -> [Segment] {
+        let terms = SearchSnippetFormatter.matchTerms(
+            terms.map { Segment(text: $0, isMatch: true) })
+        guard !text.isEmpty, !terms.isEmpty else {
+            return text.isEmpty ? [] : [Segment(text: text, isMatch: false)]
+        }
+
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        var output: [Segment] = []
+        var cursor = text.startIndex
+
+        while cursor < text.endIndex {
+            var next: Range<String.Index>?
+            for term in terms {
+                guard let candidate = text.range(
+                    of: term, options: options, range: cursor..<text.endIndex, locale: .current)
+                else { continue }
+                if let current = next {
+                    if candidate.lowerBound < current.lowerBound
+                        || (candidate.lowerBound == current.lowerBound
+                            && text.distance(from: candidate.lowerBound, to: candidate.upperBound)
+                                > text.distance(from: current.lowerBound, to: current.upperBound))
+                    {
+                        next = candidate
+                    }
+                } else {
+                    next = candidate
+                }
+            }
+
+            guard let match = next else {
+                output.append(Segment(text: String(text[cursor...]), isMatch: false))
+                break
+            }
+            if cursor < match.lowerBound {
+                output.append(Segment(text: String(text[cursor..<match.lowerBound]), isMatch: false))
+            }
+            output.append(Segment(text: String(text[match]), isMatch: true))
+            cursor = match.upperBound
+        }
+        return output
+    }
 }

@@ -489,7 +489,7 @@ struct TrackerMonotonicGuardTests {
         let heartbeatTs = h.nowMs()
         await h.signal(kind: .heartbeat, atMs: heartbeatTs, capturedAtMs: heartbeatTs)
         h.advance(10)
-        await h.signal(kind: .callEnded, reason: "left")  // debounce starts
+        await h.signal(kind: .callEnded, reason: "pagehide")  // long reload-safe debounce
         h.advance(5)
         // Replay the earlier heartbeat: 15 s old — INSIDE the 120 s fresh
         // window, for the active code, mid-debounce. Only the monotonic
@@ -638,7 +638,7 @@ struct TrackerRecordActionTests {
 
 @Suite("C14 tracker: end-debounce + auto-stop")
 struct TrackerEndDebounceTests {
-    @Test("call-ended starts the 25 s debounce; expiry auto-stops without finalizing (grace pending)")
+    @Test("explicit Leave uses a 5 s reconnect cushion, then auto-stops")
     func debounceExpiryStops() async throws {
         let h = makeTrackerHarness()
         _ = try await startRecording(h)
@@ -646,14 +646,27 @@ struct TrackerEndDebounceTests {
         h.advance(10)
         await h.signal(kind: .callEnded, reason: "left")
         #expect(h.controller.state.with { $0.autoStopCalls }.isEmpty)  // not yet
-        h.advance(10)
+        h.advance(4)
         await h.tracker.evaluate()
-        #expect(h.controller.state.with { $0.autoStopCalls }.isEmpty)  // 10 s < 25 s
-        h.advance(16)
+        #expect(h.controller.state.with { $0.autoStopCalls }.isEmpty)  // 4 s < 5 s
+        h.advance(2)
         await h.tracker.evaluate()
         #expect(h.controller.state.with { $0.autoStopCalls } == [false])  // grace window on
         // Clean signal-confirmed end: NO watchdog notification.
         #expect(h.notifier.state.with { $0.watchdogStops }.isEmpty)
+    }
+
+    @Test("pagehide keeps the 25 s reload-safe debounce")
+    func pagehideKeepsLongDebounce() async throws {
+        let h = makeTrackerHarness()
+        _ = try await startRecording(h)
+        await h.signal(kind: .callEnded, reason: "pagehide")
+        h.advance(6)
+        await h.tracker.evaluate()
+        #expect(h.controller.state.with { $0.autoStopCalls }.isEmpty)
+        h.advance(20)
+        await h.tracker.evaluate()
+        #expect(h.controller.state.with { $0.autoStopCalls } == [false])
     }
 
     @Test("a fresh heartbeat within the debounce cancels it")
@@ -661,7 +674,7 @@ struct TrackerEndDebounceTests {
         let h = makeTrackerHarness()
         _ = try await startRecording(h)
         await h.signal(kind: .callEnded, reason: "left")
-        h.advance(10)
+        h.advance(2)
         await h.signal(kind: .heartbeat)  // Meet's automatic reconnect
         h.advance(60)
         await h.tracker.evaluate()
@@ -671,7 +684,7 @@ struct TrackerEndDebounceTests {
 
     // L-3: the start-instant race — the controller session exists but the
     // detached recordingStarted fact has not been delivered yet.
-    @Test("call-ended landing before the recordingStarted fact is buffered, not dropped (25 s stop, not watchdog)")
+    @Test("explicit Leave before the recordingStarted fact is buffered, not dropped (5 s stop)")
     func callEndedBeforeStartFactBuffered() async throws {
         let h = makeTrackerHarness()
         _ = try await h.controller.start(
@@ -682,11 +695,11 @@ struct TrackerEndDebounceTests {
         await h.tracker.recordingStarted(
             meetingID: session.meetingID, meetingCode: TrackerHarness.code, title: "Weekly sync",
             partIndex: 1)
-        h.advance(26)
+        h.advance(6)
         await h.tracker.evaluate()
         #expect(
             h.controller.state.with { $0.autoStopCalls } == [false],
-            "the buffered end anchored the debounce — stopped in ~25 s, not ~6.5 min")
+            "the buffered end anchored the explicit-leave debounce — stopped in ~5 s")
     }
 
     @Test("a fresh signal cancels a buffered pre-start-fact end (flicker absorbed)")
@@ -695,7 +708,7 @@ struct TrackerEndDebounceTests {
         _ = try await h.controller.start(
             source: .meet, title: "Weekly sync", meetingCode: TrackerHarness.code, attendees: [], anchor: nil)
         await h.signal(kind: .callEnded, reason: "left")
-        h.advance(5)
+        h.advance(2)
         await h.signal(kind: .heartbeat)  // the reconnect flicker
         let session = try #require(h.controller.state.with { $0.session })
         await h.tracker.recordingStarted(

@@ -168,14 +168,31 @@
   // snapshot-derived structural marker at the Touchpoint. Source for the
   // wait-for-end-call-button pattern: TranscripTonic (2026-06-03).
   const LEAVE_BUTTON_ARIA_LABELS = ["Leave call", "Sair da chamada"];
+  // Language-independent Material icon ligatures observed inside Meet's
+  // leave control. This is the structural fallback when Google rotates the
+  // aria-label wording or the user runs a locale outside the bounded set.
+  const LEAVE_BUTTON_ICON_TOKENS = new Set(["call_end", "call_end_alt"]);
+
+  function findLeaveButton(doc) {
+    for (const label of LEAVE_BUTTON_ARIA_LABELS) {
+      const button = doc.querySelector(`button[aria-label="${label}"]`);
+      if (button) return button;
+    }
+    for (const button of doc.querySelectorAll('button, [role="button"]')) {
+      for (const icon of button.querySelectorAll("i, span")) {
+        if (!isIconElement(icon)) continue;
+        if (LEAVE_BUTTON_ICON_TOKENS.has((icon.textContent || "").trim())) {
+          return button;
+        }
+      }
+    }
+    return null;
+  }
 
   /** True when the in-call UI is present (joined state). Pre-join preview
    * must return false: the preview has no leave-call control bar. */
   function isInCall(doc) {
-    for (const label of LEAVE_BUTTON_ARIA_LABELS) {
-      if (doc.querySelector(`button[aria-label="${label}"]`)) return true;
-    }
-    return false;
+    return findLeaveButton(doc) !== null;
   }
 
   // ---- People panel (open-only; never opened by the extension). ----
@@ -349,6 +366,7 @@
     PINNED_DATA_ATTRIBUTES,
     SELF_TILE_LABELS,
     LEAVE_BUTTON_ARIA_LABELS,
+    LEAVE_BUTTON_ICON_TOKENS,
     PIN_LABEL_TEMPLATES,
     NON_NAME_CONTAINER_SELECTOR,
     isIconElement,
@@ -357,6 +375,7 @@
     nameText,
     textLeaves,
     isInCall,
+    findLeaveButton,
     findPanelList,
     panelRows,
     panelRowName,

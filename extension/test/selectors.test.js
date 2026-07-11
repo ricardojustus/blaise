@@ -71,6 +71,17 @@ describe("strategies against the in-call fixture", () => {
     expect(S.isInCall(document)).toBe(true);
   });
 
+  it("detects a call structurally when the leave aria-label is localized differently", () => {
+    document.body.innerHTML = `
+      <main>
+        <button aria-label="Ver llamada">
+          <i class="google-symbols">call_end</i>
+        </button>
+      </main>`;
+    expect(S.findLeaveButton(document)?.getAttribute("aria-label")).toBe("Ver llamada");
+    expect(S.isInCall(document)).toBe(true);
+  });
+
   it("maps a mutated descendant to its participant node", () => {
     const bar = document.querySelector('[data-requested-participant-id="pid-2"] .bar');
     const node = S.participantNodeFor(bar);

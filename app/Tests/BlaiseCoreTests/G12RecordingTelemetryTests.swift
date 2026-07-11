@@ -86,6 +86,28 @@ struct G12RecordingTelemetryTests {
         #expect(abs(AudioRMS.rms(of: f32, bytesPerSample: 4) - 0.5) < 0.001)
     }
 
+    @Test("display mapping: realistic speech uses the visible middle and upper range")
+    func perceptualDisplayMapping() {
+        #expect(LevelMeterPresentation.fraction(rms: 0) == 0)
+        #expect(LevelMeterPresentation.decibels(rms: 0) == -.infinity)
+
+        let quietSpeech = LevelMeterPresentation.fraction(rms: 0.02)
+        let normalSpeech = LevelMeterPresentation.fraction(rms: 0.08)
+        let loudSpeech = LevelMeterPresentation.fraction(rms: 0.25)
+
+        #expect(quietSpeech > 0.4)
+        #expect(normalSpeech > quietSpeech)
+        #expect(normalSpeech > 0.65)
+        #expect(loudSpeech > 0.85)
+    }
+
+    @Test("display mapping clamps and cannot alter the silence threshold")
+    func perceptualDisplayClamps() {
+        #expect(LevelMeterPresentation.fraction(rms: -1) == 0)
+        #expect(LevelMeterPresentation.fraction(rms: 1) == 1)
+        #expect(LevelMeterChannel.silenceFloor == 0.01)
+    }
+
     // MARK: - Smoothing + silence (§2)
 
     @Test("channel: EMA smoothing settles toward the input; silence is below floor for ≥ 10 s")

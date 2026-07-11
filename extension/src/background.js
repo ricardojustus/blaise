@@ -54,18 +54,12 @@ const manager = new BlaiseEvents.DeliveryManager({
   onBadge: setBadge,
 });
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message?.type === "blaiseBatch") {
-    // Fire-and-forget: storage-write failures are surfaced by the manager
-    // (counter + badge); anything else lands in the worker console, never
-    // as an unhandled rejection. `volatile` (heartbeat-only, C14): one POST
-    // attempt, never ring-buffered.
-    manager.enqueue(message.batch, { volatile: !!message.volatile }).catch((e) => {
-      console.error("Blaise: enqueue failed", e);
-    });
-  }
-  return false;
-});
+// The handler returns literal `true` for a Blaise batch and responds only after
+// DeliveryManager finishes its acceptance path. That keeps the MV3 worker alive
+// across the async storage write instead of abandoning it when this event ends.
+chrome.runtime.onMessage.addListener(
+  BlaiseEvents.createRuntimeMessageHandler(manager),
+);
 
 // Retry alarm: chrome.alarms minimum period is 30 s (0.5 min, Chrome 120+).
 chrome.runtime.onInstalled.addListener(() => {

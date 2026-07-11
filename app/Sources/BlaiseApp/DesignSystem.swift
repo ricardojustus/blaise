@@ -80,6 +80,36 @@ enum Design {
         }
     }
 
+    /// Shared quiet card surface for lists, search, and compact status fields.
+    /// Each direction keeps its palette, while spacing and hierarchy stay
+    /// consistent across the product.
+    static var surface: Color {
+        switch direction {
+        case .caderno: return Color(red: 0.145, green: 0.122, blue: 0.098)
+        case .estudio: return Color.white.opacity(0.034)
+        case .aquarela: return Color.white.opacity(0.03)
+        case .fluido: return Color.white.opacity(0.04)
+        }
+    }
+
+    static var surfaceBorder: Color {
+        switch direction {
+        case .caderno: return accent.opacity(0.13)
+        case .estudio, .fluido: return Color.white.opacity(0.065)
+        case .aquarela: return Color.white.opacity(0.06)
+        }
+    }
+
+    static var selectionFill: Color {
+        switch direction {
+        case .caderno: return accent.opacity(0.12)
+        case .estudio, .fluido: return accent.opacity(0.105)
+        case .aquarela: return accent.opacity(0.10)
+        }
+    }
+
+    static var selectionBorder: Color { accent.opacity(0.34) }
+
     // MARK: - Reading-pane backdrop (the direction's "field")
 
     /// The detail pane's background. `tint` is the per-meeting hue
@@ -172,8 +202,8 @@ enum Design {
     /// Metadata digits (times, durations, timestamps).
     static var metaFont: Font {
         switch direction {
-        case .estudio, .fluido: return .system(size: 10.5, design: .monospaced)
-        default: return .system(size: 11).monospacedDigit()
+        case .estudio, .fluido: return .system(size: 11, design: .monospaced)
+        default: return .system(size: 11.5).monospacedDigit()
         }
     }
 

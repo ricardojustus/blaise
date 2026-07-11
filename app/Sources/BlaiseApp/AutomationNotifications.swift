@@ -10,22 +10,51 @@ import os
 // watchdog-stop recovery; registered as its own category because action
 // titles are fixed per category). Interruption level `.active` —
 // `.timeSensitive` needs a provisioned entitlement the Apple Development
-// signing flow does not carry (deliberate non-goal). No custom sounds.
+// signing flow does not carry (deliberate non-goal). Actionable alerts use
+// the system sound so meeting transitions are not visually silent.
 
 enum AutomationNotificationCategory {
     static let meetStart = "meetStart"
     static let calendarUpcoming = "calendarUpcoming"
     static let graceResume = "graceResume"
     static let handoffWarning = "handoffWarning"
+    static let diagnostics = "diagnostics"
 
     static let recordAction = "record"
     static let launchRecordAction = "launchRecord"
     static let resumeAction = "resume"
+    static let openBlaiseAction = "openBlaise"
+}
+
+/// What macOS currently allows Blaise notifications to do. A successful
+/// `UNUserNotificationCenter.add` only means macOS accepted the request; it
+/// does not prove that a banner was visible (Focus and presentation settings
+/// can still keep it quiet). The menu mirrors every action regardless.
+enum AutomationNotificationHealth: Sendable, Equatable {
+    case checking
+    case available
+    case alertsDisabled
+    case denied
+    case notDetermined
+    case unavailable
+
+    var needsAttention: Bool {
+        switch self {
+        case .alertsDisabled, .denied, .notDetermined, .unavailable: true
+        case .checking, .available: false
+        }
+    }
+}
+
+struct AutomationNotificationReceipt: Sendable, Equatable {
+    var title: String
+    var submittedAt: Date
+    var acceptedBySystem: Bool
 }
 
 /// Routed actions (default body-click and the single button behave the
 /// same — benchmark: one click anywhere).
-enum AutomationNotificationAction: Sendable {
+enum AutomationNotificationAction: Sendable, Equatable {
     case record(code: String)
     case launchRecord(eventKey: String, code: String, title: String, urlString: String)
     case resume(meetingID: MeetingID)
@@ -39,6 +68,7 @@ enum AutomationNotificationAction: Sendable {
 @MainActor protocol AutomationNotificationMirroring: AnyObject {
     func calendarReminderPosted(eventKey: String, title: String, code: String, urlString: String)
     func calendarReminderWithdrawn(eventKey: String)
+    func notificationRequestCompleted(title: String, submittedAt: Date, acceptedBySystem: Bool)
 }
 
 final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
@@ -62,6 +92,9 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         let resume = UNNotificationAction(
             identifier: AutomationNotificationCategory.resumeAction, title: "Resume",
             options: [])
+        let openBlaise = UNNotificationAction(
+            identifier: AutomationNotificationCategory.openBlaiseAction, title: "Open Blaise",
+            options: [.foreground])
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: AutomationNotificationCategory.meetStart, actions: [record],
@@ -75,6 +108,9 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
             // No button — a body click activates Blaise and opens the queue.
             UNNotificationCategory(
                 identifier: AutomationNotificationCategory.handoffWarning, actions: [],
+                intentIdentifiers: []),
+            UNNotificationCategory(
+                identifier: AutomationNotificationCategory.diagnostics, actions: [openBlaise],
                 intentIdentifiers: []),
         ])
     }
@@ -90,9 +126,32 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         }
     }
 
-    func authorizationDenied() async -> Bool {
+    func notificationHealth() async -> AutomationNotificationHealth {
         let settings = await center.notificationSettings()
-        return settings.authorizationStatus == .denied
+        return Self.notificationHealth(
+            authorizationStatus: settings.authorizationStatus,
+            alertSetting: settings.alertSetting,
+            notificationCenterSetting: settings.notificationCenterSetting)
+    }
+
+    static func notificationHealth(
+        authorizationStatus: UNAuthorizationStatus,
+        alertSetting: UNNotificationSetting,
+        notificationCenterSetting: UNNotificationSetting
+    ) -> AutomationNotificationHealth {
+        switch authorizationStatus {
+        case .denied:
+            return .denied
+        case .notDetermined:
+            return .notDetermined
+        case .authorized, .provisional, .ephemeral:
+            if alertSetting == .disabled || notificationCenterSetting == .disabled {
+                return .alertsDisabled
+            }
+            return .available
+        @unknown default:
+            return .unavailable
+        }
     }
 
     // MARK: - AutomationNotifying
@@ -103,6 +162,7 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         content.body = title.map { "\(code) — \($0)" } ?? code
         content.categoryIdentifier = AutomationNotificationCategory.meetStart
         content.interruptionLevel = .active
+        content.sound = .default
         content.userInfo = ["meetingCode": code]
         await post(id: meetStartID(code), content: content)
     }
@@ -124,6 +184,7 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
             content.body = title
         }
         content.interruptionLevel = .active
+        content.sound = .default
         content.userInfo = ["meetingID": meetingID]
         await post(id: "blaise.watchdog.\(meetingID)", content: content)
     }
@@ -145,6 +206,7 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         content.body =
             "\(title) — both audio tracks were silent. Resume from the Blaise menu if the meeting is still going."
         content.interruptionLevel = .active
+        content.sound = .default
         content.userInfo = ["meetingID": meetingID]
         await post(id: "blaise.silenceautopause.\(meetingID)", content: content)
     }
@@ -154,6 +216,7 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         content.title = "Recording running — no Meet signals yet"
         content.body = "\(title) — check that the meeting was joined in Chrome with the extension."
         content.interruptionLevel = .active
+        content.sound = .default
         content.userInfo = ["meetingID": meetingID]
         await post(id: "blaise.nudge.\(meetingID)", content: content)
     }
@@ -169,6 +232,7 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         content.body = "Starts at \(formatter.string(from: start)) — opens in Google Chrome"
         content.categoryIdentifier = AutomationNotificationCategory.calendarUpcoming
         content.interruptionLevel = .active
+        content.sound = .default
         let url = urlString ?? "https://meet.google.com/\(code)"
         content.userInfo = [
             "eventKey": eventKey, "meetingCode": code, "title": title, "url": url,
@@ -200,6 +264,7 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
             + "\(warning.sinceLabel()). Last error: \(warning.shortReason)"
         content.categoryIdentifier = AutomationNotificationCategory.handoffWarning
         content.interruptionLevel = .active
+        content.sound = .default
         await post(id: Self.handoffWarningID, content: content)
     }
 
@@ -218,19 +283,44 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         content.title = "Couldn't open Google Chrome"
         content.body = "\(title) — open the Meet link in Chrome manually, then click Record."
         content.interruptionLevel = .active
+        content.sound = .default
         await post(id: "blaise.chromefail.\(UUID().uuidString)", content: content)
+    }
+
+    /// User-invoked smoke only: no tracker signal, meeting, recording,
+    /// evidence, or handoff is created. This proves banners and their action
+    /// category for the exact app identity currently running.
+    func postDiagnosticsTest() async {
+        let content = UNMutableNotificationContent()
+        content.title = "Blaise notification test"
+        content.body = "Banners and notification actions are working."
+        content.categoryIdentifier = AutomationNotificationCategory.diagnostics
+        content.interruptionLevel = .active
+        content.sound = .default
+        await post(id: "blaise.diagnostics.\(UUID().uuidString)", content: content)
     }
 
     private func meetStartID(_ code: String) -> String { "blaise.meetstart.\(code)" }
     private func calendarID(_ key: String) -> String { "blaise.calendar.\(key)" }
 
     private func post(id: String, content: UNNotificationContent) async {
+        let acceptedBySystem: Bool
         do {
             try await center.add(
                 UNNotificationRequest(identifier: id, content: content, trigger: nil))
+            acceptedBySystem = true
+            logger.info("notification request submitted to macOS (\(id, privacy: .public))")
         } catch {
             // Denied / restricted: the menu-bar surfaces carry the load.
+            acceptedBySystem = false
             logger.notice("notification post failed (\(id, privacy: .public)): \(error)")
+        }
+        let mirror = self.mirror
+        let title = content.title
+        let submittedAt = Date()
+        await MainActor.run {
+            mirror?.notificationRequestCompleted(
+                title: title, submittedAt: submittedAt, acceptedBySystem: acceptedBySystem)
         }
     }
 
@@ -259,27 +349,33 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         // Default (body click) and the single button behave the same;
         // dismiss = decline (the suppression record stands).
         guard actionID != UNNotificationDismissActionIdentifier else { return }
-        let action: AutomationNotificationAction?
-        switch content.categoryIdentifier {
+        let action = Self.action(
+            categoryIdentifier: content.categoryIdentifier, userInfo: info)
+        if let action, let onAction {
+            await onAction(action)
+        }
+    }
+
+    static func action(
+        categoryIdentifier: String, userInfo info: [AnyHashable: Any]
+    ) -> AutomationNotificationAction? {
+        switch categoryIdentifier {
         case AutomationNotificationCategory.meetStart:
-            action = (info["meetingCode"] as? String).map { .record(code: $0) }
+            return (info["meetingCode"] as? String).map { .record(code: $0) }
         case AutomationNotificationCategory.calendarUpcoming:
             if let key = info["eventKey"] as? String, let code = info["meetingCode"] as? String,
                 let title = info["title"] as? String, let url = info["url"] as? String
             {
-                action = .launchRecord(eventKey: key, code: code, title: title, urlString: url)
-            } else {
-                action = nil
+                return .launchRecord(eventKey: key, code: code, title: title, urlString: url)
             }
+            return nil
         case AutomationNotificationCategory.graceResume:
-            action = (info["meetingID"] as? String).map { .resume(meetingID: $0) }
-        case AutomationNotificationCategory.handoffWarning:
-            action = .openMainWindow
+            return (info["meetingID"] as? String).map { .resume(meetingID: $0) }
+        case AutomationNotificationCategory.handoffWarning,
+             AutomationNotificationCategory.diagnostics:
+            return .openMainWindow
         default:
-            action = nil
-        }
-        if let action, let onAction {
-            await onAction(action)
+            return nil
         }
     }
 }

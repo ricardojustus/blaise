@@ -39,18 +39,24 @@ final class CaptureStatusHolder {
     /// Transient start/stop failure surfaced in the menu (no notifications).
     var lastActionError: String?
 
-    // C14 automation surfaces (the menu is the load-bearing equivalent of
-    // every notification when notifications are denied).
+    // C14 automation surfaces. These are always visible in the menu: macOS can
+    // accept a notification request without presenting a banner (Focus,
+    // disabled alerts, or Notification Center settings), so permission alone
+    // must never decide whether Blaise exposes an automation action.
     /// Standing grace windows, soonest expiry first (back-to-back meetings
     /// can hold several at once; the menu shows the soonest plus a count).
     var graceWindows: [(meetingID: MeetingID, code: String, title: String, until: Date)] = []
-    var notificationsDenied = false
+    var notificationHealth: AutomationNotificationHealth = .checking
+    var lastNotificationReceipt: AutomationNotificationReceipt?
     /// Live Meet call with no recording ("Meeting detected — Record").
     var detectedMeeting: (code: String, title: String?)?
     /// 15-minute zero-signal nudge line.
     var nudgeMessage: String?
     /// Calendar pre-meeting reminder mirror (denied-mode menu line).
     var calendarReminder: (eventKey: String, title: String, code: String, urlString: String)?
+    /// High-confidence Meet leave received; capture remains live only for the
+    /// short reconnect cushion ending at this deadline.
+    var meetingEndPendingUntil: Date?
 
     private var machine = IndicatorStateMachine()
 
@@ -82,6 +88,13 @@ extension CaptureStatusHolder: AutomationNotificationMirroring {
         if calendarReminder?.eventKey == eventKey {
             calendarReminder = nil
         }
+    }
+
+    func notificationRequestCompleted(
+        title: String, submittedAt: Date, acceptedBySystem: Bool
+    ) {
+        lastNotificationReceipt = AutomationNotificationReceipt(
+            title: title, submittedAt: submittedAt, acceptedBySystem: acceptedBySystem)
     }
 }
 
@@ -286,137 +299,236 @@ struct RecordingMenuCommandButton: View {
 
 struct RecordingMenuView: View {
     @Environment(AppEnvironment.self) private var appEnv
+    @State private var menuContentHeight: CGFloat = 300
     // Hosted in an AppKit NSPopover (not a SwiftUI scene), so `\.openWindow` is
     // unavailable. Window-opening is routed through `uiState.openMainWindowRequest`,
     // which StatusBarController observes and fulfills via AppKit.
 
     var body: some View {
         let status = appEnv.captureStatus
-        let calendar = appEnv.calendarSuggestions
 
-        Group {
-            switch status.state {
-            case .recording(let startedAt):
-                recordingSection(startedAt: startedAt, warning: nil)
-            case .warning(let startedAt, let message):
-                recordingSection(startedAt: startedAt, warning: message)
-            case .alarm(let message):
-                // Loud post-stop failure: visible until dismissed or the
-                // next successful start — and recording stays STARTABLE.
-                Text("⚠ \(message)")
-                Button("Dismiss Warning") {
-                    status.apply(.alarmAcknowledged)
-                }
-                Divider()
-                startSection(calendar: calendar)
-            case .processing:
-                Text("Processing\(status.activeMeetingTitle.map { " — \($0)" } ?? "")…")
-                // Back-to-back meetings: the next recording can start while
-                // the previous one is still processing.
-                Divider()
-                startSection(calendar: calendar)
-            case .grace(let title, let until):
-                graceSection(
-                    title: title, until: until,
-                    moreWaiting: max(0, status.graceWindows.count - 1))
-                Divider()
-                startSection(calendar: calendar)
-            case .paused(let title, let accumulatedSeconds):
-                // G9 three-state model: a held-open meeting offers Resume and
-                // End & process. A new start is REFUSED while paused (the
-                // controller's predicate), so no start section here — the
-                // user must decide about the paused meeting first.
-                pausedSection(title: title, accumulatedSeconds: accumulatedSeconds)
-            case .idle:
-                startSection(calendar: calendar)
-            }
+        VStack(spacing: 0) {
+            menuHeader(status: status)
+            Divider().opacity(0.55)
 
-            // C14 denied-notifications surfaces: the menu is the
-            // load-bearing equivalent of every notification.
-            if status.notificationsDenied {
-                if let detected = status.detectedMeeting, !status.isRecording {
-                    Divider()
-                    Text("Meeting detected — \(detected.title ?? detected.code)")
-                    Button("Record \(detected.code)") {
-                        Task { await appEnv.recordDetectedMeeting(code: detected.code) }
-                    }
-                }
-                if let reminder = status.calendarReminder {
-                    Divider()
-                    Button("Launch & Record: \(reminder.title)") {
-                        Task {
-                            await appEnv.launchAndRecord(
-                                eventKey: reminder.eventKey, code: reminder.code,
-                                title: reminder.title, urlString: reminder.urlString)
+            // Track the natural content height so ordinary states stay compact.
+            // Dense combinations are capped and scroll instead of stretching
+            // the popover beyond a comfortable menu height.
+            ScrollView {
+                menuContent(status: status)
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: RecordingMenuContentHeightKey.self,
+                                value: proxy.size.height)
                         }
                     }
-                }
-                if let nudge = status.nudgeMessage {
-                    Divider()
-                    Text(nudge)
-                }
+            }
+            .frame(height: min(ceil(menuContentHeight), 460))
+            .onPreferenceChange(RecordingMenuContentHeightKey.self) { height in
+                guard height > 0 else { return }
+                menuContentHeight = height
             }
 
+            Divider().opacity(0.55)
+            menuFooter(status: status)
+        }
+        .frame(width: 370)
+        .background(.regularMaterial)
+        .preferredColorScheme(.dark)
+        .tint(Theme.accent)
+        .task {
+            // Neither operation prompts. Re-read both calendar rows and macOS
+            // notification presentation settings each time the menu opens.
+            async let calendar: Void = appEnv.refreshCalendarSurfaces()
+            async let automation: Void = appEnv.refreshAutomationSurfaceStatus()
+            _ = await (calendar, automation)
+        }
+    }
+
+    @ViewBuilder
+    private func menuContent(status: CaptureStatusHolder) -> some View {
+        VStack(spacing: 10) {
+            RecordingMenuCard(tint: captureTint(status.state)) {
+                captureSection(status: status, calendar: appEnv.calendarSuggestions)
+            }
+
+            // Always mirror live automation actions in-app. A granted
+            // notification permission does not prove that Focus or
+            // presentation settings showed the banner.
+            if let detected = status.detectedMeeting, !status.isRecording {
+                detectedMeetingCard(detected, paused: status.isPaused)
+            }
+            if let reminder = status.calendarReminder {
+                calendarReminderCard(reminder)
+            }
+            if let nudge = status.nudgeMessage {
+                messageCard(
+                    title: "Check Meet connection", message: nudge,
+                    systemImage: "waveform.badge.exclamationmark", tint: .orange,
+                    dismiss: { status.nudgeMessage = nil })
+            }
             if let error = status.lastActionError {
-                Divider()
-                Text(error)
+                messageCard(
+                    title: "Recording action failed", message: error,
+                    systemImage: "exclamationmark.triangle.fill", tint: .orange,
+                    dismiss: { status.lastActionError = nil })
             }
-
-            // Handoff persistent-failure warning: the badge's explanation
-            // (the badge alone would be mysterious) + the retry affordance.
             if let warning = appEnv.handoffStatus.snapshot.warning {
-                Divider()
-                Text(warning.message())
-                Button("Retry Delivery Now") {
-                    Task { await appEnv.retryHandoffNow() }
+                RecordingMenuCard(tint: .orange) {
+                    Label("Delivery needs attention", systemImage: "externaldrive.badge.exclamationmark")
+                        .font(.headline)
+                    Text(warning.message())
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Button("Retry Delivery Now") {
+                        Task { await appEnv.retryHandoffNow() }
+                    }
+                    .buttonStyle(.bordered)
                 }
             }
 
-            Divider()
+            automationStatusCard
+        }
+        .padding(12)
+    }
 
-            Button("Open Blaise") {
-                appEnv.uiState.openMainWindowRequest += 1
+    private func menuHeader(status: CaptureStatusHolder) -> some View {
+        let visualState = BlaiseStatusIcon.visualState(
+            for: status.state,
+            handoffWarning: appEnv.handoffStatus.snapshot.warning != nil,
+            meetingDetected: status.detectedMeeting != nil)
+        return HStack(spacing: 9) {
+            Image(nsImage: BlaiseStatusIcon.image(for: visualState))
+                .resizable()
+                .scaledToFit()
+                .frame(width: 24, height: 24)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Blaise").font(.headline)
+                Text(headerSubtitle(status))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            if let last = status.lastMeeting {
-                Button("Last Meeting: \(last.title)") {
-                    appEnv.uiState.selectedMeetingID = last.id
-                    appEnv.uiState.openMainWindowRequest += 1
-                }
+            Spacer()
+            if status.isRecording {
+                Text(status.meetingEndPendingUntil == nil ? "REC" : "ENDING")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Design.recording, in: Capsule())
+            } else if status.detectedMeeting != nil {
+                Text("MEETING FOUND")
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                    .foregroundStyle(Theme.accent)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Theme.accent.opacity(0.12), in: Capsule())
             }
         }
-        .onAppear {
-            // Refresh suggestions/upcoming rows when the menu opens (no prompt).
-            Task {
-                await appEnv.refreshCalendarSurfaces()
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+    }
+
+    @ViewBuilder
+    private func captureSection(
+        status: CaptureStatusHolder, calendar: CalendarSuggestionProvider
+    ) -> some View {
+        switch status.state {
+        case .recording(let startedAt):
+            recordingSection(startedAt: startedAt, warning: nil)
+        case .warning(let startedAt, let message):
+            recordingSection(startedAt: startedAt, warning: message)
+        case .alarm(let message):
+            Label("Recording may need attention", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text(message).font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Button("Dismiss") { status.apply(.alarmAcknowledged) }
+                    .buttonStyle(.bordered)
+                Spacer()
             }
+            Divider().opacity(0.5)
+            startSection(calendar: calendar)
+        case .processing:
+            Label("Processing meeting", systemImage: "arrow.triangle.2.circlepath")
+                .font(.headline)
+            if let title = status.activeMeetingTitle {
+                Text(title).font(.callout).foregroundStyle(.secondary)
+            }
+            ProgressView().controlSize(.small)
+            Divider().opacity(0.5)
+            startSection(calendar: calendar)
+        case .grace(let title, let until):
+            graceSection(
+                title: title, until: until,
+                moreWaiting: max(0, status.graceWindows.count - 1))
+            Divider().opacity(0.5)
+            startSection(calendar: calendar)
+        case .paused(let title, let accumulatedSeconds):
+            pausedSection(title: title, accumulatedSeconds: accumulatedSeconds)
+        case .idle:
+            startSection(calendar: calendar)
         }
     }
 
     @ViewBuilder
     private func recordingSection(startedAt: Date, warning: String?) -> some View {
         if let warning {
-            Text("⚠ \(warning)")
+            Label(warning, systemImage: "exclamationmark.circle.fill")
+                .font(.callout)
+                .foregroundStyle(.orange)
+        }
+        if let until = appEnv.captureStatus.meetingEndPendingUntil {
+            TimelineView(.periodic(from: menuTickAnchor, by: 1)) { context in
+                let seconds = max(0, Int(ceil(until.timeIntervalSince(context.date))))
+                Label(
+                    seconds > 0
+                        ? "Meet ended — stopping in \(seconds)s"
+                        : "Meet ended — stopping…",
+                    systemImage: "hourglass")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(Theme.accent)
+            }
         }
         let title = appEnv.captureStatus.activeMeetingTitle ?? "Recording"
         // TimelineView so the elapsed time ticks while the menu is open.
         TimelineView(.periodic(from: menuTickAnchor, by: 1)) { context in
-            Text("\(title) — \(Self.elapsed(since: startedAt, now: context.date))")
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.headline).lineLimit(1)
+                    Text("Recording in progress")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(Self.elapsed(since: startedAt, now: context.date))
+                    .font(.system(.title3, design: .monospaced, weight: .semibold))
+                    .foregroundStyle(Design.recording)
+            }
         }
         // G12 §2: the two-channel level meter in the dropdown too — the
         // "is it hearing me/others?" glance without opening the main window.
         LevelMeterView(holder: appEnv.levelMeter)
         if appEnv.captureStatus.processingMeetingID != nil {
-            Text("Still processing the previous meeting…")
+            Label("Still processing the previous meeting", systemImage: "arrow.triangle.2.circlepath")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         // G9 three-state model: Pause holds the meeting open (resume later or
         // end & process from pause); Stop finalizes and processes now.
-        Button("Pause Recording") {
-            Task { await appEnv.pauseRecording() }
+        HStack {
+            Button("Pause") { Task { await appEnv.pauseRecording() } }
+                .buttonStyle(.bordered)
+            Spacer()
+            Button("Stop & Process") { Task { await appEnv.stopRecording() } }
+                .buttonStyle(.borderedProminent)
+                .tint(Design.recording)
+                .keyboardShortcut("r", modifiers: [.option, .command])
         }
-        Button("Stop Recording") {
-            Task { await appEnv.stopRecording() }
-        }
-        .keyboardShortcut("r", modifiers: [.option, .command])
     }
 
     /// G9 paused section: the held-open meeting with its accumulated recorded
@@ -425,41 +537,55 @@ struct RecordingMenuView: View {
     /// first.
     @ViewBuilder
     private func pausedSection(title: String, accumulatedSeconds: TimeInterval) -> some View {
-        Text("Paused — \(title) (\(Self.duration(accumulatedSeconds)) recorded)")
-        Button("Resume Recording") {
-            Task { await appEnv.resumePausedRecording() }
-        }
-        // M-8: disabled until the launch orphan-CAF sweep reports done.
-        .disabled(!appEnv.canResumePaused)
-        Button("End & Process") {
-            Task { await appEnv.endPausedRecording() }
+        Label("Recording paused", systemImage: "pause.circle.fill")
+            .font(.headline)
+            .foregroundStyle(Theme.accent)
+        Text(title).font(.callout)
+        Text("\(Self.duration(accumulatedSeconds)) recorded")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+        HStack {
+            Button("End & Process") { Task { await appEnv.endPausedRecording() } }
+                .buttonStyle(.bordered)
+            Spacer()
+            Button("Resume") { Task { await appEnv.resumePausedRecording() } }
+                .buttonStyle(.borderedProminent)
+                // M-8: disabled until the launch orphan-CAF sweep reports done.
+                .disabled(!appEnv.canResumePaused)
         }
     }
 
     /// C14 grace section: "Waiting for rejoin (m:ss)" countdown + Resume +
-    /// Finalize now. The load-bearing recovery surface when notifications
-    /// are denied. Shows the SOONEST-expiring window (Resume/Finalize act on
+    /// Finalize now. Shows the SOONEST-expiring window (Resume/Finalize act on
     /// it) plus a count when more back-to-back windows are standing.
     @ViewBuilder
     private func graceSection(title: String, until: Date, moreWaiting: Int) -> some View {
         TimelineView(.periodic(from: menuTickAnchor, by: 1)) { context in
             let remaining = max(0, Int(until.timeIntervalSince(context.date)))
-            Text("Waiting for rejoin (\(remaining / 60):\(String(format: "%02d", remaining % 60))) — \(title)")
+            VStack(alignment: .leading, spacing: 3) {
+                Label("Waiting for Meet rejoin", systemImage: "arrow.clockwise.circle")
+                    .font(.headline)
+                Text(title).font(.callout)
+                Text("Finalizes in \(remaining / 60):\(String(format: "%02d", remaining % 60))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
         }
         if moreWaiting > 0 {
             Text("\(moreWaiting) more meeting\(moreWaiting == 1 ? "" : "s") waiting to finalize")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        Button("Resume Recording") {
-            Task { await appEnv.resumeFromGrace() }
-        }
-        // M-1: Pause the grace meeting (converts grace→paused). The control
-        // during an active grace window — the real production caller of the
-        // tracker's grace→paused conversion.
-        Button("Pause") {
-            Task { await appEnv.pauseGraceMeeting() }
-        }
-        Button("Finalize Now") {
-            Task { await appEnv.finalizeGraceNow() }
+        HStack {
+            Menu("More") {
+                // M-1: converts grace→paused.
+                Button("Pause Meeting") { Task { await appEnv.pauseGraceMeeting() } }
+                Button("Finalize Now") { Task { await appEnv.finalizeGraceNow() } }
+            }
+            .menuStyle(.button)
+            Spacer()
+            Button("Resume") { Task { await appEnv.resumeFromGrace() } }
+                .buttonStyle(.borderedProminent)
         }
     }
 
@@ -470,7 +596,7 @@ struct RecordingMenuView: View {
         let clipboardCode = NSPasteboard.general.string(forType: .string)
             .flatMap { MeetLinkParser.meetingCode(from: $0) }
 
-        Menu("Start Recording") {
+        Menu {
             Button(clipboardCode.map { "Google Meet (\($0) from clipboard)" } ?? "Google Meet") {
                 Task { await appEnv.startRecording(source: .meet, meetingCode: clipboardCode) }
             }
@@ -478,40 +604,313 @@ struct RecordingMenuView: View {
             Button("Zoom") { Task { await appEnv.startRecording(source: .zoom) } }
             Button("Teams") { Task { await appEnv.startRecording(source: .teams) } }
             Button("In Person") { Task { await appEnv.startRecording(source: .inPerson) } }
+        } label: {
+            Label("Start Recording", systemImage: "record.circle")
+                .frame(maxWidth: .infinity)
         }
+        .menuStyle(.button)
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
 
         if !calendar.upcomingRows.isEmpty {
-            Divider()
-            Text("Upcoming")
-            ForEach(calendar.upcomingRows.prefix(4)) { row in
-                Button("\(Self.time(row.start)) Record: \(Self.menuTitle(row.title))") {
-                    Task { await appEnv.startRecording(upcoming: row) }
-                }
-                if row.offersLaunchAndRecord {
-                    Button("\(Self.time(row.start)) Launch: \(Self.menuTitle(row.title))") {
-                        Task { await appEnv.launchAndRecord(upcoming: row) }
+            Text("UPCOMING")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 3)
+            ForEach(calendar.upcomingRows.prefix(3)) { row in
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(Self.menuTitle(row.title)).font(.callout).lineLimit(1)
+                        Text(Self.time(row.start))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
+                    Spacer()
+                    if row.offersLaunchAndRecord {
+                        Button {
+                            Task { await appEnv.launchAndRecord(upcoming: row) }
+                        } label: {
+                            Image(systemName: "video.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Launch in Chrome and record")
+                    }
+                    Button("Record") { Task { await appEnv.startRecording(upcoming: row) } }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                 }
             }
         }
 
         switch calendar.access {
         case .granted:
-            if calendar.suggestions.isEmpty {
-                Text("No calendar events near now")
-            } else {
-                ForEach(Array(calendar.suggestions.enumerated()), id: \.offset) { _, suggestion in
-                    Button("Start: \(suggestion.title) (\(Self.time(suggestion.start)))") {
-                        Task { await appEnv.startRecording(suggestion: suggestion) }
-                    }
-                }
-            }
+            EmptyView()
         case .notDetermined:
-            Button("Enable Apple Calendar…") {
+            Button("Connect Apple Calendar…") {
                 Task { await calendar.requestAccessAndLoad(userEmail: appEnv.userEmail) }
             }
+            .buttonStyle(.plain)
+            .font(.caption)
+            .foregroundStyle(.secondary)
         case .denied:
-            Text("Apple Calendar off (System Settings → Privacy)")
+            Label("Apple Calendar is off", systemImage: "calendar.badge.exclamationmark")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func detectedMeetingCard(
+        _ detected: (code: String, title: String?), paused: Bool
+    ) -> some View {
+        RecordingMenuCard(tint: Theme.accent) {
+            HStack(spacing: 7) {
+                Image(nsImage: BlaiseStatusIcon.image(for: .meetingDetected))
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 18, height: 18)
+                    .accessibilityHidden(true)
+                Text("Meeting detected")
+                    .font(.headline)
+                    .foregroundStyle(Theme.accent)
+            }
+            Text(detected.title ?? "Google Meet")
+                .font(.callout.weight(.medium))
+                .lineLimit(2)
+            Text(detected.code)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            if paused {
+                Text("Finish or resume the paused recording first.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            HStack {
+                Button("Not This Meeting") {
+                    Task { await appEnv.dismissDetectedMeeting(code: detected.code) }
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+                Button("Record Now") {
+                    Task { await appEnv.recordDetectedMeeting(code: detected.code) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(paused)
+            }
+        }
+    }
+
+    private func calendarReminderCard(
+        _ reminder: (eventKey: String, title: String, code: String, urlString: String)
+    ) -> some View {
+        RecordingMenuCard(tint: Design.support) {
+            Label("Calendar meeting ready", systemImage: "calendar.badge.clock")
+                .font(.headline)
+                .foregroundStyle(Design.support)
+            Text(reminder.title).font(.callout.weight(.medium)).lineLimit(2)
+            HStack {
+                Button("Dismiss") {
+                    Task { await appEnv.dismissCalendarReminder(eventKey: reminder.eventKey) }
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+                Button("Launch & Record") {
+                    Task {
+                        await appEnv.launchAndRecord(
+                            eventKey: reminder.eventKey, code: reminder.code,
+                            title: reminder.title, urlString: reminder.urlString)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+
+    private func messageCard(
+        title: String, message: String, systemImage: String, tint: Color,
+        dismiss: @escaping @MainActor () -> Void
+    ) -> some View {
+        RecordingMenuCard(tint: tint) {
+            HStack(alignment: .top) {
+                Label(title, systemImage: systemImage)
+                    .font(.headline)
+                    .foregroundStyle(tint)
+                Spacer()
+                Button(action: dismiss) {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Dismiss")
+            }
+            Text(message).font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
+    private var automationStatusCard: some View {
+        let listener = listenerPresentation
+        let notifications = notificationPresentation
+        let degraded = listener.needsAttention || notifications.needsAttention
+
+        return RecordingMenuCard(tint: degraded ? .orange : .green) {
+            Text("AUTOMATION STATUS")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.tertiary)
+            statusRow(
+                systemImage: listener.systemImage, tint: listener.tint,
+                title: listener.title, detail: listener.detail)
+            Divider().opacity(0.35)
+            statusRow(
+                systemImage: notifications.systemImage, tint: notifications.tint,
+                title: notifications.title, detail: notifications.detail)
+        }
+    }
+
+    private func statusRow(
+        systemImage: String, tint: Color, title: String, detail: String
+    ) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: systemImage)
+                .frame(width: 16)
+                .foregroundStyle(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.caption.weight(.semibold))
+                Text(detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private typealias StatusPresentation = (
+        title: String, detail: String, systemImage: String, tint: Color, needsAttention: Bool
+    )
+
+    private var listenerPresentation: StatusPresentation {
+        let holder = appEnv.listenerStatus
+        switch holder.state {
+        case .starting:
+            return ("Meet listener starting", "Preparing the local Chrome connection.",
+                    "ellipsis.circle", .secondary, false)
+        case .disabledForIsolatedData:
+            return ("Meet listener off in test build",
+                    "This isolated copy cannot take over the live app’s connection.",
+                    "checkmark.shield", .green, false)
+        case .unavailable:
+            return ("Meet listener unavailable",
+                    "Chrome events are buffering; Blaise retries the connection every minute.",
+                    "exclamationmark.triangle.fill", .orange, true)
+        case .listening:
+            guard let response = holder.lastResponse else {
+                return ("Waiting for Chrome extension",
+                        "Listener is ready; no Meet event has arrived since Blaise launched.",
+                        "antenna.radiowaves.left.and.right", .secondary, false)
+            }
+            switch response.status {
+            case 200:
+                return ("Meet extension connected",
+                        "Last batch accepted \(Self.relativeAge(response.receivedAt)).",
+                        "checkmark.circle.fill", .green, false)
+            case 401:
+                return ("Meet extension secret rejected",
+                        "Chrome reached Blaise, but the shared secret was missing or did not match.",
+                        "key.slash.fill", .orange, true)
+            case 400:
+                return ("Meet batch rejected",
+                        "Chrome reached Blaise, but the batch format was unusable.",
+                        "exclamationmark.triangle.fill", .orange, true)
+            default:
+                return ("Meet event will retry",
+                        "Chrome reached Blaise, but local acceptance failed.",
+                        "arrow.clockwise.circle.fill", .orange, true)
+            }
+        }
+    }
+
+    private var notificationPresentation: StatusPresentation {
+        let status = appEnv.captureStatus
+        let latest = status.lastNotificationReceipt
+        if let latest, !latest.acceptedBySystem {
+            return ("Notification request failed",
+                    "The action is still available here in the Blaise menu.",
+                    "bell.badge.slash.fill", .orange, true)
+        }
+        switch status.notificationHealth {
+        case .checking:
+            return ("Checking notifications", "Reading macOS presentation settings.",
+                    "ellipsis.circle", .secondary, false)
+        case .available:
+            let detail = latest.map {
+                "Sent “\($0.title)” to macOS \(Self.relativeAge($0.submittedAt)); Focus can still keep it quiet."
+            } ?? "Banners are allowed; Focus can still keep them quiet. Actions always appear here."
+            return ("Notification banners allowed", detail, "bell.fill", .green, false)
+        case .alertsDisabled:
+            return ("Notification banners are off",
+                    "macOS may keep alerts in the background; actions always appear here.",
+                    "bell.slash.fill", .orange, true)
+        case .denied:
+            return ("Notifications denied",
+                    "Enable Blaise in System Settings if you want banners; actions still appear here.",
+                    "bell.slash.fill", .orange, true)
+        case .notDetermined:
+            return ("Notifications not authorized",
+                    "Blaise has not received a macOS notification decision yet.",
+                    "bell.badge.fill", .orange, true)
+        case .unavailable:
+            return ("Notification status unavailable",
+                    "Blaise could not read macOS notification settings.",
+                    "bell.badge.exclamationmark.fill", .orange, true)
+        }
+    }
+
+    private func menuFooter(status: CaptureStatusHolder) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                appEnv.uiState.openMainWindowRequest += 1
+            } label: {
+                Label("Open Blaise", systemImage: "macwindow")
+            }
+            .buttonStyle(.plain)
+            .font(.callout.weight(.medium))
+            Spacer()
+            if let last = status.lastMeeting {
+                Button {
+                    appEnv.uiState.selectedMeetingID = last.id
+                    appEnv.uiState.openMainWindowRequest += 1
+                } label: {
+                    Label("Last Meeting", systemImage: "clock.arrow.circlepath")
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(last.title)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    private func headerSubtitle(_ status: CaptureStatusHolder) -> String {
+        if status.meetingEndPendingUntil != nil {
+            return "Meet ended — finishing capture"
+        }
+        return switch status.state {
+        case .recording, .warning: "Capturing this meeting"
+        case .alarm: "Recording needs attention"
+        case .processing: "Turning the last meeting into memory"
+        case .grace: "Waiting for a quick rejoin"
+        case .paused: "Meeting held open"
+        case .idle: status.detectedMeeting == nil ? "Ready to remember" : "Ready to record this call"
+        }
+    }
+
+    private func captureTint(_ state: IndicatorState) -> Color {
+        switch state {
+        case .recording, .warning: Design.recording
+        case .alarm: .orange
+        case .processing, .grace, .paused: Theme.accent
+        case .idle: .white
         }
     }
 
@@ -537,6 +936,16 @@ struct RecordingMenuView: View {
         return String(trimmed.prefix(15)) + "…"
     }
 
+    private static func relativeAge(_ date: Date, now: Date = Date()) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(date)))
+        if seconds < 10 { return "just now" }
+        if seconds < 60 { return "\(seconds)s ago" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        return "\(hours)h ago"
+    }
+
     /// G9 accumulated recorded time (sum of part durations) for the paused
     /// display. Mirrors `elapsed`'s mm:ss / h:mm:ss formatting.
     static func duration(_ seconds: TimeInterval) -> String {
@@ -546,5 +955,39 @@ struct RecordingMenuView: View {
         let s = total % 60
         return h > 0
             ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
+    }
+}
+
+private struct RecordingMenuContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct RecordingMenuCard<Content: View>: View {
+    let tint: Color
+    @ViewBuilder let content: Content
+
+    init(tint: Color, @ViewBuilder content: () -> Content) {
+        self.tint = tint
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(11)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.white.opacity(0.045))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(tint.opacity(0.22), lineWidth: 1)
+        }
     }
 }

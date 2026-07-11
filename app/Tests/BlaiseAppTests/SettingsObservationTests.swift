@@ -54,12 +54,12 @@ struct SettingsObservationTests {
         holder.apply(.captureStarted(at: Date(timeIntervalSince1970: 0)))
 
         // The ONLY `captureStatus` property the Settings scene reads is
-        // `notificationsDenied` (AutomationTab's denied banner). Track exactly
+        // `notificationHealth` (AutomationTab's presentation banner). Track exactly
         // that — the Settings root and the scene body read no `state`-derived
         // property after the fix.
         let settings = InvalidationCounter()
         withObservationTracking {
-            _ = holder.notificationsDenied
+            _ = holder.notificationHealth
         } onChange: {
             MainActor.assumeIsolated { settings.bump() }
         }

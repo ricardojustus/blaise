@@ -47,7 +47,7 @@ struct G12LevelMeterObservationTests {
         let capture = CaptureStatusHolder()
         let sceneRoot = InvalidationCounter()
         withObservationTracking {
-            _ = capture.notificationsDenied
+            _ = capture.notificationHealth
         } onChange: {
             MainActor.assumeIsolated { sceneRoot.bump() }
         }

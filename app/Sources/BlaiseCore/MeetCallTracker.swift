@@ -97,6 +97,11 @@ public enum MeetAutomationEvent: Sendable, Equatable {
     /// surface: "Meeting detected — Record").
     case meetingDetected(code: String, title: String?)
     case meetingDetectionCleared(code: String)
+    /// Meet explicitly reported that the active call ended. Capture continues
+    /// only through the short reconnect cushion represented by `until`.
+    case meetingEndPending(code: String, until: Date)
+    /// A reconnect cancelled the pending end, or capture began stopping.
+    case meetingEndPendingCleared(code: String)
     /// The 15-minute zero-signal nudge (menu line under denied
     /// notifications).
     case nudge(meetingID: MeetingID, title: String)
@@ -112,12 +117,21 @@ public enum MeetAutomationEvent: Sendable, Equatable {
 public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObserving {
     // Constants (constants, not settings — resolved decision).
     public static let freshSignalSeconds: TimeInterval = 120
+    /// An explicit in-page leave is a high-confidence end. Keep only a short
+    /// reconnect cushion so the recording visibly settles within a few seconds.
+    public static let explicitLeaveDebounceSeconds: TimeInterval = 5
+    /// A pagehide/tab-close can also be a reload, so retain the longer cushion
+    /// for that lower-confidence signal.
     public static let endDebounceSeconds: TimeInterval = 25
     public static let watchdogStaleSeconds: TimeInterval = 300
     public static let watchdogConfirmSeconds: TimeInterval = 90
     public static let suppressionExpirySeconds: TimeInterval = 600
     public static let nudgeAfterSeconds: TimeInterval = 900
     public static let evaluationIntervalSeconds: TimeInterval = 30
+
+    public static func debounceSeconds(forEndReason reason: String?) -> TimeInterval {
+        reason == "left" ? explicitLeaveDebounceSeconds : endDebounceSeconds
+    }
 
     // Injected.
     private let controller: any RecordingAutomating
@@ -186,8 +200,8 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
         var lastSignalAt: Date?
         /// Process uptime at the FIRST stale evaluation (watchdog).
         var staleSinceUptime: TimeInterval?
-        /// End-debounce anchor (receipt clock); set by `call-ended`.
-        var endPendingSince: Date?
+        /// End-debounce deadline (receipt clock + reason-aware cushion).
+        var endPendingUntil: Date?
         var nudgeSent = false
     }
     private var activeCall: ActiveCall?
@@ -207,7 +221,7 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
 
     /// A `call-ended` that landed before the controller's detached
     /// `recordingStarted` fact (start-instant race): buffered per code,
-    /// consumed when the fact arrives, pruned after the debounce span.
+    /// consumed when the fact arrives, pruned after its reason-aware deadline.
     private var pendingEnds: [String: Date] = [:]
 
     /// Consumed by the next `recordingStarted` (nudge backstop arming).
@@ -331,7 +345,7 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
         }
 
         if lifecycleFresh, let lifecycle, lifecycle.kind == .callEnded {
-            await handleCallEnded(code: code)
+            await handleCallEnded(code: code, reason: lifecycle.reason)
             return
         }
 
@@ -339,8 +353,9 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
         // them cancels a pending end-debounce for the code (the fast
         // flicker the debounce exists to absorb) — and a buffered
         // pre-start-fact end (the same flicker, caught even earlier).
-        if activeCall?.code == code, activeCall?.endPendingSince != nil {
-            activeCall?.endPendingSince = nil
+        if activeCall?.code == code, activeCall?.endPendingUntil != nil {
+            activeCall?.endPendingUntil = nil
+            emit(.meetingEndPendingCleared(code: code))
             logger.info("end-debounce cancelled by fresh signal for \(code, privacy: .private)")
         }
         pendingEnds[code] = nil
@@ -402,7 +417,7 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
         logger.notice("meet-start notification posted for \(code, privacy: .private)")
     }
 
-    private func handleCallEnded(code: String) async {
+    private func handleCallEnded(code: String, reason: String?) async {
         // The meet-start offer is moot; calendar reminders for the code are
         // withdrawn too. The suppression record is NOT cleared (a tab
         // reload's pagehide emits call-ended and the rejoin re-fires
@@ -414,11 +429,15 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
         guard let session = await controller.currentSession(), session.meetingCode == code else {
             return
         }
+        let delay = Self.debounceSeconds(forEndReason: reason)
+        let deadline = now().addingTimeInterval(delay)
         if activeCall?.code == code {
-            guard activeCall?.endPendingSince == nil else { return }
-            activeCall?.endPendingSince = now()
-            logger.notice("call-ended for active recording — end-debounce started")
-            schedule(Self.endDebounceSeconds + 0.1) { [weak self] in
+            guard activeCall?.endPendingUntil == nil else { return }
+            activeCall?.endPendingUntil = deadline
+            emit(.meetingEndPending(code: code, until: deadline))
+            logger.notice(
+                "call-ended for active recording — \(delay, privacy: .public)s end-debounce started (\(reason ?? "unknown", privacy: .public))")
+            schedule(delay + 0.1) { [weak self] in
                 await self?.fireEndDebounceIfDue()
             }
         } else {
@@ -427,7 +446,7 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
             // race): buffer the end; the fact's arrival anchors the
             // debounce at THIS receipt time. Without the buffer the stop
             // would wait on the ~6.5 min watchdog instead of 25 s.
-            pendingEnds[code] = now()
+            pendingEnds[code] = deadline
             logger.notice("call-ended buffered: start fact not yet delivered")
         }
     }
@@ -464,12 +483,13 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
             startedAt: now(), viaNotification: via)
         // A call-ended buffered ahead of this fact (start-instant race):
         // start the debounce now, anchored at the buffered receipt.
-        if let meetingCode, let pendingSince = pendingEnds.removeValue(forKey: meetingCode),
-            now().timeIntervalSince(pendingSince) <= Self.endDebounceSeconds
+        if let meetingCode, let pendingUntil = pendingEnds.removeValue(forKey: meetingCode),
+            now() <= pendingUntil
         {
-            activeCall?.endPendingSince = pendingSince
+            activeCall?.endPendingUntil = pendingUntil
+            emit(.meetingEndPending(code: meetingCode, until: pendingUntil))
             logger.notice("buffered call-ended consumed — end-debounce started")
-            schedule(Self.endDebounceSeconds + 0.1) { [weak self] in
+            schedule(max(0, pendingUntil.timeIntervalSince(now())) + 0.1) { [weak self] in
                 await self?.fireEndDebounceIfDue()
             }
         }
@@ -485,6 +505,9 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
     public func recordingPaused(meetingID: MeetingID, meetingCode: String?) async {
         manualControl.insert(meetingID)
         if activeCall?.meetingID == meetingID {
+            if let code = activeCall?.code, activeCall?.endPendingUntil != nil {
+                emit(.meetingEndPendingCleared(code: code))
+            }
             activeCall = nil
         }
         // Grace→paused conversion: if this meeting held a grace entry, remove
@@ -562,6 +585,9 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
 
     public func recordingStopped(meetingID: MeetingID, meetingCode: String?, manual: Bool) async {
         if activeCall?.meetingID == meetingID {
+            if let code = activeCall?.code, activeCall?.endPendingUntil != nil {
+                emit(.meetingEndPendingCleared(code: code))
+            }
             activeCall = nil
         }
         guard manual else { return }
@@ -588,11 +614,9 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
         guard await automationEnabled() else { return }
         expireSuppressions(at: now())
         // A buffered pre-start-fact end whose recording never materialized
-        // is dropped after the debounce span (consuming it later would
+        // is dropped after its deadline (consuming it later would
         // insta-stop an unrelated fresh recording on the code).
-        pendingEnds = pendingEnds.filter {
-            now().timeIntervalSince($0.value) <= Self.endDebounceSeconds
-        }
+        pendingEnds = pendingEnds.filter { now() <= $0.value }
         await fireEndDebounceIfDue()
         await finalizeGraceIfExpired()
         await checkNudge()
@@ -600,17 +624,20 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
     }
 
     private func fireEndDebounceIfDue() async {
-        guard let call = activeCall, let since = call.endPendingSince,
-            now().timeIntervalSince(since) >= Self.endDebounceSeconds
+        guard let call = activeCall, let until = call.endPendingUntil,
+            now() >= until
         else { return }
-        activeCall?.endPendingSince = nil
+        activeCall?.endPendingUntil = nil
+        if let code = call.code {
+            emit(.meetingEndPendingCleared(code: code))
+        }
         logger.notice("end-debounce expired — auto-stopping")
         await performAutoStop(watchdog: false)
     }
 
     private func checkWatchdog() async {
         guard let call = activeCall, let last = call.lastSignalAt else { return }
-        guard call.endPendingSince == nil else { return }  // the debounce owns the end
+        guard call.endPendingUntil == nil else { return }  // the debounce owns the end
         let stale = now().timeIntervalSince(last) > Self.watchdogStaleSeconds
         guard stale else {
             activeCall?.staleSinceUptime = nil

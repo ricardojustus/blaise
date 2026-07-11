@@ -49,6 +49,28 @@ struct StatusBarGlyphTests {
         #expect(StatusBarController.symbolName(for: .paused(meetingTitle: "m", accumulatedSeconds: 0), handoffWarning: false) == "pause.circle.fill")
     }
 
+    @Test("a detected meeting is visible in actionable quiet states")
+    func detectedMeetingGlyph() {
+        #expect(
+            StatusBarController.symbolName(
+                for: .idle, handoffWarning: false, meetingDetected: true)
+                == "video.circle.fill")
+        #expect(
+            StatusBarController.symbolName(
+                for: .processing, handoffWarning: true, meetingDetected: true)
+                == "video.circle.fill")
+        // Never mask the load-bearing live-recording state.
+        #expect(
+            StatusBarController.symbolName(
+                for: .recording(startedAt: t), handoffWarning: false,
+                meetingDetected: true) == "record.circle")
+        // A paused meeting must be resolved before another recording starts.
+        #expect(
+            StatusBarController.symbolName(
+                for: .paused(meetingTitle: "m", accumulatedSeconds: 1),
+                handoffWarning: false, meetingDetected: true) == "pause.circle.fill")
+    }
+
     @Test("idle status item title shows the next upcoming meeting compactly")
     func upcomingTitle() {
         let start = Date(timeIntervalSince1970: 1_781_150_400)
@@ -71,4 +93,27 @@ struct StatusBarGlyphTests {
         #expect(
             StatusBarController.upcomingTitle([row], now: row.end.addingTimeInterval(1)) == nil)
     }
+
+    @Test("the custom Blaise mark keeps one identity while state treatments change")
+    func coherentVisualStates() {
+        #expect(
+            BlaiseStatusIcon.visualState(
+                for: .idle, handoffWarning: false, meetingDetected: false) == .idle)
+        #expect(
+            BlaiseStatusIcon.visualState(
+                for: .idle, handoffWarning: false, meetingDetected: true) == .meetingDetected)
+        #expect(
+            BlaiseStatusIcon.visualState(
+                for: .recording(startedAt: t), handoffWarning: true,
+                meetingDetected: true) == .recording)
+        #expect(
+            BlaiseStatusIcon.visualState(
+                for: .paused(meetingTitle: "m", accumulatedSeconds: 1),
+                handoffWarning: false, meetingDetected: false) == .paused)
+        #expect(
+            BlaiseStatusIcon.visualState(
+                for: .processing, handoffWarning: true,
+                meetingDetected: false) == .handoffWarning)
+    }
+
 }
