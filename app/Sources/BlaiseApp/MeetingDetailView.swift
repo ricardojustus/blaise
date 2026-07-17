@@ -1319,7 +1319,10 @@ private struct TranscriptRow: View {
 
     @ViewBuilder
     private var speakerLabelView: some View {
-        let isStale = rename?.stale ?? false
+        // NH-E: an `unattributed` rename is label-literal and always applied, so
+        // it NEVER renders the re-confirmation badge — even a legacy stale row.
+        let isStale = (rename?.stale ?? false)
+            && !SpeakerRename.isAnchorless(segment.speakerLabel)
         HStack(spacing: 5) {
             Button {
                 if renameable { showRename = true }
