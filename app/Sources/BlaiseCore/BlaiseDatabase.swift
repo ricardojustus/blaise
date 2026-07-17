@@ -509,6 +509,63 @@ public final class BlaiseDatabase: Sendable {
                 t.add(column: "scoped_alias_bindings", .text) // nullable; JSON [AliasPair]
             }
         }
+        // C15: widen `meeting.source` to accept new `MeetingSource` cases
+        // (Slack huddles). Migration v1 baked `CHECK(source IN (…))` with the
+        // rawValues present WHEN v1 RAN, and SQLite never updates a column
+        // CHECK when a new enum case is added later — a `slack`-source INSERT
+        // would fail the frozen v1 CHECK on any migrated DB (a fresh DB at v1
+        // already gets the wide list from `allCases`). SQLite cannot
+        // ALTER…DROP CONSTRAINT, so this is the standard table rebuild (same
+        // shape as v14's `cloud_spend_receipt` CHECK rebuild). The rebuilt
+        // table drops the source CHECK entirely: the `MeetingSource` enum is
+        // the validity boundary (the same stance v1 took for `status`, whose
+        // vocabulary is likewise expected to evolve), so a future source
+        // addition never needs another rebuild. `meeting` is referenced by
+        // child FKs; the migrator defers foreign-key checks by default, so the
+        // drop/rename preserves them (rows keep their ids; the end-of-migration
+        // check passes).
+        migrator.registerMigration("v18") { db in
+            try db.create(table: "meeting_new") { t in
+                t.primaryKey("id", .text)
+                t.column("title", .text).notNull()
+                t.column("started_at", .datetime).notNull()
+                t.column("ended_at", .datetime)
+                t.column("source", .text).notNull() // no CHECK — enum is the boundary
+                t.column("status", .text).notNull()
+                t.column("attendees", .text).notNull() // JSON
+                t.column("dominant_language", .text)
+                t.column("asr_provenance", .text) // JSON
+                t.column("last_processing_error", .text)
+                t.column("created_at", .datetime).notNull()
+                t.column("updated_at", .datetime).notNull()
+                t.column("processing_note", .text)
+                t.column("meeting_code", .text)
+                t.column("captured", .boolean).notNull().defaults(to: false)
+                t.column("calendar_event_id", .text)
+                t.column("scheduled_end_ms", .integer)
+                t.column("grace_until_ms", .integer)
+                t.column("title_source", .text).notNull().defaults(to: "default")
+            }
+            try db.execute(sql: """
+                INSERT INTO meeting_new
+                  (id, title, started_at, ended_at, source, status, attendees,
+                   dominant_language, asr_provenance, last_processing_error,
+                   created_at, updated_at, processing_note, meeting_code, captured,
+                   calendar_event_id, scheduled_end_ms, grace_until_ms, title_source)
+                SELECT
+                  id, title, started_at, ended_at, source, status, attendees,
+                  dominant_language, asr_provenance, last_processing_error,
+                  created_at, updated_at, processing_note, meeting_code, captured,
+                  calendar_event_id, scheduled_end_ms, grace_until_ms, title_source
+                FROM meeting
+                """)
+            try db.drop(table: "meeting")
+            try db.rename(table: "meeting_new", to: "meeting")
+            // Recreate the v1 indexes (dropped with the old table) under their
+            // canonical GRDB names.
+            try db.execute(sql: #"CREATE INDEX "index_meeting_on_started_at" ON "meeting"("started_at")"#)
+            try db.execute(sql: #"CREATE INDEX "index_meeting_on_status" ON "meeting"("status")"#)
+        }
         return migrator
     }
 

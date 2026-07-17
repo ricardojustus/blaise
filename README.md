@@ -44,6 +44,12 @@ never leaves the machine.
   Blaise for speaker naming. It captures display names and speaking times only — no
   audio, no captions, no chat — and delivers them encrypted to the app on
   localhost. It is entirely optional; Blaise works without it.
+- **Optional Slack Huddles roster.** While you're in a Slack huddle, Blaise learns
+  the participants and call lifecycle natively over Slack's Socket Mode API and
+  feeds them into the same speaker-naming and auto-record flow as Meet. It reads
+  presence metadata only — who is in the huddle and when — never messages, never
+  audio; the two tokens stay in your Keychain. It is entirely optional (see
+  [`docs/slack_huddles_contract.md`](docs/slack_huddles_contract.md) for setup).
 - **Search and library.** Full-text search across every transcript and note, with
   accent-insensitive matching.
 
@@ -61,6 +67,10 @@ Blaise is local-first by design, and the privacy boundary is stated honestly:
 - **Spend tracking and a ceiling are built in.** Blaise tracks what the notes step
   costs and enforces a configurable monthly ceiling, so the cloud step can never
   run away.
+- **Integration tokens stay local.** The optional Google Calendar and Slack Huddles
+  integrations read metadata only (event times and attendees; huddle presence — never
+  huddle messages or audio). Their credentials live in the macOS Keychain and never
+  leave the machine except as Blaise's own API calls to the respective service.
 - **Fully offline mode.** Select the local MLX notes engine and Blaise synthesises
   notes entirely on-device. If neither a cloud key nor a local model is available,
   the meeting is transcribed and stored with notes marked *pending* — nothing is

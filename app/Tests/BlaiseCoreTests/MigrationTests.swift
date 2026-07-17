@@ -8,7 +8,7 @@ import Testing
         let database = try makeDatabase()
         try database.pool.read { db in
             let applied = try BlaiseDatabase.migrator.appliedMigrations(db)
-            #expect(applied == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
+            #expect(applied == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"])
 
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)")
             let structured = columns.first { $0["name"] == "structured" }
@@ -131,7 +131,7 @@ import Testing
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"])
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)").map { $0["name"] as String }
             #expect(columns.contains("structured"))
             #expect(columns.contains("memory_digest"), "v14 adds the nullable memory_digest column")
@@ -163,7 +163,7 @@ import Testing
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"])
             let note = try Row.fetchOne(db, sql: "SELECT processing_note, title, captured, title_source FROM meeting")
             #expect(note?["processing_note"] == nil)
             #expect(note?["title"] == "v2 meeting")
@@ -221,6 +221,51 @@ import Testing
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)").map { $0["name"] as String }
             #expect(!columns.contains("structured"))
             #expect(try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM meeting_notes") == 1)
+        }
+    }
+
+    /// C15 migration v18: the `meeting` rebuild that widens `source` for
+    /// `slack` (real users' old-binary DBs carry a `slack`-rejecting v1 CHECK;
+    /// the current binary's v1 already includes it, so this pins the rebuild's
+    /// MECHANICS — data preserved, indexes recreated, `slack` insertable —
+    /// which is what must never corrupt an upgraded database).
+    @Test func v18RebuildPreservesDataAndWidensSource() throws {
+        let url = try makeTempRoot().appendingPathComponent("v17-populated.sqlite")
+        let queue = try DatabaseQueue(path: url.path)
+        try BlaiseDatabase.migrator.migrate(queue, upTo: "v17")
+        try queue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting (id, title, started_at, source, status, attendees, created_at, updated_at, meeting_code)
+                    VALUES ('M1', 'kept', ?, 'meet', 'ready', '[]', ?, ?, 'abc-defg-hij')
+                    """,
+                arguments: [msDate(), msDate(), msDate()])
+        }
+
+        try BlaiseDatabase.migrator.migrate(queue, upTo: "v18")
+
+        try queue.write { db in
+            // Existing row (and its non-default columns) preserved across the
+            // create-copy-drop-rename rebuild.
+            let kept = try Row.fetchOne(db, sql: "SELECT * FROM meeting WHERE id = 'M1'")
+            #expect(kept?["title"] == "kept")
+            #expect(kept?["meeting_code"] == "abc-defg-hij")
+            #expect(kept?["title_source"] == "default")
+            // slack inserts.
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting (id, title, started_at, source, status, attendees, created_at, updated_at)
+                    VALUES ('M2', 'slack meeting', ?, 'slack', 'ready', '[]', ?, ?)
+                    """,
+                arguments: [msDate(), msDate(), msDate()])
+            #expect(try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM meeting WHERE source = 'slack'") == 1)
+            // Indexes recreated under their canonical names.
+            let indexes = try Set(
+                String.fetchAll(
+                    db,
+                    sql: "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'meeting'"))
+            #expect(indexes.contains("index_meeting_on_started_at"))
+            #expect(indexes.contains("index_meeting_on_status"))
         }
     }
 }

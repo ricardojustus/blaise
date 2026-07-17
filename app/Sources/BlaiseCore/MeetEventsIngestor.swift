@@ -99,6 +99,24 @@ public final class MeetCallSignalBox: MeetCallSignalReceiving, Sendable {
     }
 }
 
+// MARK: - In-process batch seam (C15)
+
+/// A producer of already-plaintext `MeetWireBatch`es feeding the SAME
+/// ingestion core as the decrypt path — no HTTP, no crypto. The Slack huddle
+/// tracker (C15) emits roster/lifecycle batches through here; the ingestor's
+/// existing post-commit signal forward then delivers the liveness/lifecycle
+/// signal to the automation tracker, so auto-record + auto-stop come free
+/// (exactly as they do for the Meet extension's decrypt path).
+public protocol MeetBatchIngesting: Sendable {
+    func ingest(batch: MeetWireBatch) async
+}
+
+/// Test/default seam: drops batches on the floor.
+public struct NoopMeetBatchIngestor: MeetBatchIngesting {
+    public init() {}
+    public func ingest(batch: MeetWireBatch) async {}
+}
+
 // MARK: - Pipeline sweep seam
 
 /// Pending-events sweep trigger seam (same pattern as `HandoffKicking`):
@@ -165,7 +183,7 @@ public struct MeetEventsResponse: Sendable, Equatable {
 
 // MARK: - Ingestor
 
-public struct MeetEventsIngestor: Sendable, MeetEventsSweeping {
+public struct MeetEventsIngestor: Sendable, MeetEventsSweeping, MeetBatchIngesting {
     /// Localized-self denylist (contract): a rotated self-tile label that
     /// escaped the extension's closed set is treated as isSelf.
     public static let selfDenylist: Set<String> = ["You", "Você", "you", "você"]
@@ -252,53 +270,85 @@ public struct MeetEventsIngestor: Sendable, MeetEventsSweeping {
             return respond(400)
         }
 
-        // Freshness (±48 h on capturedAtMs): stale-but-valid → acked 200,
-        // dropped — never silently double-ingested, never 400.
-        let nowMs = Int64(now().timeIntervalSince1970 * 1000)
-        guard abs(batch.capturedAtMs - nowMs) <= Self.freshnessWindowMs else {
-            logger.info("meet-events batch outside ±48 h freshness window: acked, dropped")
-            return respond(200)
-        }
-
         do {
-            if let meetingID = try await matchMeeting(for: batch) {
-                let outcome = try await ingest(batch: batch, into: meetingID, pendingRowID: nil)
-                // H-1: content landing AFTER the meeting is `ready` postdates
-                // the minted payload — fire the status-dependent dispatch
-                // (`ready` → regenerate: re-snapshot, re-mint, supersede) so
-                // the new events/roster reach the notes and the Evidence
-                // Store. Immediate dispatch costs one full re-run per
-                // post-ready flush; the common case is a single post-meeting
-                // flush, and deduped replays add no content, so they never
-                // re-fire. Fire-and-forget: the 200 must not wait on a run.
-                if outcome.addedContent, outcome.meetingStatus == .ready {
-                    let dispatcher = self.dispatcher
-                    Task { await dispatcher.dispatch(meetingID: meetingID) }
-                }
-            } else if !batch.isHeartbeatOnly {
-                // Heartbeat-only batches matched to no meeting are NOT
-                // stored pending (content-free; the signal below is their
-                // entire purpose).
-                try await storePending(batch: batch, plaintext: plaintext)
-            }
-            try midResponseHook?()
-            // C14: forward the per-batch liveness signal (plus lifecycle
-            // when present) for EVERY accepted code-carrying batch —
-            // correlated or not. Fire-and-forget AFTER the transaction; the
-            // signed 200 never waits on it. The tracker's monotonic guard
-            // absorbs replays (a deduped re-delivery carries an old
-            // timestamp and advances nothing).
-            let signals = self.signals
-            let signal = MeetCallSignal(
-                meetingCode: batch.meetingCode, capturedAtMs: batch.capturedAtMs,
-                lifecycle: batch.lifecycle)
-            Task { await signals.receive(signal) }
+            try await accept(batch: batch, plaintext: plaintext)
             return respond(200)
         } catch {
             // Local/transient (DB write failure, crash-hook seam): 5xx —
             // the extension ring-retries; NEVER 400 for transient conditions.
             logger.error("meet-events ingest failed transiently: \(error)")
             return respond(500)
+        }
+    }
+
+    // MARK: - Shared ingestion core (decrypt path + in-process C15 path)
+
+    /// Freshness gate → correlation → ingest-or-pending → post-commit signal
+    /// forward. Shared by `handle(body:)` (decrypt path) and `ingest(batch:)`
+    /// (in-process C15 path) so both share dedupe, the ±10-min / live-session
+    /// correlation, pending storage, roster absorption, and the automation
+    /// signal forward. Returns normally on durable acceptance OR on a
+    /// stale-but-valid batch (acked, dropped, NOT forwarded); throws only on a
+    /// transient local failure (DB write / the mid-response crash hook), which
+    /// the decrypt path maps to 500. `plaintext` is the pending-store payload;
+    /// nil = derive it from the batch on demand (only the unmatched-store path
+    /// needs it).
+    private func accept(batch: MeetWireBatch, plaintext: Data?) async throws {
+        // Freshness (±48 h on capturedAtMs): stale-but-valid → acked, dropped —
+        // never silently double-ingested, never forwarded.
+        let nowMs = Int64(now().timeIntervalSince1970 * 1000)
+        guard abs(batch.capturedAtMs - nowMs) <= Self.freshnessWindowMs else {
+            logger.info("meet-events batch outside ±48 h freshness window: acked, dropped")
+            return
+        }
+        if let meetingID = try await matchMeeting(for: batch) {
+            let outcome = try await ingest(batch: batch, into: meetingID, pendingRowID: nil)
+            // H-1: content landing AFTER the meeting is `ready` postdates the
+            // minted payload — fire the status-dependent dispatch (`ready` →
+            // regenerate: re-snapshot, re-mint, supersede) so the new
+            // events/roster reach the notes and the Evidence Store. Immediate
+            // dispatch costs one full re-run per post-ready flush; the common
+            // case is a single post-meeting flush, and deduped replays add no
+            // content, so they never re-fire. Fire-and-forget: the response
+            // must not wait on a run.
+            if outcome.addedContent, outcome.meetingStatus == .ready {
+                let dispatcher = self.dispatcher
+                Task { await dispatcher.dispatch(meetingID: meetingID) }
+            }
+        } else if !batch.isHeartbeatOnly {
+            // Heartbeat-only batches matched to no meeting are NOT stored
+            // pending (content-free; the signal below is their entire purpose).
+            let bytes = try plaintext ?? JSONEncoder().encode(batch)
+            try await storePending(batch: batch, plaintext: bytes)
+        }
+        try midResponseHook?()
+        // C14: forward the per-batch liveness signal (plus lifecycle when
+        // present) for EVERY accepted code-carrying batch — correlated or not.
+        // Fire-and-forget AFTER the transaction; the response never waits on
+        // it. The tracker's monotonic guard absorbs replays (a deduped
+        // re-delivery carries an old timestamp and advances nothing).
+        let signals = self.signals
+        let signal = MeetCallSignal(
+            meetingCode: batch.meetingCode, capturedAtMs: batch.capturedAtMs,
+            lifecycle: batch.lifecycle)
+        Task { await signals.receive(signal) }
+    }
+
+    /// C15 in-process entry (`MeetBatchIngesting`): a producer that already
+    /// holds a plaintext `MeetWireBatch` (the Slack huddle tracker) drives the
+    /// SAME core as the decrypt path. No HTTP status, no crypto: a transient
+    /// failure is logged (an in-process producer has no signed ack to
+    /// ring-retry). The batch validity gate mirrors `handle`'s post-decrypt
+    /// 400 rule (schemaVersion ∈ {1, 2}, non-empty code).
+    public func ingest(batch: MeetWireBatch) async {
+        guard [1, 2].contains(batch.schemaVersion), !batch.meetingCode.isEmpty else {
+            logger.warning("in-process batch rejected: empty code or unsupported schemaVersion")
+            return
+        }
+        do {
+            try await accept(batch: batch, plaintext: nil)
+        } catch {
+            logger.error("in-process batch ingest failed: \(error)")
         }
     }
 
