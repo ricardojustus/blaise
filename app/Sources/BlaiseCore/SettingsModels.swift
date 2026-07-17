@@ -197,6 +197,15 @@ public final class HandoffSettingsModel {
     public private(set) var localFolderPath = ""
     /// Markdown sidecar toggle for the local folder (default ON).
     public var markdownSidecar = true
+    /// G5 v1.3: keep superseded payloads at the destination. Default OFF ⇒
+    /// cleanup ON (the destination holds exactly ONE current payload per
+    /// meeting). ON preserves the pre-v1.3 accumulate-forever behavior.
+    /// Destination-independent.
+    public var keepPayloadHistory = false
+    /// G5 v1.3: deliver the meeting's retained audio to the destination. Default
+    /// OFF (the privacy default). ON copies `audio*.m4a` — a syncing destination
+    /// then means audio leaves the machine. Destination-independent.
+    public var deliverAudio = false
     /// G14: "Include memory digest" — the second machine-facing render that
     /// the knowledge graph's graph extractor reads. Default ON. OFF ⇒ no second synthesis
     /// call and no `memory_digest` on the payload (absent ⇒ skip to the knowledge graph).
@@ -228,6 +237,8 @@ public final class HandoffSettingsModel {
             ?? nil ?? ""
         markdownSidecar = (try? await settings.get(HandoffDestination.Key.localMarkdownSidecar, as: Bool.self))
             ?? nil ?? true
+        keepPayloadHistory = await HandoffDestination.keepPayloadHistory(from: settings)
+        deliverAudio = await HandoffDestination.deliverAudio(from: settings)
         includeMemoryDigest = await MemoryDigestSettings.isEnabled(in: settings)
         verifyMemoryDigest = await MemoryDigestSettings.isVerifyEnabled(in: settings)
         validationError = validationMessage(of: current)
@@ -269,6 +280,9 @@ public final class HandoffSettingsModel {
         // persisted for the local folder.
         try? await settings.set(HandoffDestination.Key.kind, to: destinationKind)
         try? await settings.set(HandoffDestination.Key.localMarkdownSidecar, to: markdownSidecar)
+        // G5 v1.3 destination-independent toggles (forward deliveries only).
+        try? await settings.set(HandoffDestination.Key.keepPayloadHistory, to: keepPayloadHistory)
+        try? await settings.set(HandoffDestination.Key.deliverAudio, to: deliverAudio)
         // G14: persist the memory-digest toggle (forward renders only — it
         // never rewrites already-minted payloads).
         try? await settings.set(MemoryDigestSettings.enabledKey, to: includeMemoryDigest)

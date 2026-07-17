@@ -334,6 +334,11 @@ public actor HandoffWorker: HandoffKicking {
                 return
             }
 
+            // G5 v1.3 destination-independent toggles, read fresh each drain so a
+            // Settings change takes effect on the next delivery.
+            let keepHistory = await HandoffDestination.keepPayloadHistory(from: settingsStore)
+            let deliverAudio = await HandoffDestination.deliverAudio(from: settingsStore)
+
             switch destination {
             case .ssh(let settings, let sidecar):
                 guard let host = await pickHost(settings.hosts) else {
@@ -374,14 +379,29 @@ public actor HandoffWorker: HandoffKicking {
                         message: "spawn failed: \(error)")
                     continue
                 }
-                if outcome.exitStatus == 0, sidecar {
+                if outcome.exitStatus == 0 {
                     // JSON delivered; upload the convenience Markdown sidecar
                     // (failure ISOLATED — never fails the queue item; retried on
                     // this meeting's next delivery), mirroring the local path.
-                    await uploadSidecar(
-                        item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                    if sidecar {
+                        await uploadSidecar(
+                            item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                    }
+                    // G5 v1.3: audio delivery AFTER the sidecar step (opt-in,
+                    // failure-isolated exactly like the sidecar).
+                    if deliverAudio {
+                        await deliverAudioSSH(
+                            item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                    }
                 }
                 await recordOutcome(outcome, item: claimed, endpoint: host)
+                // G5 v1.3: superseded-payload cleanup AFTER delivery + supersession
+                // (default ON; failure-isolated). Never touches the local
+                // `handoff/` snapshots — the destination is a delivery target.
+                if outcome.exitStatus == 0, !keepHistory {
+                    await cleanupSupersededSSH(
+                        item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                }
 
             case .localFolder(let url, let sidecar):
                 // No host to pick — the folder IS the single endpoint. The
@@ -416,8 +436,19 @@ public actor HandoffWorker: HandoffKicking {
                     if sidecar {
                         await writeSidecar(item: claimed, root: url)
                     }
+                    // G5 v1.3: audio delivery AFTER the sidecar step (opt-in,
+                    // failure-isolated). Runs inside the still-open security scope.
+                    if deliverAudio {
+                        await deliverAudioLocal(item: claimed, root: url)
+                    }
                 }
                 await recordOutcome(outcome, item: claimed, endpoint: endpoint)
+                // G5 v1.3: superseded-payload cleanup AFTER delivery + supersession
+                // (default ON; failure-isolated). `.tmp-*` and the sidecar/audio
+                // files are untouched — only OTHER `<hash>.json` are removed.
+                if outcome.exitStatus == 0, !keepHistory {
+                    await cleanupSupersededLocal(item: claimed, root: url)
+                }
             }
         }
     }
@@ -508,6 +539,171 @@ public actor HandoffWorker: HandoffKicking {
             logger.warning(
                 "sidecar upload for \(item.meetingID, privacy: .public) errored: \(String(describing: error), privacy: .public) — JSON already delivered; retried on next delivery"
             )
+        }
+    }
+
+    // MARK: - G5 v1.3: superseded-payload cleanup (failure-isolated)
+
+    /// Removes THIS meeting's OTHER `<hash>.json` from the LOCAL destination
+    /// meeting dir after a successful delivery + supersession (default ON). The
+    /// dir is per-meeting and Blaise-owned; `.tmp-*`, the sidecar `.md`, and any
+    /// delivered audio are untouched (only `*.json` other than the just-delivered
+    /// hash). FAILURE-ISOLATED: never fails or retries the JSON queue item —
+    /// logged and retried on this meeting's next delivery.
+    private func cleanupSupersededLocal(item: HandoffItem, root: URL) async {
+        let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
+        let keep = "\(item.versionHash).json"
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+        var removed = 0
+        for name in names where name.hasSuffix(".json") && name != keep {
+            do {
+                try fm.removeItem(at: dir.appendingPathComponent(name))
+                removed += 1
+            } catch {
+                logger.warning(
+                    "payload cleanup: could not remove \(name, privacy: .public) for \(item.meetingID, privacy: .public): \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
+                )
+            }
+        }
+        if removed > 0 {
+            logger.notice(
+                "payload cleanup: removed \(removed) superseded JSON(s) for \(item.meetingID, privacy: .public)"
+            )
+        }
+    }
+
+    /// Removes THIS meeting's OTHER `<hash>.json` from the SSH destination
+    /// meeting dir via a second ssh invocation (`cleanupArgv`), the sidecar's
+    /// argv/quoting discipline. FAILURE-ISOLATED exactly like `uploadSidecar`.
+    private func cleanupSupersededSSH(
+        item: HandoffItem, settings: HandoffSettings, host: String, remoteDir: String
+    ) async {
+        let argv = HandoffCommand.cleanupArgv(
+            user: settings.user, host: host, identityFile: settings.identityFile,
+            remoteDir: remoteDir, keepHash: item.versionHash)
+        do {
+            let outcome = try await transport.deliver(
+                argv: argv, payload: Data(),
+                timeout: HandoffCommand.watchdogTimeout(payloadByteCount: 0))
+            if outcome.exitStatus != 0 {
+                logger.warning(
+                    "payload cleanup (ssh) for \(item.meetingID, privacy: .public) exit=\(outcome.exitLabel, privacy: .public) — JSON already delivered; retried next delivery"
+                )
+            }
+        } catch {
+            logger.warning(
+                "payload cleanup (ssh) for \(item.meetingID, privacy: .public) errored: \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
+            )
+        }
+    }
+
+    // MARK: - G5 v1.3: audio delivery (opt-in, failure-isolated, size-idempotent)
+
+    /// Delivers the meeting's retained `audio*.m4a` set to the LOCAL destination
+    /// meeting dir under their canonical names (opt-in). Retained audio is
+    /// immutable post-encode, so a destination file whose byte length already
+    /// matches is skipped (`stat`); otherwise a temp write + `rename(2)`.
+    /// FAILURE-ISOLATED per file: never fails or retries the JSON queue item.
+    private func deliverAudioLocal(item: HandoffItem, root: URL) async {
+        let sources = database.paths.retainedAudioURLs(item.meetingID)
+        guard !sources.isEmpty else { return }
+        let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            logger.warning(
+                "audio delivery: could not create dir for \(item.meetingID, privacy: .public): \(String(describing: error), privacy: .public)"
+            )
+            return
+        }
+        for source in sources {
+            let name = source.lastPathComponent
+            let dest = dir.appendingPathComponent(name)
+            let localSize = (try? source.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+            // Size-match idempotent skip (audio is immutable post-encode).
+            if let localSize,
+                let destSize = (try? dest.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+                destSize == localSize
+            {
+                continue
+            }
+            // The `.tmp-` prefix (M2) makes the existing 24h stale-temp sweep in
+            // LocalFolderTransport reclaim a crash orphan between copy and rename;
+            // the *.json cleanup glob never touches it.
+            let temp = dir.appendingPathComponent(".tmp-audio-\(item.versionHash)-\(nonce())-\(name)")
+            do {
+                if fm.fileExists(atPath: temp.path) { try fm.removeItem(at: temp) }
+                try fm.copyItem(at: source, to: temp)
+                try LocalFolderTransport.atomicReplace(temp: temp, final: dest)
+            } catch {
+                try? fm.removeItem(at: temp)
+                logger.warning(
+                    "audio delivery: \(name, privacy: .public) for \(item.meetingID, privacy: .public) failed: \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
+                )
+            }
+        }
+    }
+
+    /// Delivers the meeting's retained `audio*.m4a` set to the SSH destination
+    /// meeting dir under their canonical names (opt-in). One `wc -c` pre-check
+    /// per file skips an already-delivered file of matching byte length;
+    /// otherwise the bytes stream via `cat > '<dir>/<name>'` (the sidecar's
+    /// argv/quoting pattern). FAILURE-ISOLATED per file.
+    private func deliverAudioSSH(
+        item: HandoffItem, settings: HandoffSettings, host: String, remoteDir: String
+    ) async {
+        let sources = database.paths.retainedAudioURLs(item.meetingID)
+        guard !sources.isEmpty else { return }
+        for source in sources {
+            let name = source.lastPathComponent
+            // Injection-safety assert: canonical names are `audio[a-z0-9_]*.m4a`,
+            // so they can never break out of the single-quoted remote command.
+            // SKIP rather than emit an unsafe command (the sidecar-slug rule).
+            guard HandoffCommand.isSafeAudioName(name) else {
+                logger.error(
+                    "audio name '\(name, privacy: .public)' is not audio[a-z0-9_]*.m4a; skipping (JSON already delivered)"
+                )
+                continue
+            }
+            // wc -c pre-check: skip when the remote file already matches by size
+            // (retained audio is immutable post-encode). The local size is read
+            // WITHOUT loading the (potentially large) file into memory.
+            let localSize = (try? source.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+            let sizeArgv = HandoffCommand.audioSizeCheckArgv(
+                user: settings.user, host: host, identityFile: settings.identityFile,
+                remoteDir: remoteDir, name: name)
+            if let localSize,
+                let sizeOutcome = try? await transport.deliver(
+                    argv: sizeArgv, payload: Data(),
+                    timeout: HandoffCommand.watchdogTimeout(payloadByteCount: 0)),
+                sizeOutcome.exitStatus == 0,
+                let remoteSize = Int(
+                    String(decoding: sizeOutcome.stdout, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)),
+                remoteSize == localSize
+            {
+                continue
+            }
+            guard let bytes = try? Data(contentsOf: source) else { continue }
+            let writeArgv = HandoffCommand.audioWriteArgv(
+                user: settings.user, host: host, identityFile: settings.identityFile,
+                remoteDir: remoteDir, name: name)
+            do {
+                let outcome = try await transport.deliver(
+                    argv: writeArgv, payload: bytes,
+                    timeout: HandoffCommand.watchdogTimeout(payloadByteCount: bytes.count))
+                if outcome.exitStatus != 0 {
+                    logger.warning(
+                        "audio delivery (ssh) \(name, privacy: .public) for \(item.meetingID, privacy: .public) exit=\(outcome.exitLabel, privacy: .public) — JSON already delivered; retried next delivery"
+                    )
+                }
+            } catch {
+                logger.warning(
+                    "audio delivery (ssh) \(name, privacy: .public) for \(item.meetingID, privacy: .public) errored: \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
+                )
+            }
         }
     }
 

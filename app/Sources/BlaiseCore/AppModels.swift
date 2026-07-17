@@ -562,6 +562,9 @@ public final class PipelineActivityHolder {
             activeRuns[id] = nil
         case .glossaryLoaded:
             break // informational (§5b); does not change run activity
+        case .participantConfirmationNeeded:
+            break // G15: the app posts the notification; run activity is cleared
+                  // by the run's own runCompleted at the pending terminal.
         }
         return nil
     }

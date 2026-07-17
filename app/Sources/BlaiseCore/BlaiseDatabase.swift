@@ -643,12 +643,19 @@ public final class BlaiseDatabase: Sendable {
     /// failed regeneration must never re-label the old transcript.
     /// `midTransactionHook` is the crash-test seam (C1 pattern).
     @discardableResult
+    ///
+    /// `additionalWrites` (G2 M1) runs INSIDE the same write transaction, after
+    /// the segment replace + meeting update, so a caller can commit a companion
+    /// row (e.g. a `speaker_rename` upsert) ATOMICALLY with the transcript it was
+    /// applied to — no crash window where the row exists but the persisted
+    /// transcript does not.
     public func persistTranscript(
         meetingID: MeetingID,
         segments: [TranscriptSegment],
         asrProvenance: ASRProvenance,
         dominantLanguage: String,
         updatedAt: Date = Date(),
+        additionalWrites: (@Sendable (Database) throws -> Void)? = nil,
         midTransactionHook: (@Sendable () throws -> Void)? = nil
     ) async throws -> [TranscriptSegment] {
         try await pool.write { db in
@@ -667,6 +674,7 @@ public final class BlaiseDatabase: Sendable {
             meeting.dominantLanguage = dominantLanguage
             meeting.updatedAt = updatedAt
             try meeting.update(db)
+            try additionalWrites?(db)
             try midTransactionHook?()
             return inserted
         }

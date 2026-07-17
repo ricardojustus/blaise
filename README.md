@@ -4,7 +4,7 @@ Local-first macOS meeting transcription and notes. Blaise records your system
 audio and microphone, transcribes the conversation on-device (Portuguese/English
 code-switching is a first-class case, not an afterthought), and writes structured
 notes with your action items pulled out and made impossible to miss. Your audio
-never leaves the machine.
+stays on the machine unless you explicitly enable audio delivery to a destination.
 
 ![Blaise — the Estúdio library view: the meeting list with a selected meeting's notes (demo data)](assets/screenshot-estudio.png)
 
@@ -51,8 +51,13 @@ never leaves the machine.
 
 Blaise is local-first by design, and the privacy boundary is stated honestly:
 
-- **Your audio never leaves the machine.** Recording, retention, and transcription
-  are all on-device. There is no upload path for audio.
+- **Your audio stays on the machine by default.** Recording, retention, and
+  transcription are all on-device. The promise, stated exactly:
+  there is no upload path for audio unless you explicitly enable audio delivery to a destination.
+  That toggle ("Include audio recordings", Settings → Evidence Store) is off by
+  default; turning it on copies a meeting's recordings to the delivery destination,
+  and a destination that syncs (iCloud or a network folder) then means the audio
+  leaves this machine.
 - **One optional cloud call: notes synthesis.** By default, notes are written by
   Claude (Anthropic's Sonnet model) under **your own API key**, which means the
   meeting *transcript* — not the audio — is sent to Anthropic for that one step.

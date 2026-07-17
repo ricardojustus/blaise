@@ -19,11 +19,13 @@ enum AutomationNotificationCategory {
     static let graceResume = "graceResume"
     static let handoffWarning = "handoffWarning"
     static let diagnostics = "diagnostics"
+    static let participantConfirm = "participantConfirm"
 
     static let recordAction = "record"
     static let launchRecordAction = "launchRecord"
     static let resumeAction = "resume"
     static let openBlaiseAction = "openBlaise"
+    static let confirmParticipantsAction = "confirmParticipants"
 }
 
 /// What macOS currently allows Blaise notifications to do. A successful
@@ -61,6 +63,9 @@ enum AutomationNotificationAction: Sendable, Equatable {
     /// Handoff-warning click (L-3): activate the app and open the main window
     /// (where the queue banner and the Settings → handoff panel live).
     case openMainWindow
+    /// G15 participant-confirmation click: activate the app and select the
+    /// meeting so its pending banner (which hosts the confirm sheet) is visible.
+    case participantConfirm(meetingID: MeetingID)
 }
 
 /// Mirrors every posted/withdrawn notification to the menu-bar surfaces
@@ -95,6 +100,9 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         let openBlaise = UNNotificationAction(
             identifier: AutomationNotificationCategory.openBlaiseAction, title: "Open Blaise",
             options: [.foreground])
+        let confirmParticipants = UNNotificationAction(
+            identifier: AutomationNotificationCategory.confirmParticipantsAction,
+            title: "Confirm participants", options: [.foreground])
         center.setNotificationCategories([
             UNNotificationCategory(
                 identifier: AutomationNotificationCategory.meetStart, actions: [record],
@@ -112,6 +120,9 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
             UNNotificationCategory(
                 identifier: AutomationNotificationCategory.diagnostics, actions: [openBlaise],
                 intentIdentifiers: []),
+            UNNotificationCategory(
+                identifier: AutomationNotificationCategory.participantConfirm,
+                actions: [confirmParticipants], intentIdentifiers: []),
         ])
     }
 
@@ -276,6 +287,34 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
 
     private static let handoffWarningID = "blaise.handoffwarning"
 
+    /// G15: the participant-confirmation gate parked a meeting (posted once per
+    /// park off the pipeline event, never per resume re-park). A body click / the
+    /// "Confirm participants" action opens Blaise and selects the meeting, whose
+    /// pending banner hosts the confirm sheet. A per-meeting id keeps at most one
+    /// in Notification Center; the confirm/skip flow withdraws it.
+    func postParticipantConfirmation(meetingID: MeetingID, title: String) async {
+        let content = UNMutableNotificationContent()
+        content.title = "Confirm participants"
+        content.body = title.isEmpty
+            ? "Confirm who was in this meeting so its notes can be written."
+            : "\(title) — confirm who was there so notes can be written."
+        content.categoryIdentifier = AutomationNotificationCategory.participantConfirm
+        content.interruptionLevel = .active
+        content.sound = .default
+        content.userInfo = ["meetingID": meetingID]
+        await post(id: participantConfirmID(meetingID), content: content)
+    }
+
+    /// Withdrawn when the meeting leaves the gate (Confirm / Skip): a stale
+    /// "confirm participants" surface would be dead.
+    func withdrawParticipantConfirmation(meetingID: MeetingID) {
+        withdraw(ids: [participantConfirmID(meetingID)])
+    }
+
+    private func participantConfirmID(_ meetingID: MeetingID) -> String {
+        "blaise.participantconfirm.\(meetingID)"
+    }
+
     /// Chrome missing / launch failure: no recording start (recording an
     /// unjoined meeting is empty audio, worse than nothing).
     func postChromeLaunchFailure(title: String) async {
@@ -374,6 +413,8 @@ final class AutomationNotificationAdapter: NSObject, AutomationNotifying,
         case AutomationNotificationCategory.handoffWarning,
              AutomationNotificationCategory.diagnostics:
             return .openMainWindow
+        case AutomationNotificationCategory.participantConfirm:
+            return (info["meetingID"] as? String).map { .participantConfirm(meetingID: $0) }
         default:
             return nil
         }

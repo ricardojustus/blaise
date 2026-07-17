@@ -139,6 +139,12 @@ func seedHandoffConfig(
     // transport call counts on the JSON path; default it OFF here so each
     // delivery is one call, and seed it ON explicitly in the sidecar tests.
     try await store.set(HandoffDestination.Key.localMarkdownSidecar, to: markdownSidecar)
+    // Same rationale for the G5 v1.3 destination-independent toggles: default
+    // them to their no-extra-call state so each delivery stays one JSON call —
+    // cleanup OFF (keepPayloadHistory = true) and audio OFF. The dedicated
+    // cleanup/audio tests flip them ON explicitly.
+    try await store.set(HandoffDestination.Key.keepPayloadHistory, to: true)
+    try await store.set(HandoffDestination.Key.deliverAudio, to: false)
 }
 
 /// A coordinated virtual clock for the retry/backoff tests. `now()` reads a

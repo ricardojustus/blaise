@@ -43,6 +43,7 @@ struct SettingsRootView: View {
 struct AutomationTab: View {
     @Environment(AppEnvironment.self) private var appEnv
     @State private var enabled = true
+    @State private var confirmParticipants = false
     @State private var resumeWindowMinutes = AutomationSettings.defaultResumeWindowSeconds / 60
     @State private var silenceAutoPauseEnabled = SilenceAutoPauseSettings.defaultEnabled
     @State private var silenceThresholdMinutes = Int(SilenceAutoPauseSettings.defaultThresholdSeconds / 60)
@@ -66,6 +67,24 @@ struct AutomationTab: View {
                     }
                 Text(
                     "A notification offers Record when a Meet call starts; the recording stops by itself when the meeting ends. Manual start/stop always works."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                // G15: opt-in participant-confirmation gate.
+                Toggle(
+                    "Ask me to confirm participants before notes are written",
+                    isOn: $confirmParticipants
+                )
+                .onChange(of: confirmParticipants) { _, newValue in
+                    guard loaded else { return }
+                    Task {
+                        try? await appEnv.settings.set(
+                            AutomationSettings.confirmParticipantsKey, to: newValue)
+                    }
+                }
+                Text(
+                    "When a meeting's participants couldn't be learned from your calendar or the Meet roster, Blaise still transcribes and keeps the audio, but holds the notes until you confirm the names (or skip). Off by default."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -297,6 +316,7 @@ struct AutomationTab: View {
             await appEnv.googleCalendar.listCalendars()
             await appEnv.calendarSuggestions.load()
             enabled = await AutomationSettings.enabled(from: appEnv.settings)
+            confirmParticipants = await AutomationSettings.confirmParticipants(from: appEnv.settings)
             resumeWindowMinutes =
                 await AutomationSettings.resumeWindowSeconds(from: appEnv.settings) / 60
             silenceAutoPauseEnabled = await SilenceAutoPauseSettings.enabled(from: appEnv.settings)
@@ -758,6 +778,23 @@ private struct HandoffSection: View {
             // the JSON. (Mirrors the memory-digest toggle's placement.)
             Toggle("Write Markdown sidecar (Obsidian-ready)", isOn: $model.markdownSidecar)
                 .accessibilityLabel("Write Markdown sidecar alongside the evidence payload")
+
+            // G5 v1.3: superseded-payload history. Default OFF ⇒ cleanup ON: a
+            // correction/regeneration REPLACES the delivered evidence so the
+            // destination holds exactly one current payload per meeting.
+            Toggle("Keep superseded payloads at the destination", isOn: $model.keepPayloadHistory)
+                .accessibilityLabel("Keep superseded payloads at the destination")
+            Text("Off (default): a correction or regeneration replaces the delivered evidence, so each meeting keeps one current payload. On: every delivered version is kept.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            // G5 v1.3: audio delivery. Default OFF (the privacy default) — the
+            // headline is stated plainly here and in the README/contract doc.
+            Toggle("Include audio recordings", isOn: $model.deliverAudio)
+                .accessibilityLabel("Include audio recordings in the destination")
+            Text("Off by default. On copies each meeting's recordings to the destination; a destination that syncs (iCloud/network) means audio leaves this machine. Applies to each meeting's NEXT delivery — there is no retroactive sweep.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             // G14: the memory-digest toggle is destination-independent — it
             // gates the second machine-facing render on the knowledge graph payload.

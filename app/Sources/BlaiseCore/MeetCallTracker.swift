@@ -20,8 +20,19 @@ public enum AutomationSettings {
     public static let resumeWindowKey = "automation.resumeWindowSeconds"
     public static let defaultResumeWindowSeconds = 300
 
+    /// G15: "Ask me to confirm participants before notes are written" — opt-in,
+    /// default OFF. When ON, a meeting whose attendees Blaise could not learn
+    /// (empty attendees, no calendar/roster match) holds the notes stage until
+    /// the user confirms the participant names; transcription and audio
+    /// retention are never blocked. OFF is byte-identical to the pre-G15 flow.
+    public static let confirmParticipantsKey = "automation.confirmParticipants"
+
     public static func clampResumeWindow(_ value: Int) -> Int {
         value <= 0 ? 0 : min(600, max(60, value))
+    }
+
+    public static func confirmParticipants(from settings: SettingsStore) async -> Bool {
+        (try? await settings.get(confirmParticipantsKey, as: Bool.self)) ?? nil ?? false
     }
 
     public static func resumeWindowSeconds(from settings: SettingsStore) async -> Int {

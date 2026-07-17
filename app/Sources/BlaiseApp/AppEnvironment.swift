@@ -537,6 +537,14 @@ final class AppEnvironment {
                     self.uiState.openMainWindowRequest += 1
                     NSApp.activate(ignoringOtherApps: true)
                 }
+            case .participantConfirm(let meetingID):
+                // G15: open Blaise and select the meeting so its pending banner
+                // (which hosts the confirm sheet) is front and center.
+                await MainActor.run {
+                    self.uiState.selectedMeetingID = meetingID
+                    self.uiState.openMainWindowRequest += 1
+                    NSApp.activate(ignoringOtherApps: true)
+                }
             }
         }
         Task { [notificationAdapter, settings, captureStatus] in
@@ -699,6 +707,12 @@ final class AppEnvironment {
                         self.captureStatus.apply(.processingFinished)
                         self.refreshLastMeeting()
                     }
+                case .participantConfirmationNeeded(let id, let title):
+                    // G15: the gate parked this meeting for the FIRST time — post
+                    // the confirm notification once (the pipeline emits this event
+                    // once per park, never per resume re-park).
+                    let adapter = self.notificationAdapter
+                    Task { await adapter.postParticipantConfirmation(meetingID: id, title: title) }
                 default:
                     break
                 }
@@ -1049,6 +1063,56 @@ final class AppEnvironment {
     func sendNotificationTest() async {
         await notificationAdapter.postDiagnosticsTest()
         await refreshAutomationSurfaceStatus()
+    }
+
+    // MARK: - G15 participant confirmation (sheet backing)
+
+    /// Confirm-sheet pre-fill names (§3), in the spec's order: calendar
+    /// suggestions for the meeting's time window (attendees of the event the
+    /// start binds to), then grounded person-hint canonicals. Folded-deduped,
+    /// order-preserving. Empty when neither source has anything.
+    func participantPrefillNames(for meeting: Meeting) async -> [String] {
+        var names: [String] = []
+        // Calendar suggestions for the meeting's own time window.
+        let windowEnd = meeting.endedAt ?? meeting.startedAt
+        let snapshots = await calendarSuggestions.eventSnapshots(
+            from: meeting.startedAt.addingTimeInterval(-CalendarSuggestionBuilder.bindLeadSeconds),
+            to: windowEnd.addingTimeInterval(CalendarSuggestionBuilder.bindLeadSeconds))
+        if let event = CalendarSuggestionBuilder.bindingEvent(
+            for: meeting.startedAt, code: meeting.meetingCode, in: snapshots)
+        {
+            let userEmailFolded = userEmail.lowercased()
+            for attendee in event.attendees
+            where userEmailFolded.isEmpty || (attendee.email ?? "").lowercased() != userEmailFolded {
+                names.append(attendee.name)
+            }
+        }
+        // Grounded person hints (curated glossary names heard in this meeting).
+        names.append(contentsOf: await pipeline.groundedPersonNames(meetingID: meeting.id))
+        // Fold-dedup, order-preserving (surface preserved), empties dropped.
+        return ProcessingPipeline.foldedDedupedAttendees(names).map(\.name)
+    }
+
+    /// Confirm-sheet caption count (§3): "Blaise heard N distinct voices".
+    func participantVoiceCount(for meetingID: MeetingID) async -> Int {
+        await pipeline.diarizationClusterCount(meetingID: meetingID)
+    }
+
+    /// Confirm (§3): write the confirmed attendee names and dispatch the
+    /// gate-bypassing notes-only resume; withdraw the confirm notification.
+    func confirmParticipants(meetingID: MeetingID, names: [String]) async {
+        _ = try? await pipeline.confirmParticipants(meetingID: meetingID, names: names)
+        notificationAdapter.withdrawParticipantConfirmation(meetingID: meetingID)
+    }
+
+    /// Skip (§3): proceed without attendees. "Don't ask again" flips the
+    /// preference off first. Withdraws the confirm notification.
+    func skipParticipantConfirmation(meetingID: MeetingID, dontAskAgain: Bool) async {
+        if dontAskAgain {
+            try? await settings.set(AutomationSettings.confirmParticipantsKey, to: false)
+        }
+        _ = try? await pipeline.skipParticipantConfirmation(meetingID: meetingID)
+        notificationAdapter.withdrawParticipantConfirmation(meetingID: meetingID)
     }
 
     /// The calendar Launch & Record action: open the Meet link in Google

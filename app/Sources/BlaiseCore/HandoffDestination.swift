@@ -42,6 +42,32 @@ public enum HandoffDestination: Sendable, Equatable {
         /// kept (`…localFolder.markdownSidecar`) so existing installs migrate
         /// with no settings loss.
         public static let localMarkdownSidecar = "handoff.localFolder.markdownSidecar"
+        /// Superseded-payload cleanup at the destination (G5 v1.3);
+        /// destination-independent. Absent ⇒ cleanup ON — after a delivery + D12
+        /// supersession, this meeting's OTHER `<hash>.json` at the destination
+        /// are removed, so the destination holds exactly ONE current payload per
+        /// meeting (a correction/regeneration REPLACES the delivered evidence).
+        /// `true` opts OUT: cleanup is skipped and today's accumulate-forever
+        /// behavior is preserved verbatim.
+        public static let keepPayloadHistory = "handoff.keepPayloadHistory"
+        /// Audio delivery (G5 v1.3); destination-independent. Absent ⇒ OFF (the
+        /// privacy default). `true` copies the meeting's retained `audio*.m4a`
+        /// set into the destination meeting dir after the sidecar — a syncing
+        /// destination (iCloud/network) then means audio leaves the machine. The
+        /// payload bytes are unchanged (no audio field).
+        public static let deliverAudio = "handoff.deliverAudio"
+    }
+
+    /// Destination-independent (G5 v1.3): whether to KEEP superseded payloads at
+    /// the destination. Absent ⇒ false ⇒ cleanup ON (the default).
+    public static func keepPayloadHistory(from store: SettingsStore) async -> Bool {
+        (try? await store.get(Key.keepPayloadHistory, as: Bool.self)) ?? nil ?? false
+    }
+
+    /// Destination-independent (G5 v1.3): whether to deliver retained audio.
+    /// Absent ⇒ false ⇒ OFF (the privacy default).
+    public static func deliverAudio(from store: SettingsStore) async -> Bool {
+        (try? await store.get(Key.deliverAudio, as: Bool.self)) ?? nil ?? false
     }
 
     public var kind: Kind {

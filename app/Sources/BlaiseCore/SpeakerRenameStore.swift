@@ -74,11 +74,24 @@ public enum SpeakerRenameStore {
         _ db: Database, meetingID: MeetingID, speakerLabel: String, name: String,
         diarization: DiarizationOutput, now: Date
     ) throws {
+        try makeRow(
+            meetingID: meetingID, speakerLabel: speakerLabel, name: name,
+            diarization: diarization, now: now
+        ).save(db)
+    }
+
+    /// The row `upsert` would save, WITHOUT persisting it — so a caller can apply
+    /// it to segments in memory AND commit the identical row inside the
+    /// transcript-persist transaction (G2 M1 atomicity). Same anchor + stale
+    /// discipline as `upsert` (H-6: no derivable anchor ⇒ `stale = 1`, anchor 0).
+    public static func makeRow(
+        meetingID: MeetingID, speakerLabel: String, name: String,
+        diarization: DiarizationOutput, now: Date
+    ) -> SpeakerRename {
         let derived = anchorMs(for: speakerLabel, in: diarization)
-        let row = SpeakerRename(
+        return SpeakerRename(
             meetingID: meetingID, speakerLabel: speakerLabel, anchorMs: derived ?? 0,
             stale: derived == nil, name: name, createdAt: now)
-        try row.save(db)
     }
 
     public static func delete(_ db: Database, meetingID: MeetingID, speakerLabel: String) throws {
