@@ -968,7 +968,7 @@ final class OneShotLatch: @unchecked Sendable {
         // process() wrote the artifact and called the diarizer exactly once.
         let diarPath = harness.database.paths.diarizationURL(meeting.id).path
         #expect(FileManager.default.fileExists(atPath: diarPath), "process() must persist diarization.json")
-        let callsAfterProcess = harness.diarizer.state.withLock { $0.attendeeCounts.count }
+        let callsAfterProcess = harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count }
         #expect(callsAfterProcess == 1)
         let labelsAfterProcess = Set((try await harness.segments(meeting.id)).map(\.speakerLabel))
 
@@ -983,7 +983,7 @@ final class OneShotLatch: @unchecked Sendable {
         _ = try await harness.pipeline.regenerate(meetingID: meeting.id)
 
         // The diarizer was NOT called again; labels are unchanged.
-        let callsAfterRegen = harness.diarizer.state.withLock { $0.attendeeCounts.count }
+        let callsAfterRegen = harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count }
         #expect(callsAfterRegen == 1, "regenerate() must reuse persisted diarization, not re-diarize")
         let labelsAfterRegen = Set((try await harness.segments(meeting.id)).map(\.speakerLabel))
         #expect(labelsAfterRegen == labelsAfterProcess, "speaker labels must be stable across regeneration")
@@ -995,9 +995,9 @@ final class OneShotLatch: @unchecked Sendable {
     @Test func regenerateFallsBackToFreshDiarizeWhenArtifactMissing() async throws {
         let (harness, meeting) = try await readyHarness()
         try FileManager.default.removeItem(at: harness.database.paths.diarizationURL(meeting.id))
-        let callsBefore = harness.diarizer.state.withLock { $0.attendeeCounts.count }
+        let callsBefore = harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count }
         _ = try await harness.pipeline.regenerate(meetingID: meeting.id)
-        let callsAfter = harness.diarizer.state.withLock { $0.attendeeCounts.count }
+        let callsAfter = harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count }
         #expect(callsAfter == callsBefore + 1, "missing artifact → one fresh diarize")
         #expect(
             FileManager.default.fileExists(

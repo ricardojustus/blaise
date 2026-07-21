@@ -42,7 +42,8 @@ enum RegressionPin {
     /// The fabricated attendee list for the full-sample run (the ICSI
     /// Bmr001 excerpt is an English meeting): an English fictional cast.
     /// Sam Rivera is the user identity; the other participants exist so the
-    /// diarizer gets a sane speaker-count ceiling (attendeeCount + 1).
+    /// diarizer gets a sane speaker-count ceiling (file-first mixed track:
+    /// attendees + 1, C4 v5.5).
     static let fabricatedAttendees: [Attendee] = [
         Attendee(name: "Sam Rivera", email: "sam.rivera@vexatron.test", source: .manual),
         Attendee(name: "Marco Vidal", email: nil, source: .manual),

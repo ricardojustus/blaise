@@ -157,6 +157,15 @@ public struct MeetingPaths: Sendable {
         meetingDirectory(meetingID).appendingPathComponent("diarization.json")
     }
 
+    /// Room mode (C4 v5.6): the MIC-track diarization of an in-person
+    /// captured meeting, clusters in their own `M<n>` label namespace so
+    /// they never collide with the system track's `S<n>` and both artifacts
+    /// reuse independently on regenerate. Absent for non-room meetings and
+    /// meetings processed before room mode existed.
+    public func diarizationMicURL(_ meetingID: MeetingID) -> URL {
+        meetingDirectory(meetingID).appendingPathComponent("diarization_mic.json")
+    }
+
     public func transcriptURL(_ meetingID: MeetingID) -> URL {
         meetingDirectory(meetingID).appendingPathComponent("transcript.json")
     }

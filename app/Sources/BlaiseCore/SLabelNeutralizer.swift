@@ -158,18 +158,19 @@ public enum SLabelNeutralizer {
         labelRanges(in: text).filter { labelMap[String(text[$0])] == nil }
     }
 
-    /// The label grammar `(?<![A-Za-z0-9])S\d+(?![A-Za-z0-9])`: a capital `S`
-    /// then one or more ASCII digits (any count), bounded by non-alphanumeric
+    /// The label grammar `(?<![A-Za-z0-9])[SM]\d+(?![A-Za-z0-9])`: a capital
+    /// `S` (system cluster) or `M` (room-mode mic cluster, C4 v5.6) then one
+    /// or more ASCII digits (any count), bounded by non-alphanumeric
     /// characters. `_` is a `\w` char but NOT alphanumeric, so the boundaries
     /// match an underscore-italic `_S0_` while rejecting an identifier-embedded
-    /// `S0Helper`/`AS0`/`S0x`; `S` is literal so a lowercase `s0` never matches
-    /// (case-sensitive). Markdown emphasis runs (`_ * ` `` ` ``) are
-    /// non-alphanumeric, so they act as token boundaries by construction.
+    /// `S0Helper`/`AS0`/`S0x`; the letters are literal so lowercase `s0`/`m0`
+    /// never match (case-sensitive). Markdown emphasis runs (`_ * ` `` ` ``)
+    /// are non-alphanumeric, so they act as token boundaries by construction.
     ///
     /// Swift's regex engine has no lookbehind, so the RIGHT boundary is a
     /// lookahead in the pattern and the LEFT boundary is checked against the
-    /// preceding character below. The match body is the whole `S\d+` token.
-    static var labelRegex: Regex<Substring> { /S[0-9]+(?![A-Za-z0-9])/ }
+    /// preceding character below. The match body is the whole `[SM]\d+` token.
+    static var labelRegex: Regex<Substring> { /[SM][0-9]+(?![A-Za-z0-9])/ }
 
     /// Every diarization-label occurrence in `text`, as source ranges, in
     /// reading order. Emphasis-aware, case-sensitive (see `labelRegex`).

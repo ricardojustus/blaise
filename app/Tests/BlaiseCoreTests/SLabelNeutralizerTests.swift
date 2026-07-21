@@ -27,6 +27,10 @@ import Testing
         #expect(matches("_S0_") == ["S0"])
         // Any digit count is still a label.
         #expect(matches("S1000") == ["S1000"])
+        // Room-mode mic clusters (C4 v5.6 / G13 v4.2): M-labels are labels.
+        #expect(matches("M0") == ["M0"])
+        #expect(matches("**M1**") == ["M1"])
+        #expect(matches("S0/M0") == ["S0", "M0"])
     }
 
     @Test func rejectsNonLabels() {
@@ -39,6 +43,11 @@ import Testing
         // No digits → not a label.
         #expect(matches("S").isEmpty)
         #expect(matches("Sx").isEmpty)
+        // M-grammar mirrors S exactly (G13 v4.2): case-sensitive, unbroken
+        // token boundaries.
+        #expect(matches("m0").isEmpty)
+        #expect(matches("AM0").isEmpty)
+        #expect(matches("M0x").isEmpty)
     }
 
     @Test func containsLabelPredicate() {

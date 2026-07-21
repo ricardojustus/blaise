@@ -104,11 +104,26 @@ public enum SpeakerRenameStore {
         // row must NOT land on one of them.
         let existingStaleKeys = Set(allRows.filter { $0.stale }.map(\.speakerLabel))
 
-        // Which fresh cluster contains each row's anchor instant?
-        func containingLabel(_ anchorMs: Int64) -> String? {
+        // A row's label carries its track (C4 v5.6): `S<n>` = system
+        // clusters, `M<n>` = room-mode mic clusters. The two tracks are
+        // time-coextensive, so a bare instant is ambiguous across them —
+        // candidates are scoped to the row's own namespace. Labels outside
+        // both grammars (e.g. `unattributed`) keep the unscoped candidate
+        // set, preserving the pre-room-mode re-key behavior.
+        func labelNamespace(_ label: String) -> Character? {
+            guard let first = label.first, first == "S" || first == "M",
+                label.dropFirst().allSatisfy(\.isNumber), label.count > 1
+            else { return nil }
+            return first
+        }
+
+        // Which fresh cluster contains this row's anchor instant?
+        func containingLabel(_ anchorMs: Int64, rowLabel: String) -> String? {
             let t = Double(anchorMs) / 1000.0
+            let namespace = labelNamespace(rowLabel)
             let hits = Set(
                 fresh.segments
+                    .filter { namespace == nil || labelNamespace($0.speakerLabel) == namespace }
                     .filter { $0.startSeconds <= t && t <= $0.endSeconds }
                     .map(\.speakerLabel))
             // A single containing cluster only (overlapping segments of one
@@ -118,7 +133,7 @@ public enum SpeakerRenameStore {
 
         var targets: [(row: SpeakerRename, newLabel: String?)] = []
         for row in rows {
-            targets.append((row, containingLabel(row.anchorMs)))
+            targets.append((row, containingLabel(row.anchorMs, rowLabel: row.speakerLabel)))
         }
         // Two rows mapping to the SAME new cluster → BOTH stale (R4-L4).
         var labelCounts: [String: Int] = [:]

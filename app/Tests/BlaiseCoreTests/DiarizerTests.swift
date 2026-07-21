@@ -142,6 +142,24 @@ private func plantModelFixture(parent: URL) throws {
         #expect(FluidAudioDiarizer.repoFolderName == "speaker-diarization")
     }
 
+    // MARK: - Clustering bounds decision (C4 v5.5)
+
+    @Test func clusteringBoundsUseTheEstimateAsAnUnpaddedCeiling() throws {
+        // max = the estimate EXACTLY: the offline clusterer saturates its
+        // ceiling on meeting-platform audio, so the old `+ 1` padding split a
+        // 1:1's single remote speaker into two phantom clusters (measured on
+        // three field recordings — every padded run wrong, every exact run
+        // right). min stays 1: silent invitees are common.
+        let solo = try #require(FluidAudioDiarizer.clusteringBounds(expectedSpeakerCount: 1))
+        #expect(solo == (min: 1, max: 1))
+        let panel = try #require(FluidAudioDiarizer.clusteringBounds(expectedSpeakerCount: 4))
+        #expect(panel == (min: 1, max: 4))
+        // Unknown or degenerate estimates → unconstrained, never a guess.
+        #expect(FluidAudioDiarizer.clusteringBounds(expectedSpeakerCount: nil) == nil)
+        #expect(FluidAudioDiarizer.clusteringBounds(expectedSpeakerCount: 0) == nil)
+        #expect(FluidAudioDiarizer.clusteringBounds(expectedSpeakerCount: -2) == nil)
+    }
+
     // MARK: - Output post-processing (clamp / drop / label normalization)
 
     @Test func normalizedOutputClampsOverrunsAndDropsPastEOF() {

@@ -61,6 +61,18 @@ let package = Package(
             name: "CrashRunner",
             dependencies: ["BlaiseCore"]
         ),
+        // C4 diarization eval harness (scripts/diar_eval.sh): re-runs
+        // FluidAudio over retained meeting audio / fixture WAVs with config
+        // variants and scores cluster counts against known ground truth
+        // (a captured 1:1's system track holds exactly one speaker). Reads
+        // the app data root READ-ONLY. Debug tooling, never shipped.
+        .executableTarget(
+            name: "DiarLab",
+            dependencies: [
+                "BlaiseCore",
+                .product(name: "FluidAudio", package: "FluidAudio"),
+            ]
+        ),
         .testTarget(
             name: "BlaiseCoreTests",
             dependencies: ["BlaiseCore"]

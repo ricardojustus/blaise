@@ -13,7 +13,14 @@ import os
 public protocol Diarizing: Sendable {
     func prepare() async throws
     func availability() async -> EngineAvailability
-    func diarize(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput
+    /// `expectedSpeakerCount` is the caller's best POINT ESTIMATE of distinct
+    /// speakers audible in THIS audio track (nil = unknown). Callers own the
+    /// track topology: a captured system track excludes the user (= remote
+    /// attendee count); a file-first mixed track includes them (= attendees
+    /// + 1). Never pad the estimate — the offline clusterer saturates its
+    /// ceiling on meeting-platform audio, so every unit of slack becomes a
+    /// fabricated speaker (C4 v5.5, measured on three 1:1 field recordings).
+    func diarize(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput
 }
 
 public struct DiarizationOutput: Codable, Sendable, Equatable {
@@ -151,8 +158,10 @@ public actor FluidAudioDiarizer: Diarizing {
         try await chain.run { try await self.prepareBody() }
     }
 
-    public func diarize(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput {
-        try await chain.run { try await self.diarizeBody(audioURL: audioURL, attendeeCount: attendeeCount) }
+    public func diarize(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput {
+        try await chain.run {
+            try await self.diarizeBody(audioURL: audioURL, expectedSpeakerCount: expectedSpeakerCount)
+        }
     }
 
     // MARK: - Bodies (un-chained; diarizeBody calls prepareBody directly,
@@ -202,7 +211,7 @@ public actor FluidAudioDiarizer: Diarizing {
         }
     }
 
-    private func diarizeBody(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput {
+    private func diarizeBody(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput {
         if Task.isCancelled { throw EngineError.cancelled }
         try await prepareBody()
         guard case .real(let models) = models else {
@@ -217,11 +226,9 @@ public actor FluidAudioDiarizer: Diarizing {
         }
         let audioDuration = wavInfo.duration
 
-        // Speaker-count constraint when the attendee count is known: pyannote
-        // semantics, never `exactly` (the count is a hint, not ground truth).
         var config = OfflineDiarizerConfig.default
-        if let attendeeCount {
-            config = config.withSpeakers(min: 1, max: attendeeCount + 1)
+        if let bounds = Self.clusteringBounds(expectedSpeakerCount: expectedSpeakerCount) {
+            config = config.withSpeakers(min: bounds.min, max: bounds.max)
         }
 
         if Task.isCancelled { throw EngineError.cancelled }
@@ -254,6 +261,22 @@ public actor FluidAudioDiarizer: Diarizing {
         logger.info(
             "diarization: \(output.segments.count)/\(raw.count) segments, \(output.speakerCount) speakers")
         return output
+    }
+
+    // MARK: - Clustering bounds decision (C4 v5.5)
+
+    /// Speaker bounds for the clusterer when the caller has a count estimate.
+    /// `max` = the estimate EXACTLY, no padding: FluidAudio's offline path
+    /// re-partitions with K-Means whenever VBx's detected count leaves the
+    /// bounds, and on meeting-platform system audio it saturates the ceiling
+    /// every run — measured on three field 1:1s, `max: 2` split the single
+    /// remote speaker into two balanced phantom clusters on every run while
+    /// `max: 1` was correct on every run (the old `attendeeCount + 1` rule
+    /// was this bug). `min` stays 1: a silent invitee is common, and an
+    /// inflated floor would fabricate speakers the same way.
+    static func clusteringBounds(expectedSpeakerCount: Int?) -> (min: Int, max: Int)? {
+        guard let expectedSpeakerCount, expectedSpeakerCount >= 1 else { return nil }
+        return (min: 1, max: expectedSpeakerCount)
     }
 
     // MARK: - Output post-processing (C4-owned)

@@ -14,6 +14,7 @@ extension PipelineHarness {
     func plantCapturedMeeting(
         tracks: [CaptureTrack],
         status: MeetingStatus = .failed,
+        source: MeetingSource = .meet,
         attendees: [Attendee] = [Attendee(name: "Sam", email: "sam.rivera@vexatron.test", source: .manual)],
         processingNote: String? = nil,
         captured: Bool = false
@@ -23,7 +24,7 @@ extension PipelineHarness {
             title: "Reunião capturada",
             startedAt: msDate(),
             endedAt: msDate(1_770_000_120),
-            source: .meet,
+            source: source,
             status: status,
             attendees: attendees,
             processingNote: processingNote,
@@ -241,7 +242,7 @@ struct ProcessCapturedTests {
 
         let record = try await harness.pipeline.processCaptured(meetingID: meeting.id)
         #expect(record.capturedTracks == ["mic"])
-        #expect(harness.diarizer.state.withLock { $0.attendeeCounts }.isEmpty)
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts }.isEmpty)
 
         let segments = try await harness.segments(meeting.id)
         #expect(!segments.isEmpty)
@@ -365,6 +366,162 @@ struct ProcessCapturedTests {
             .activeSpeakerEvents(meetingID: meeting.id)
         #expect(events.map(\.displayName) == ["Anna Reyes"])  // junk dropped, raw rows still 3
         #expect(try await harness.database.count("meeting_speaker_event") == 3)
+    }
+
+    @Test("C4 v5.5: in-track estimates — system track forwards the remote count, file-first forwards attendees + 1, empty list forwards nil")
+    func expectedSpeakerCountTopology() async throws {
+        let harness = try await makePipelineHarness()
+        let attendees = [
+            Attendee(name: "Marco Vidal", email: nil, source: .manual),
+            Attendee(name: "Anna Reyes", email: nil, source: .manual),
+        ]
+
+        // Captured: only the system track is diarized and the user is not in
+        // it → the estimate is the (owner-excluded) attendee count itself.
+        let captured = try await harness.plantCapturedMeeting(
+            tracks: [.system, .mic], attendees: attendees)
+        _ = try await harness.pipeline.processCaptured(meetingID: captured.id)
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts } == [2])
+
+        // File-first: the user speaks in the mixed track → attendees + 1.
+        let imported = try await harness.importTestMeeting(attendees: attendees)
+        _ = try await harness.pipeline.process(meetingID: imported.id)
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts } == [2, 3])
+
+        // No attendee knowledge → no constraint (nil), never a guessed bound.
+        let unknown = try await harness.plantCapturedMeeting(
+            tracks: [.system, .mic], attendees: [])
+        _ = try await harness.pipeline.processCaptured(meetingID: unknown.id)
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts } == [2, 3, nil])
+    }
+
+    // MARK: - Room mode (C4 v5.6, source == .inPerson)
+
+    /// Plants an in-person captured meeting and queues per-track diarizer
+    /// outputs: system = the default 2-cluster fixture, mic = one cluster
+    /// covering the mic ASR segment (renamed by the pipeline into the M namespace).
+    private func plantRoomMeeting(
+        _ harness: PipelineHarness,
+        attendees: [Attendee] = [Attendee(name: "Sam", email: "sam.rivera@vexatron.test", source: .manual)]
+    ) async throws -> Meeting {
+        let meeting = try await harness.plantCapturedMeeting(
+            tracks: [.system, .mic], source: .inPerson, attendees: attendees)
+        harness.diarizer.state.withLock {
+            $0.outputQueue = [
+                PipelineMockData.diarization,
+                DiarizationOutput(
+                    segments: [
+                        DiarizedSegment(speakerLabel: "S0", startSeconds: 1.2, endSeconds: 2.4)
+                    ],
+                    speakerCount: 1),
+            ]
+        }
+        return meeting
+    }
+
+    @Test("room mode: mic clusters in the M namespace, NO user label, no owner name")
+    func roomModeMicAnonymous() async throws {
+        let harness = try await makePipelineHarness()
+        let meeting = try await plantRoomMeeting(harness)
+
+        let record = try await harness.pipeline.processCaptured(meetingID: meeting.id)
+        #expect(record.capturedTracks == ["system", "mic"])
+        // Both tracks diarized: system estimate nil (attendees are in the
+        // room, not on the wire), mic estimate attendees + 1 (mixed rule).
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts } == [nil, 2])
+        // Combined clustering on the record: 2 system + 1 mic cluster.
+        #expect(record.speakerCount == 3)
+
+        let segments = try await harness.segments(meeting.id)
+        #expect(!segments.isEmpty)
+        // The blanket owner attribution is gone: no `user` label, no
+        // owner name anywhere.
+        #expect(!segments.contains { $0.speakerLabel == TranscriptSegment.userLabel })
+        #expect(!segments.contains { $0.speakerName == "Sam Rivera" })
+        // The mic ASR segment (1.2–2.4 s) landed on the M-namespaced mic
+        // cluster.
+        let micSegment = try #require(
+            segments.first { $0.text.contains("Perfeito, eu reviso") })
+        #expect(micSegment.speakerLabel == "M0")
+        #expect(micSegment.speakerName == nil)
+        // System clusters keep their original namespace.
+        #expect(segments.contains { $0.speakerLabel == "S0" || $0.speakerLabel == "S1" })
+    }
+
+    @Test("room mode: regenerate reuses both artifacts; each track's artifact re-diarizes independently when missing")
+    func roomModeArtifactIndependence() async throws {
+        let harness = try await makePipelineHarness()
+        let meeting = try await plantRoomMeeting(harness)
+        _ = try await harness.pipeline.processCaptured(meetingID: meeting.id)
+
+        let paths = harness.database.paths
+        #expect(FileManager.default.fileExists(atPath: paths.diarizationURL(meeting.id).path))
+        #expect(FileManager.default.fileExists(atPath: paths.diarizationMicURL(meeting.id).path))
+        let callsAfterFirst = harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count }
+        #expect(callsAfterFirst == 2)
+
+        // Regenerate: both artifacts reused — zero new diarize calls.
+        _ = try await harness.pipeline.regenerate(meetingID: meeting.id)
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count } == 2)
+
+        // The namespaces are disjoint, so a missing SYSTEM artifact
+        // re-diarizes only the system track (one new call)…
+        try FileManager.default.removeItem(at: paths.diarizationURL(meeting.id))
+        harness.diarizer.state.withLock { $0.outputQueue = [PipelineMockData.diarization] }
+        _ = try await harness.pipeline.regenerate(meetingID: meeting.id)
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count } == 3)
+
+        // …and a missing MIC artifact re-diarizes only the mic track.
+        try FileManager.default.removeItem(at: paths.diarizationMicURL(meeting.id))
+        harness.diarizer.state.withLock {
+            $0.outputQueue = [
+                DiarizationOutput(
+                    segments: [
+                        DiarizedSegment(speakerLabel: "S0", startSeconds: 1.2, endSeconds: 2.4)
+                    ],
+                    speakerCount: 1)
+            ]
+        }
+        _ = try await harness.pipeline.regenerate(meetingID: meeting.id)
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count } == 4)
+        #expect(FileManager.default.fileExists(atPath: paths.diarizationMicURL(meeting.id).path))
+    }
+
+    @Test("room mode: a rename on a mic cluster anchors via the combined artifacts and survives a fresh re-diarize")
+    func roomModeRenameSurvivesFreshDiarize() async throws {
+        let harness = try await makePipelineHarness()
+        let meeting = try await plantRoomMeeting(harness)
+        _ = try await harness.pipeline.processCaptured(meetingID: meeting.id)
+
+        // Rename the mic cluster (M0 = the room voice) — the anchor must
+        // resolve against the COMBINED persisted clustering.
+        let renamed = try await harness.pipeline.renameSpeaker(
+            meetingID: meeting.id, speakerLabel: "M0", to: "Marco Vidal")
+        #expect(renamed)
+        var segments = try await harness.segments(meeting.id)
+        #expect(segments.contains { $0.speakerLabel == "M0" && $0.speakerName == "Marco Vidal" })
+
+        // Wipe both artifacts → the next regenerate diarizes fresh and
+        // re-keys the rename row against the combined fresh output. The
+        // anchor instant sits inside BOTH a system cluster (S1, 0.98–1.9)
+        // and the mic cluster (M0, 1.2–2.4) — the namespace scoping is what
+        // keeps the row re-keyable instead of ambiguous-stale (C4 v5.6).
+        let paths = harness.database.paths
+        try FileManager.default.removeItem(at: paths.diarizationURL(meeting.id))
+        try FileManager.default.removeItem(at: paths.diarizationMicURL(meeting.id))
+        harness.diarizer.state.withLock {
+            $0.outputQueue = [
+                PipelineMockData.diarization,
+                DiarizationOutput(
+                    segments: [
+                        DiarizedSegment(speakerLabel: "S0", startSeconds: 1.2, endSeconds: 2.4)
+                    ],
+                    speakerCount: 1),
+            ]
+        }
+        _ = try await harness.pipeline.regenerate(meetingID: meeting.id)
+        segments = try await harness.segments(meeting.id)
+        #expect(segments.contains { $0.speakerLabel == "M0" && $0.speakerName == "Marco Vidal" })
     }
 
     @Test("file-first process() is untouched: no capturedTracks, single ASR pass")

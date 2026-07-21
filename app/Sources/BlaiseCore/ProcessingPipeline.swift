@@ -1370,11 +1370,12 @@ public actor ProcessingPipeline {
 
         // 4. diarize — same temp WAV. A regenerate reuses the first run's
         // persisted diarization (deterministic naming; see
-        // diarizeReusingPersisted).
-        let attendeeCount = meeting.attendees.isEmpty ? nil : meeting.attendees.count
+        // diarizeReusingPersisted). Mixed track: the user speaks IN this
+        // audio, so the in-track estimate is attendees (owner-excluded) + 1.
+        let expectedSpeakerCount = meeting.attendees.isEmpty ? nil : meeting.attendees.count + 1
         let diarization = try await stage(.diarize, context, meetingID) {
             try await self.diarizeReusingPersisted(
-                meetingID: meetingID, audioURL: tempWAV, attendeeCount: attendeeCount,
+                meetingID: meetingID, audioURL: tempWAV, expectedSpeakerCount: expectedSpeakerCount,
                 regeneration: context.record.regeneration)
         }
         context.record.diarizationSegmentCount = diarization.segments.count
@@ -1501,21 +1502,47 @@ public actor ProcessingPipeline {
         context.record.detectedLanguage = systemASR?.detectedLanguage ?? micASR?.detectedLanguage
         context.record.asrProvenance = provenance
 
-        // 4. diarize — SYSTEM track only (the mic track is by definition the
-        // user; never diarized). Skipped entirely when only the mic track
-        // survived a partial recovery.
+        // 4. diarize. Non-room captured meetings: SYSTEM track only (the mic
+        // track is by definition the user; never diarized), estimate = the
+        // (owner-excluded) attendee count itself — the old `count` forwarded
+        // here became `count + 1` inside the diarizer and split a 1:1's
+        // single remote speaker into two phantom clusters on every field
+        // recording (C4 v5.5). ROOM MODE (source == .inPerson, C4 v5.6): the
+        // mic is the room's shared channel — blanket user attribution put a
+        // whole workshop's words in the owner's mouth — so the mic track is
+        // diarized like a system track too (labels offset past the system
+        // run's count; the mic artifact is offset-coupled to the system one).
+        let roomMode = meeting.source == .inPerson
         var diarization = DiarizationOutput(segments: [], speakerCount: 0)
-        if systemPresent {
-            let attendeeCount = meeting.attendees.isEmpty ? nil : meeting.attendees.count
+        var micDiarization: DiarizationOutput?
+        if roomMode {
+            let result = try await stage(.diarize, context, meetingID) {
+                try await self.diarizeCapturedRoomMode(
+                    meetingID: meetingID,
+                    systemWAV: systemPresent ? tempSystemWAV : nil,
+                    micWAV: micPresent ? tempMicWAV : nil,
+                    attendeeCount: meeting.attendees.isEmpty ? nil : meeting.attendees.count,
+                    regeneration: context.record.regeneration)
+            }
+            diarization = result.system
+            micDiarization = result.mic
+        } else if systemPresent {
+            let expectedSpeakerCount = meeting.attendees.isEmpty ? nil : meeting.attendees.count
             diarization = try await stage(.diarize, context, meetingID) {
                 try await self.diarizeReusingPersisted(
-                    meetingID: meetingID, audioURL: tempSystemWAV, attendeeCount: attendeeCount,
+                    meetingID: meetingID, audioURL: tempSystemWAV,
+                    expectedSpeakerCount: expectedSpeakerCount,
                     regeneration: context.record.regeneration)
             }
         }
-        context.record.diarizationSegmentCount = diarization.segments.count
-        context.record.speakerCount = diarization.speakerCount
-        context.record.diarization = diarization
+        // The record (and FrontResult) carry the combined clustering; in
+        // non-room runs that is exactly the system output. Resolution stays
+        // safe with mic clusters present: in-person meetings have no
+        // active-speaker timeline, so voting is a no-op there.
+        let combinedDiarization = Self.combineDiarization(system: diarization, mic: micDiarization)
+        context.record.diarizationSegmentCount = combinedDiarization.segments.count
+        context.record.speakerCount = combinedDiarization.speakerCount
+        context.record.diarization = combinedDiarization
 
         // 5. merge — cross-track echo suppression at RAW-ASR granularity
         // (C7 v3.8), then system merge as today; the mic SURVIVORS are
@@ -1560,18 +1587,34 @@ public actor ProcessingPipeline {
                     }
                     micRaw = suppressed.kept
                 }
-                micSegments = SpeakerMerger.merge(
-                    asr: micRaw, diarization: [], meetingID: meetingID
-                ).segments.map { segment in
-                    var named = segment
-                    named.speakerLabel = TranscriptSegment.userLabel
-                    // G3: a pre-onboarding (empty) identity contributes no
-                    // self-name, so the mic turn stays nameless (speakerName ==
-                    // nil) rather than persisting an empty speaker name. The
-                    // "You" UI fallback (micAwareSpeakerLabel) and the
-                    // payload-owner / prompt "the user" handling all key on nil.
-                    named.speakerName = user.name.isEmpty ? nil : user.name
-                    return named
+                if let micDiarization {
+                    // Room mode (C4 v5.6): the mic carries the whole room —
+                    // merge against its own clusters; segments stay
+                    // anonymous (LLM-nameable, renameable), never blanket-
+                    // attributed to the owner. The owner's own voice is one
+                    // of these clusters until fingerprints can identify it.
+                    let merged = SpeakerMerger.merge(
+                        asr: micRaw, diarization: micDiarization.segments,
+                        meetingID: meetingID)
+                    context.record.mergeSplits += merged.report.splits
+                    context.record.mergeDegenerateSegments += merged.report.degenerateSegments
+                    context.record.mergeGapAssignedWords += merged.report.gapAssignedWords
+                    context.record.mergeHealedFragments += merged.report.healedFragments
+                    micSegments = merged.segments
+                } else {
+                    micSegments = SpeakerMerger.merge(
+                        asr: micRaw, diarization: [], meetingID: meetingID
+                    ).segments.map { segment in
+                        var named = segment
+                        named.speakerLabel = TranscriptSegment.userLabel
+                        // G3: a pre-onboarding (empty) identity contributes no
+                        // self-name, so the mic turn stays nameless (speakerName ==
+                        // nil) rather than persisting an empty speaker name. The
+                        // "You" UI fallback (micAwareSpeakerLabel) and the
+                        // payload-owner / prompt "the user" handling all key on nil.
+                        named.speakerName = user.name.isEmpty ? nil : user.name
+                        return named
+                    }
                 }
             }
             return TwoTrackInterleaver.interleave(mic: micSegments, system: systemSegments)
@@ -1580,7 +1623,7 @@ public actor ProcessingPipeline {
 
         return FrontResult(
             segments: interleaved,
-            diarization: diarization,
+            diarization: combinedDiarization,
             provenance: provenance,
             detectedLanguage: context.record.detectedLanguage,
             audioDuration: audioDuration,
@@ -1727,13 +1770,16 @@ public actor ProcessingPipeline {
     /// one. `process()` (first run) and meetings predating the artifact always
     /// diarize fresh.
     private func diarizeReusingPersisted(
-        meetingID: MeetingID, audioURL: URL, attendeeCount: Int?, regeneration: Bool
+        meetingID: MeetingID, audioURL: URL, expectedSpeakerCount: Int?, regeneration: Bool
     ) async throws -> DiarizationOutput {
-        if regeneration, let reused = loadPersistedDiarization(meetingID: meetingID) {
+        if regeneration,
+            let reused = loadPersistedDiarization(at: database.paths.diarizationURL(meetingID))
+        {
             logger.info("regenerate: reusing persisted diarization (\(reused.segments.count) segments) — naming stays deterministic")
             return reused
         }
-        let fresh = try await diarizer.diarize(audioURL: audioURL, attendeeCount: attendeeCount)
+        let fresh = try await diarizer.diarize(
+            audioURL: audioURL, expectedSpeakerCount: expectedSpeakerCount)
         // G2 §4 (R4-H1 ordering): on the MISSING-ARTIFACT fallback, re-map +
         // re-key the speaker-rename rows by anchor against this FRESH
         // clustering and COMMIT that BEFORE persisting the fresh artifact — a
@@ -1751,21 +1797,130 @@ public actor ProcessingPipeline {
             try SpeakerRenameStore.remapForFreshDiarization(
                 db, meetingID: meetingID, fresh: fresh, now: now)
         }
-        persistDiarization(fresh, meetingID: meetingID)
+        persistDiarization(fresh, at: database.paths.diarizationURL(meetingID))
         return fresh
     }
 
+    /// Room mode (C4 v5.6, `source == .inPerson`): the mic track carries the
+    /// whole room through one shared channel, so it is diarized like a
+    /// system track instead of blanket-attributed to the owner (a field
+    /// workshop put 74 minutes of the room's words in the owner's mouth).
+    /// Mic clusters live in their own label namespace (`M<n>`), so the two
+    /// tracks never collide, both artifacts reuse independently, and a
+    /// rename row's track is derivable from its label forever — a plain
+    /// time anchor is ambiguous across time-coextensive tracks. The rename
+    /// re-key runs ONCE against the COMBINED fresh output and commits
+    /// BEFORE either fresh artifact persists (G2 §4 / M-1 ordering).
+    private func diarizeCapturedRoomMode(
+        meetingID: MeetingID, systemWAV: URL?, micWAV: URL?, attendeeCount: Int?,
+        regeneration: Bool
+    ) async throws -> (system: DiarizationOutput, mic: DiarizationOutput?) {
+        let paths = database.paths
+
+        // System track: media playback / rare dial-ins — the attendees are
+        // in the ROOM, so no in-track speaker estimate exists (nil).
+        var system = DiarizationOutput(segments: [], speakerCount: 0)
+        var systemFresh = false
+        if let systemWAV {
+            if regeneration,
+                let reused = loadPersistedDiarization(at: paths.diarizationURL(meetingID))
+            {
+                system = reused
+            } else {
+                system = try await diarizer.diarize(
+                    audioURL: systemWAV, expectedSpeakerCount: nil)
+                systemFresh = true
+            }
+        }
+
+        // Mic track: the room's mixed audio — the C4 mixed-track estimate,
+        // (owner-excluded) attendees + the owner.
+        var mic: DiarizationOutput?
+        var micFresh = false
+        if let micWAV {
+            if regeneration,
+                let reused = loadPersistedDiarization(at: paths.diarizationMicURL(meetingID))
+            {
+                mic = reused
+            } else {
+                let raw = try await diarizer.diarize(
+                    audioURL: micWAV, expectedSpeakerCount: attendeeCount.map { $0 + 1 })
+                mic = Self.micNamespaced(raw)
+                micFresh = true
+            }
+        }
+
+        if systemFresh || micFresh {
+            let combined = Self.combineDiarization(system: system, mic: mic)
+            let now = self.now()
+            // M-1: the re-key transaction commits before ANY fresh artifact
+            // persists — rename anchors resolve against the union, so rows
+            // anchored in a reused track's clusters re-key to themselves.
+            try await database.pool.write { db in
+                try SpeakerRenameStore.remapForFreshDiarization(
+                    db, meetingID: meetingID, fresh: combined, now: now)
+            }
+            if systemFresh { persistDiarization(system, at: paths.diarizationURL(meetingID)) }
+            if micFresh, let mic {
+                persistDiarization(mic, at: paths.diarizationMicURL(meetingID))
+            }
+        }
+        return (system, mic)
+    }
+
+    /// Rewrites normalized `"S<n>"` labels into the mic namespace `"M<n>"`
+    /// (C4 v5.6). The prefix — not an offset — separates the tracks: labels
+    /// stay collision-free whatever either track's cluster count does, and
+    /// a label names its track forever (what the rename re-key relies on).
+    /// Non-conforming labels pass through untouched.
+    static func micNamespaced(_ output: DiarizationOutput) -> DiarizationOutput {
+        let segments = output.segments.map { segment -> DiarizedSegment in
+            guard segment.speakerLabel.hasPrefix("S"),
+                Int(segment.speakerLabel.dropFirst()) != nil
+            else { return segment }
+            return DiarizedSegment(
+                speakerLabel: "M" + segment.speakerLabel.dropFirst(),
+                startSeconds: segment.startSeconds, endSeconds: segment.endSeconds)
+        }
+        return DiarizationOutput(segments: segments, speakerCount: output.speakerCount)
+    }
+
+    /// Union of the per-track clusterings (time-sorted; counts additive —
+    /// the namespaces are disjoint by construction). With no mic run this
+    /// is exactly the system output.
+    static func combineDiarization(
+        system: DiarizationOutput, mic: DiarizationOutput?
+    ) -> DiarizationOutput {
+        guard let mic, !mic.segments.isEmpty || mic.speakerCount > 0 else { return system }
+        let segments = (system.segments + mic.segments).sorted {
+            ($0.startSeconds, $0.endSeconds, $0.speakerLabel)
+                < ($1.startSeconds, $1.endSeconds, $1.speakerLabel)
+        }
+        return DiarizationOutput(
+            segments: segments, speakerCount: system.speakerCount + mic.speakerCount)
+    }
+
+    /// The combined persisted clustering for rename anchoring: system
+    /// artifact plus (room mode) the mic artifact. `nil` only when neither
+    /// exists.
     private func loadPersistedDiarization(meetingID: MeetingID) -> DiarizationOutput? {
-        let url = database.paths.diarizationURL(meetingID)
+        let system = loadPersistedDiarization(at: database.paths.diarizationURL(meetingID))
+        let mic = loadPersistedDiarization(at: database.paths.diarizationMicURL(meetingID))
+        guard system != nil || mic != nil else { return nil }
+        return Self.combineDiarization(
+            system: system ?? DiarizationOutput(segments: [], speakerCount: 0), mic: mic)
+    }
+
+    private func loadPersistedDiarization(at url: URL) -> DiarizationOutput? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(DiarizationOutput.self, from: data)
     }
 
-    private func persistDiarization(_ output: DiarizationOutput, meetingID: MeetingID) {
+    private func persistDiarization(_ output: DiarizationOutput, at url: URL) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         guard let data = try? encoder.encode(output) else { return }
-        try? data.write(to: database.paths.diarizationURL(meetingID), options: .atomic)
+        try? data.write(to: url, options: .atomic)
     }
 
     // MARK: - Stage 9: notes with the ONE-hop runtime fallback (D17 policy)

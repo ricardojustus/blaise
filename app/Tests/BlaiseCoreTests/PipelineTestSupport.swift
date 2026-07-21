@@ -171,8 +171,11 @@ final class PipelineMockASR: ASREngine, @unchecked Sendable {
 final class PipelineMockDiarizer: Diarizing, @unchecked Sendable {
     struct State {
         var output = PipelineMockData.diarization
+        /// Room-mode tests: per-call outputs consumed in order BEFORE
+        /// falling back to `output` (call 1 = system track, call 2 = mic).
+        var outputQueue: [DiarizationOutput] = []
         var error: EngineError?
-        var attendeeCounts: [Int?] = []
+        var expectedSpeakerCounts: [Int?] = []
     }
 
     let state = Mutex(State())
@@ -180,10 +183,11 @@ final class PipelineMockDiarizer: Diarizing, @unchecked Sendable {
     func prepare() async throws {}
     func availability() async -> EngineAvailability { .available }
 
-    func diarize(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput {
+    func diarize(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput {
         try state.withLock { state in
-            state.attendeeCounts.append(attendeeCount)
+            state.expectedSpeakerCounts.append(expectedSpeakerCount)
             if let error = state.error { throw error }
+            if !state.outputQueue.isEmpty { return state.outputQueue.removeFirst() }
             return state.output
         }
     }

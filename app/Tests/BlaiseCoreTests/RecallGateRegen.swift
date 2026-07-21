@@ -30,7 +30,7 @@ import Testing
 private final class RecallGateNoopDiarizer: Diarizing, @unchecked Sendable {
     func prepare() async throws {}
     func availability() async -> EngineAvailability { .available }
-    func diarize(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput {
+    func diarize(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput {
         DiarizationOutput(segments: [], speakerCount: 0)
     }
 }
