@@ -641,6 +641,7 @@ private struct NotesPane: View {
                     CorrectionsListView(
                         rows: correctionRows, busy: correctionBusy,
                         onDelete: { deleteCorrectionRow($0) },
+                        onEdit: { editCorrectionRow($0, text: $1) },
                         onRewrite: { rewriteNow() })
                 }
             }
@@ -887,6 +888,37 @@ private struct NotesPane: View {
             return "Note saved — it appears in the notes when the current run finishes."
         }
         return nil
+    }
+
+    /// §UX-3: edit the row's TEXT, keeping its anchor. An annotation edit
+    /// re-mints (the aside's wording must move now); an understanding edit
+    /// returns the row to `pending`, so the chip's "Re-write notes now" is the
+    /// user's next step — the edit is not silently applied to existing notes.
+    private func editCorrectionRow(_ row: MeetingCorrection, text: String) {
+        guard !text.isEmpty, text != row.userText, !correctionBusy else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        Task {
+            do {
+                let refused = try await pipeline.updateCorrection(
+                    meetingID: meetingID, id: row.id, quotedText: row.quotedText,
+                    occurrence: row.occurrence, userText: text)
+                uiState.lastActionError = editFeedback(row, refused: refused)
+            } catch {
+                uiState.lastActionError = "Could not edit: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    private func editFeedback(_ row: MeetingCorrection, refused: Bool) -> String? {
+        if row.kind == .understanding {
+            return "Correction updated — use \u{201C}Re-write notes now\u{201D} to apply it to these notes."
+        }
+        return refused
+            ? "Note updated — it reaches the delivered notes when processing completes."
+            : nil
     }
 
     /// PIN PICKER (§AC4): re-anchor a stale note onto the block the user

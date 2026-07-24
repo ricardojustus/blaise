@@ -233,7 +233,15 @@ struct CorrectionsListView: View {
     var rows: [MeetingCorrection]
     var busy: Bool
     var onDelete: (MeetingCorrection) -> Void
+    /// §UX-3: edit of the row's text. An annotation edit re-mints; an
+    /// understanding edit returns the row to `pending` for the next re-write.
+    var onEdit: (MeetingCorrection, String) -> Void
     var onRewrite: () -> Void
+
+    /// The row being edited, if any, and its in-progress text. One at a time:
+    /// this popover is a management list, not a document editor.
+    @State private var editingID: String?
+    @State private var draft = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -259,15 +267,35 @@ struct CorrectionsListView: View {
                                     in: Capsule())
                             statusBadge(row.status)
                         }
-                        Text(row.userText)
-                            .font(.system(size: 12))
-                            .lineLimit(3)
+                        if editingID == row.id {
+                            editor(for: row)
+                        } else {
+                            Text(row.userText)
+                                .font(.system(size: 12))
+                                .lineLimit(3)
+                        }
                         Text("on \u{201C}\(AddNotePopover.shortQuote(row.quotedText))\u{201D}")
                             .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
                     Spacer(minLength: 0)
+                    if editingID != row.id {
+                        // §UX-3: edit, the half of management that never
+                        // shipped — delete was the only way to change a row.
+                        Button {
+                            draft = row.userText
+                            editingID = row.id
+                        } label: {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(busy)
+                        .help(row.kind == .understanding
+                            ? "Edit — the row returns to pending for the next re-write"
+                            : "Edit — updates the note and re-delivers")
+                    }
                     Button {
                         onDelete(row)
                     } label: {
@@ -296,6 +324,33 @@ struct CorrectionsListView: View {
         }
         .padding(14)
         .frame(width: 340)
+    }
+
+    /// The inline edit field. Deliberately the TEXT only: the quote is the
+    /// anchor, and re-anchoring has its own affordance (the pin picker).
+    @ViewBuilder
+    private func editor(for row: MeetingCorrection) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextField("", text: $draft, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12))
+                .lineLimit(2...5)
+            HStack(spacing: 8) {
+                Button("Cancel") { editingID = nil }
+                    .font(.system(size: 11))
+                Button("Save") {
+                    let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                    editingID = nil
+                    onEdit(row, text)
+                }
+                .font(.system(size: 11))
+                .keyboardShortcut(.defaultAction)
+                .disabled(
+                    busy
+                        || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || draft.trimmingCharacters(in: .whitespacesAndNewlines) == row.userText)
+            }
+        }
     }
 
     @ViewBuilder
