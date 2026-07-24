@@ -63,6 +63,29 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     private var writeFailed = false
     private var listeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
 
+    // B4 route-change resilience (all owned by processingQueue). One physical
+    // route event (AirPods connect) fires the default-device listeners many
+    // times over a few seconds — observed 6 rebuilds in 5 s with the rate
+    // flapping 48k↔24k (2026-07-23 log) — and every destructive rebuild
+    // drops the audio in its teardown→live window. So: triggers coalesce
+    // into ONE debounced rebuild; a failed rebuild walks a retry ladder
+    // before declaring the capture dead; and the audio lost while the graph
+    // was down is back-filled as silence so the timeline stays wall-clock
+    // true (the stitcher gap-fills PART boundaries only, never in-part gaps).
+    /// The one pending debounced rebuild/retry (superseded by newer triggers,
+    /// cancelled by stop).
+    private var pendingRebuild: DispatchWorkItem?
+    /// True when the pending rebuild MUST run (device identity changed).
+    /// A rate-only pending is skipped if the aggregate's rate never moved.
+    private var pendingForced = false
+    /// Position on the retry ladder; reset by success or a fresh route change.
+    private var rebuildAttempt = 0
+    /// Monotonic uptime when buffers were last accepted for writing — the
+    /// gap-fill anchor. Uptime, never wall-clock: system sleep must not be
+    /// back-filled as hours of silence (the silence watchdog pins the same
+    /// clock choice for the same reason).
+    private var lastBufferUptime: TimeInterval?
+
     public init() {}
 
     // MARK: - AudioCapturing
@@ -82,6 +105,9 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             self.lastLevelEmit = nil
             self.stopped = false
             self.writeFailed = false
+            self.pendingForced = false
+            self.rebuildAttempt = 0
+            self.lastBufferUptime = nil
             do {
                 try buildGraph()
             } catch {
@@ -100,6 +126,9 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         processingQueue.sync {
             guard !stopped else { return }
             stopped = true
+            pendingRebuild?.cancel()
+            pendingRebuild = nil
+            pendingForced = false
             removeRouteListeners()
             teardownGraph()
             writers?.system.close()
@@ -124,6 +153,13 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         var streamFormats: [AVAudioFormat]
         var micConverter: AVAudioConverter?
         var systemConverter: AVAudioConverter?
+        /// B4: the aggregate's nominal rate as READ at build time (raw, pre-
+        /// validation). The rate listener compares against this observation,
+        /// so a rebuild happens only when the reported rate actually MOVED —
+        /// loop-proof: a fresh aggregate notifies for its own initial rate.
+        var observedRateAtBuild: Double?
+        /// B4: nominal-rate listener on this aggregate (removed at teardown).
+        var rateListener: AudioObjectPropertyListenerBlock?
     }
 
     private func buildGraph() throws {
@@ -246,11 +282,29 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 throw CaptureSessionError.coreAudio("AudioDeviceStart", status)
             }
 
+            // B4: watch the aggregate's nominal rate. Only default-device
+            // IDENTITY changes trigger the route listeners — a same-device
+            // rate renegotiation (Bluetooth flapped 48k↔24k within seconds
+            // on 2026-07-23) would otherwise leave the converters resampling
+            // by the wrong ratio: pitch-shifted tracks and no error anywhere.
+            let rateListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.processingQueue.async { self?.scheduleRebuild(forced: false) }
+            }
+            var rateAddress = Self.nominalRateAddress
+            let rateStatus = AudioObjectAddPropertyListenerBlock(
+                aggregateID, &rateAddress, processingQueue, rateListener)
+            if rateStatus != noErr {
+                logger.error(
+                    "nominal-rate listener install failed (OSStatus \(rateStatus)) — same-device rate changes will not rebuild")
+            }
+
             graph = Graph(
                 tapID: tapID, aggregateID: aggregateID, aggregateUID: aggregateUID,
                 procID: procID,
                 micStreamCount: micStreamCount, streamFormats: streamFormats,
-                micConverter: micConverter, systemConverter: systemConverter)
+                micConverter: micConverter, systemConverter: systemConverter,
+                observedRateAtBuild: aggregateRate,
+                rateListener: rateStatus == noErr ? rateListener : nil)
             logger.notice(
                 "capture graph live: \(streams.count) streams (\(micStreamCount) mic), tap format \(streamFormats.last.map { "\($0.sampleRate) Hz \($0.channelCount) ch" } ?? "unknown")")
         } catch {
@@ -265,6 +319,11 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     private func teardownGraph() {
         guard let graph else { return }
         generation += 1
+        if let rateListener = graph.rateListener {
+            var rateAddress = Self.nominalRateAddress
+            _ = AudioObjectRemovePropertyListenerBlock(
+                graph.aggregateID, &rateAddress, processingQueue, rateListener)
+        }
         _ = AudioDeviceStop(graph.aggregateID, graph.procID)
         _ = AudioDeviceDestroyIOProcID(graph.aggregateID, graph.procID)
         _ = AudioHardwareDestroyAggregateDevice(graph.aggregateID)
@@ -273,7 +332,19 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         self.graph = nil
     }
 
-    // MARK: - Route changes (default output OR input): full rebuild
+    // MARK: - Route changes (default output OR input): debounced full rebuild
+
+    /// B4: the quiet window that collapses a notification storm (both
+    /// default-device listeners fire, several times, per physical event)
+    /// into one destructive rebuild. The old graph keeps running while the
+    /// window is open, so a still-working route loses nothing to the wait.
+    static let rebuildDebounceSeconds: TimeInterval = 0.5
+    /// B4: backoff before a rebuild failure ends the recording. A route
+    /// change mid-Bluetooth-negotiation fails transiently (no default input
+    /// for a moment after an unplug; HAL errors while devices flap) — a
+    /// transient error must not kill a recording (Floor 2: dead air for
+    /// seconds is recoverable, a stopped capture is not).
+    static let rebuildRetryDelays: [TimeInterval] = [0.5, 1, 2, 4, 8]
 
     /// The tap follows the default output for audio by itself, but the
     /// negotiated format can change with the route (48 kHz speakers →
@@ -288,7 +359,7 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 mScope: kAudioObjectPropertyScopeGlobal,
                 mElement: kAudioObjectPropertyElementMain)
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-                self?.processingQueue.async { self?.rebuildAfterRouteChange() }
+                self?.processingQueue.async { self?.scheduleRebuild(forced: true) }
             }
             let status = AudioObjectAddPropertyListenerBlock(
                 AudioObjectID(kAudioObjectSystemObject), &address, processingQueue, block)
@@ -307,17 +378,136 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         listeners.removeAll()
     }
 
-    private func rebuildAfterRouteChange() {
+    /// B4: every rebuild trigger lands here and coalesces into the single
+    /// pending work item. `forced` (device identity changed) always
+    /// rebuilds; a rate-only trigger may be skipped at fire time if the
+    /// aggregate's reported rate never actually moved.
+    private func scheduleRebuild(forced: Bool) {
         guard !stopped else { return }
-        logger.notice("default device changed — rebuilding capture graph")
+        pendingForced = pendingForced || forced
+        // A fresh route change means the device world CHANGED — whatever
+        // failed before may work now, so the retry ladder starts over.
+        if forced { rebuildAttempt = 0 }
+        enqueueRebuild(after: Self.rebuildDebounceSeconds)
+    }
+
+    private func enqueueRebuild(after delay: TimeInterval) {
+        pendingRebuild?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.performPendingRebuild() }
+        pendingRebuild = item
+        processingQueue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func performPendingRebuild() {
+        guard !stopped else { return }
+        pendingRebuild = nil
+        let forced = pendingForced
+        pendingForced = false
+        // Rate-only trigger: skip when the aggregate's reported rate never
+        // moved from the build-time observation (creating an aggregate
+        // notifies for its own initial rate — an unconditional rebuild here
+        // would loop forever).
+        if !forced, let graph,
+            !Self.rateChangeRequiresRebuild(
+                current: Self.aggregateNominalSampleRate(graph.aggregateID),
+                observedAtBuild: graph.observedRateAtBuild)
+        { return }
+        logger.notice("default device or delivered rate changed — rebuilding capture graph")
         teardownGraph()
         do {
             try buildGraph()
+            rebuildAttempt = 0
+            fillCaptureGap()
         } catch {
-            // Rebuild failure = capture cannot continue; route through the
-            // write-failure stop policy (stop + encode what exists).
-            logger.error("capture graph rebuild failed: \(error)")
-            onEvent?(.writeFailure("audio route change broke the capture (\(error))"))
+            guard rebuildAttempt < Self.rebuildRetryDelays.count else {
+                // Ladder exhausted: capture cannot continue; route through
+                // the write-failure stop policy (stop + encode what exists).
+                logger.error(
+                    "capture graph rebuild failed after \(Self.rebuildRetryDelays.count) retries: \(error)")
+                onEvent?(.writeFailure("audio route change broke the capture (\(error))"))
+                return
+            }
+            let delay = Self.rebuildRetryDelays[rebuildAttempt]
+            rebuildAttempt += 1
+            logger.error(
+                "capture graph rebuild failed (attempt \(self.rebuildAttempt)): \(error) — retrying in \(delay)s")
+            // The dead air accumulating during retries is back-filled by the
+            // next successful rebuild's gap fill.
+            pendingForced = true
+            enqueueRebuild(after: delay)
+        }
+    }
+
+    /// B4: rebuild only when the aggregate's reported nominal rate MOVED
+    /// against the build-time observation. nil current (unreadable now) →
+    /// no rebuild: zero information, and rebuilding while the rate stays
+    /// unreadable would loop. nil observation with a readable current →
+    /// rebuild once (the fallback-format graph upgrades to a validated-rate
+    /// graph); the new graph then records the observation, so this cannot
+    /// loop either.
+    static func rateChangeRequiresRebuild(current: Double?, observedAtBuild: Double?) -> Bool {
+        guard let current else { return false }
+        guard let observedAtBuild else { return true }
+        return abs(current - observedAtBuild) >= 1
+    }
+
+    // MARK: - B4 gap fill: excised rebuild windows become silence
+
+    /// Below the minimum a fill is jitter noise, not a gap; the cap bounds
+    /// the fill so a pathological anchor can never flood the tracks.
+    static let gapFillMinimumSeconds = 0.05
+    static let gapFillMaximumSeconds = 300.0
+
+    /// Frames of silence for a measured capture gap (0 = no fill).
+    static func silenceFillFrames(gapSeconds: Double, sampleRate: Double) -> Int {
+        guard gapSeconds >= gapFillMinimumSeconds else { return 0 }
+        return Int(min(gapSeconds, gapFillMaximumSeconds) * sampleRate)
+    }
+
+    /// A rebuild EXCISES the audio between teardown and the new graph going
+    /// live (0.1–2.2 s per rebuild on 2026-07-23; more when retries run).
+    /// The stitcher silence-fills PART boundaries only — an in-part gap
+    /// silently compresses the timeline, shifting everything after a device
+    /// change earlier and skewing diarization/calendar alignment. So write
+    /// the measured gap into BOTH tracks as silence, in the writer format.
+    /// Runs on processingQueue right after a successful rebuild — BEFORE any
+    /// new-generation buffer can be processed (serial-queue order), so the
+    /// fill lands exactly at the gap position.
+    private func fillCaptureGap() {
+        guard let lastBufferUptime, let writers else { return }
+        let gap = ProcessInfo.processInfo.systemUptime - lastBufferUptime
+        let frames = Self.silenceFillFrames(
+            gapSeconds: gap, sampleRate: CaptureCAFWriter.sampleRate)
+        guard frames > 0 else { return }
+        logger.notice(
+            "gap-filling \(frames) frames (\(gap, format: .fixed(precision: 2)) s) of silence after rebuild")
+        do {
+            try writeSilence(frames: frames, to: writers.system)
+            try writeSilence(frames: frames, to: writers.mic)
+            self.lastBufferUptime = ProcessInfo.processInfo.systemUptime
+        } catch {
+            writeFailed = true
+            onEvent?(.writeFailure("\(error)"))
+        }
+    }
+
+    /// ≤ 1 s chunks bound the allocation; the buffer is explicitly zeroed
+    /// (AVAudioPCMBuffer does not document zero-initialized memory).
+    private func writeSilence(frames: Int, to writer: CaptureCAFWriter) throws {
+        let chunkFrames = Int(CaptureCAFWriter.sampleRate)
+        var remaining = frames
+        while remaining > 0 {
+            let n = AVAudioFrameCount(min(remaining, chunkFrames))
+            guard
+                let buffer = AVAudioPCMBuffer(
+                    pcmFormat: CaptureCAFWriter.format, frameCapacity: n)
+            else { return }
+            buffer.frameLength = n
+            if let channel = buffer.int16ChannelData?[0] {
+                channel.update(repeating: 0, count: Int(n))
+            }
+            try writer.write(buffer)
+            remaining -= Int(n)
         }
     }
 
@@ -344,6 +534,8 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         guard generation == self.generation, !stopped, !writeFailed,
             let graph, let writers
         else { return }
+        // B4 gap-fill anchor: buffers are flowing for the live generation.
+        lastBufferUptime = ProcessInfo.processInfo.systemUptime
 
         var micData = Data()
         var systemData = Data()
@@ -575,14 +767,20 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
 
     // MARK: - B3: aggregate-delivered sample rate (drift root fix)
 
+    /// The nominal-rate property address — shared by the build-time read and
+    /// the B4 rate listener (install + removal must use the same address).
+    static var nominalRateAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+    }
+
     /// The aggregate's currently-delivered (master) sample rate. With the mic
     /// pinned as master (B3), every stream is drift-compensated to this rate, so
     /// it is the correct converter INPUT rate. nil if unreadable or <= 0.
     static func aggregateNominalSampleRate(_ deviceID: AudioObjectID) -> Double? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
+        var address = Self.nominalRateAddress
         var rate = Float64(0)
         var size = UInt32(MemoryLayout<Float64>.size)
         guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate) == noErr,

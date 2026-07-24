@@ -132,6 +132,54 @@ struct CaptureRateResolutionTests {
     }
 }
 
+/// B4: route-change resilience — the deterministic, headless-testable parts
+/// (rate-move gate, gap-fill sizing). The WIRING (debounced rebuild, retry
+/// ladder, silence actually landing in the CAFs) needs live HAL devices and
+/// is covered by the gated capture integration test at the Human Touchpoint.
+struct RouteChangeResilienceTests {
+
+    @Test("rateChangeRequiresRebuild: only a MOVED readable rate rebuilds (loop-proof)")
+    func rateMoveGate() {
+        // Unreadable now -> zero information, never rebuild (would loop while
+        // the rate stays unreadable).
+        #expect(!CaptureSession.rateChangeRequiresRebuild(current: nil, observedAtBuild: 48000))
+        #expect(!CaptureSession.rateChangeRequiresRebuild(current: nil, observedAtBuild: nil))
+        // Readable now, unreadable at build -> one upgrade rebuild.
+        #expect(CaptureSession.rateChangeRequiresRebuild(current: 48000, observedAtBuild: nil))
+        // Same rate (an aggregate notifies for its own initial rate) -> skip.
+        #expect(!CaptureSession.rateChangeRequiresRebuild(current: 48000, observedAtBuild: 48000))
+        #expect(!CaptureSession.rateChangeRequiresRebuild(current: 48000.5, observedAtBuild: 48000))
+        // A real move (the observed Bluetooth 48k<->24k flap) -> rebuild.
+        #expect(CaptureSession.rateChangeRequiresRebuild(current: 24000, observedAtBuild: 48000))
+        #expect(CaptureSession.rateChangeRequiresRebuild(current: 48000, observedAtBuild: 24000))
+    }
+
+    @Test("silenceFillFrames: sub-minimum gaps are jitter; real gaps fill; the cap bounds")
+    func gapSizing() {
+        let rate = CaptureCAFWriter.sampleRate
+        // Below the minimum: no fill (sub-buffer jitter, not a gap).
+        #expect(CaptureSession.silenceFillFrames(gapSeconds: 0, sampleRate: rate) == 0)
+        #expect(CaptureSession.silenceFillFrames(gapSeconds: 0.04, sampleRate: rate) == 0)
+        // The observed per-rebuild loss band (0.1–2.2 s) fills exactly.
+        #expect(CaptureSession.silenceFillFrames(gapSeconds: 0.5, sampleRate: rate) == 8000)
+        #expect(CaptureSession.silenceFillFrames(gapSeconds: 2.2, sampleRate: rate) == 35200)
+        // The cap bounds a pathological anchor.
+        #expect(
+            CaptureSession.silenceFillFrames(gapSeconds: 10_000, sampleRate: rate)
+                == Int(CaptureSession.gapFillMaximumSeconds * rate))
+    }
+
+    @Test("retry ladder: bounded, monotonic, finite total")
+    func retryLadder() {
+        let delays = CaptureSession.rebuildRetryDelays
+        #expect(!delays.isEmpty)
+        #expect(delays == delays.sorted())
+        // The whole ladder resolves (or gives up) well under a minute — the
+        // user-visible ceiling for "recording still green but silent".
+        #expect(delays.reduce(0, +) < 60)
+    }
+}
+
 // MARK: - CAF writer format assertions (AC1)
 
 @Suite("C11 capture CAF writer")
