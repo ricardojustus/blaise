@@ -147,6 +147,32 @@ public enum MeetingCorrectionStore {
     }
 }
 
+/// G17 FIX H: the single-line fold for USER-authored correction text and the
+/// quotes that travel with it.
+///
+/// Deliberately separate from `NotesRenderer.flattenToTitleLine`: that one
+/// owns TITLE bytes for every meeting (including the ones with no corrections
+/// at all) and strips a leading `#` run, which is title semantics. This one
+/// collapses EVERY Unicode line break — LF/CR/CRLF plus U+000B, U+000C,
+/// U+0085, U+2028 and U+2029, which end a line for renderers that are not
+/// strictly CommonMark and for the synthesis prompt alike. Two escapes close
+/// with it: a note escaping its `>` blockquote in notes.md, and a quote or
+/// note body forging an extra numbered entry inside the prompt's
+/// AUTHORITATIVE corrections block.
+///
+/// A leading `#` is deliberately NOT stripped: inline after our
+/// "**Your note:** " prefix it is inert, and stripping it would silently eat
+/// the body of a note that is legitimately just "### TODO".
+public enum CorrectionSanitize {
+    public static func flatten(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .components(separatedBy: .newlines)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+    }
+}
+
 /// The pure anchoring discipline shared by the renderer, the re-anchor pass,
 /// and the UI: a quote matches a block when the folded block CONTAINS the
 /// folded quote; `occurrence` selects among multiple matching blocks.

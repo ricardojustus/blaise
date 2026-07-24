@@ -108,7 +108,7 @@ public enum NotesRenderer {
         if !weave.unanchored.isEmpty {
             blocks.append("## \(strings.yourNotes)")
             blocks.append(weave.unanchored.map { note in
-                "- \(flattenToTitleLine(note.text)) *(\(strings.wasOn) \u{201C}\(anchorQuote(note.quote))\u{201D})*"
+                "- \(CorrectionSanitize.flatten(note.text)) *(\(strings.wasOn) \u{201C}\(anchorQuote(note.quote))\u{201D})*"
             }.joined(separator: "\n"))
         }
         return blocks.joined(separator: "\n\n") + "\n"
@@ -166,21 +166,22 @@ public enum NotesRenderer {
     }
 
     /// A note aside: one blockquote paragraph. The note body flattens to one
-    /// line (a multi-line note must not escape the blockquote).
+    /// line (a multi-line note must not escape the blockquote) through the
+    /// correction fold, which keeps a `#`-only note's body (FIX H).
     private static func aside(_ text: String, strings: LocalizedStrings) -> String {
-        "> **\(strings.yourNote):** \(flattenToTitleLine(text))"
+        "> **\(strings.yourNote):** \(CorrectionSanitize.flatten(text))"
     }
 
     /// A list-adjacent aside names its anchor (the aside sits after the list,
     /// so adjacency alone cannot associate it).
     private static func aside(_ text: String, on quote: String, strings: LocalizedStrings) -> String {
-        "> **\(strings.yourNote)** (\(strings.wasOn) \u{201C}\(anchorQuote(quote))\u{201D}): \(flattenToTitleLine(text))"
+        "> **\(strings.yourNote)** (\(strings.wasOn) \u{201C}\(anchorQuote(quote))\u{201D}): \(CorrectionSanitize.flatten(text))"
     }
 
     /// Anchor quotes render flattened and bounded (a full paragraph quote
     /// would swallow the document).
     private static func anchorQuote(_ quote: String) -> String {
-        let flat = flattenToTitleLine(quote)
+        let flat = CorrectionSanitize.flatten(quote)
         guard flat.count > 60 else { return flat }
         return flat.prefix(59).trimmingCharacters(in: .whitespaces) + "…"
     }
@@ -249,17 +250,17 @@ public enum NotesRenderer {
     /// Title/meetingTitle → single line: newlines become spaces, leading `#`
     /// run stripped, surrounding whitespace trimmed.
     ///
-    /// FIX G: "newline" means EVERY Unicode line break, not just LF/CR/CRLF —
-    /// U+000B, U+000C, U+0085, U+2028 and U+2029 all end a line for renderers
-    /// that are not strictly CommonMark. G17 flattens user annotation text
-    /// through here before it goes into a `>` aside, so a surviving separator
-    /// would let the note's tail escape its blockquote downstream. CRLF
-    /// collapses first so the pair still yields ONE space.
+    /// FIX H: deliberately NOT widened to the other Unicode line separators.
+    /// This function owns TITLE bytes for every meeting, including the ones
+    /// with no corrections at all — widening it moved the rendered output of
+    /// a pre-G17 title containing U+2028. User correction text has its own
+    /// fold (`CorrectionSanitize.flatten`), which is where that hardening
+    /// belongs.
     static func flattenToTitleLine(_ raw: String) -> String {
         var line = raw
             .replacingOccurrences(of: "\r\n", with: " ")
-            .components(separatedBy: .newlines)
-            .joined(separator: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
             .trimmingCharacters(in: .whitespaces)
         while line.hasPrefix("#") {
             line.removeFirst()

@@ -298,6 +298,11 @@ public enum NotesPromptBuilder {
     /// user reviewed an earlier draft; their statement of fact outranks
     /// transcript inference). Notes are context to honor, never to restate as
     /// findings. nil when the meeting has no rows (presence gate).
+    ///
+    /// FIX H: every user-authored string is folded to ONE line first. A
+    /// newline inside a quote or a note body otherwise forges additional
+    /// numbered entries inside a block the prompt itself labels authoritative
+    /// — the highest-trust position in the whole message.
     static func correctionsBlock(_ corrections: [NotesCorrection]) -> String? {
         guard !corrections.isEmpty else { return nil }
         var lines: [String] = []
@@ -306,9 +311,11 @@ public enum NotesPromptBuilder {
         if !understanding.isEmpty {
             lines.append(
                 "USER CORRECTIONS (authoritative — the user reviewed an earlier draft of these notes; these corrections override anything the transcript seems to imply):")
+            lines.append(
+                "Where a correction conflicts with the transcript, the correction wins: treat the transcript passage as misheard or misunderstood.")
             for (index, correction) in understanding.enumerated() {
                 lines.append(
-                    "\(index + 1). In the \(sectionLabel(correction.section)), an earlier draft said: \"\(correction.quotedText)\". The user corrects: \(correction.userText)")
+                    "\(index + 1). In the \(sectionLabel(correction.section)), an earlier draft said: \"\(CorrectionSanitize.flatten(correction.quotedText))\". The user corrects: \(CorrectionSanitize.flatten(correction.userText))")
             }
         }
 
@@ -318,7 +325,8 @@ public enum NotesPromptBuilder {
             lines.append(
                 "USER NOTES (the user's own margin notes; do not contradict them and do not restate them as your own findings):")
             for note in annotations {
-                lines.append("- (on \"\(note.quotedText)\") \(note.userText)")
+                lines.append(
+                    "- (on \"\(CorrectionSanitize.flatten(note.quotedText))\") \(CorrectionSanitize.flatten(note.userText))")
             }
         }
         return lines.joined(separator: "\n")
