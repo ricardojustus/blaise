@@ -348,11 +348,18 @@ private func makeRow(
         let before = EvidencePayloadBuilder.build(
             meeting: meeting, segments: [], notes: bare, user: user)
 
+        // AC6: the gate is ABSENCE, not an empty array — the bare payload must
+        // carry no such key at all, or a pre-G17 payload could not
+        // re-materialize byte-identically.
+        let bareJSON = String(decoding: before.bytes, as: UTF8.self)
+        #expect(!bareJSON.contains("user_corrections"))
+
         var withEmpty = bare
         withEmpty.userCorrections = []
         let gated = EvidencePayloadBuilder.build(
             meeting: meeting, segments: [], notes: withEmpty, user: user)
         #expect(gated.versionHash == before.versionHash)
+        #expect(!String(decoding: gated.bytes, as: UTF8.self).contains("user_corrections"))
 
         var withSnapshot = bare
         let row = MeetingCorrection(
@@ -431,9 +438,11 @@ private func makeRow(
         let blocks = ["alpha beta", "gamma beta", "delta"]
         #expect(CorrectionAnchoring.matches(quote: "BETA", in: blocks) == [0, 1])
         #expect(CorrectionAnchoring.resolve(quote: "beta", occurrence: 1, in: blocks)?.blockIndex == 1)
-        // Out-of-range occurrence clamps to the first match (a re-write that
-        // collapsed duplicates keeps the note attached).
-        #expect(CorrectionAnchoring.resolve(quote: "beta", occurrence: 7, in: blocks)?.blockIndex == 2 - 1)
+        // Out-of-range occurrence clamps to the LAST match (a re-write that
+        // collapsed duplicates keeps the note attached; block 1 is the last of
+        // the two "beta" matches, not the first).
+        #expect(CorrectionAnchoring.resolve(quote: "beta", occurrence: 7, in: blocks)?.blockIndex == 1)
+        #expect(CorrectionAnchoring.resolve(quote: "beta", occurrence: 7, in: blocks)?.occurrence == 1)
         #expect(CorrectionAnchoring.resolve(quote: "absent", occurrence: 0, in: blocks) == nil)
         #expect(CorrectionAnchoring.resolve(quote: "", occurrence: 0, in: blocks) == nil)
     }

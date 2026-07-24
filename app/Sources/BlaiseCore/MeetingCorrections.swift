@@ -263,8 +263,10 @@ public enum CorrectionAnchoring {
     }
 
     /// The block index an anchor currently resolves to, or nil (stale). An
-    /// out-of-range stored occurrence clamps to the first match: a re-write
-    /// that collapsed duplicates should keep the note attached, not orphan it.
+    /// out-of-range stored occurrence clamps to the LAST match: a re-write
+    /// that collapsed duplicates should keep the note attached rather than
+    /// orphan it, and the last surviving match is the closest thing to "the
+    /// one that used to be further down".
     public static func resolve(
         quote: String, occurrence: Int, in blocks: [String]
     ) -> (blockIndex: Int, occurrence: Int)? {
