@@ -192,6 +192,44 @@ private func makeRow(
             "- Important reminder. *(on \u{201C}a paragraph the re-write removed\u{201D})*"))
     }
 
+    @Test("FIX B: a fenced detailed-notes block spanning a blank line stays intact; the aside lands after the blob")
+    func fencedDetailedNotesKeepFenceAndAppendAside() throws {
+        let fenced = NotesStructured(
+            title: "Sync",
+            summary: "Setup summary.",
+            detailedNotes: """
+                Intro paragraph before the code.
+
+                ```swift
+                let a = 1
+
+                let b = 2
+                ```
+
+                Closing paragraph.
+                """,
+            decisions: [],
+            actionItems: [],
+            userActionItems: [])
+        let markdown = try NotesRenderer.render(
+            fenced, language: "en", meetingTitle: "Sync", userName: "Sam",
+            annotations: [
+                annotation(
+                    section: .detailedNotes, quote: "Intro paragraph before the code",
+                    text: "Link the PR here.")
+            ])
+        // The fence — including its INTERIOR blank line — survives whole; the
+        // old per-paragraph path split it on the blank line and force-closed
+        // it per fragment.
+        #expect(markdown.contains("```swift\nlet a = 1\n\nlet b = 2\n```"))
+        // The aside is appended AFTER the whole blob, in the quoted form
+        // (adjacency to its exact paragraph is no longer possible).
+        #expect(markdown.contains(
+            "> **Your note** (on \u{201C}Intro paragraph before the code.\u{201D}): Link the PR here."))
+        // The corrupt per-fragment re-close never appears.
+        #expect(!markdown.contains("```\n\n```"))
+    }
+
     @Test("Portuguese localization for asides and tail")
     func portuguese() throws {
         let markdown = try NotesRenderer.render(

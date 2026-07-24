@@ -64,18 +64,29 @@ public enum NotesRenderer {
         blocks.append("## \(strings.detailedNotes)")
         if weave.detailedAsides.isEmpty {
             blocks.append(detailedNotes.isEmpty ? strings.noneMarker : demoteHeadings(in: detailedNotes))
+        } else if containsFence(detailedNotes) {
+            // FIX B: the per-paragraph path splits on blank lines, but a
+            // fenced code block that spans a blank line is split mid-fence and
+            // `demoteHeadings` force-closes it per fragment — corrupting the
+            // block. When this section has anchored asides AND a fence, render
+            // the whole blob once (fence intact) and append the asides after
+            // it in the quoted form (they can no longer sit under their exact
+            // paragraph, so the quote names the anchor). Deterministic order:
+            // by block index, then row order within a block.
+            blocks.append(demoteHeadings(in: detailedNotes))
+            for entry in weave.detailedAsides.sorted(by: { $0.key < $1.key }).flatMap(\.value) {
+                blocks.append(aside(entry.text, on: entry.quote, strings: strings))
+            }
         } else {
             // Per-paragraph render so each aside lands under its anchor. The
             // paragraph split mirrors `CorrectionAnchoring.blocks`; demoting
-            // per paragraph is equivalent except for a fenced code block that
-            // spans a blank line, which this path may re-close per paragraph
-            // — accepted: it activates only when a note anchors in this
-            // section, and anchoring itself is paragraph-granular.
+            // per paragraph is equivalent for fence-free prose (the fenced
+            // case is handled above).
             let paragraphs = CorrectionAnchoring.blocks(of: s, section: .detailedNotes)
             for (index, paragraph) in paragraphs.enumerated() {
                 blocks.append(demoteHeadings(in: paragraph))
-                for text in weave.detailedAsides[index] ?? [] {
-                    blocks.append(aside(text, strings: strings))
+                for entry in weave.detailedAsides[index] ?? [] {
+                    blocks.append(aside(entry.text, strings: strings))
                 }
             }
             if paragraphs.isEmpty {
@@ -110,7 +121,11 @@ public enum NotesRenderer {
     /// order within each bucket).
     struct AnnotationWeave {
         var summaryAsides: [String] = []
-        var detailedAsides: [Int: [String]] = [:]
+        // FIX B: detailed asides carry their anchor quote as well as the text.
+        // The per-paragraph path renders the text under its paragraph (quote
+        // redundant there); the fenced-blob path renders the quoted form after
+        // the whole blob, where adjacency no longer names the anchor.
+        var detailedAsides: [Int: [(quote: String, text: String)]] = [:]
         var decisionAsides: [(quote: String, text: String)] = []
         var actionAsides: [(quote: String, text: String)] = []
         var unanchored: [(quote: String, text: String)] = []
@@ -130,7 +145,8 @@ public enum NotesRenderer {
                 case .summary:
                     weave.summaryAsides.append(row.userText)
                 case .detailedNotes:
-                    weave.detailedAsides[hit.blockIndex, default: []].append(row.userText)
+                    weave.detailedAsides[hit.blockIndex, default: []]
+                        .append((blocks[hit.blockIndex], row.userText))
                 case .decision:
                     weave.decisionAsides.append((blocks[hit.blockIndex], row.userText))
                 case .actionItem:
@@ -139,6 +155,14 @@ public enum NotesRenderer {
             }
             return weave
         }
+    }
+
+    /// FIX B: whether the raw detailed-notes blob carries a fenced code block.
+    /// A conservative substring check on the fence markers — any fence sends
+    /// the section down the whole-blob path, because the per-paragraph aside
+    /// weaving corrupts a fence that spans a blank line.
+    private static func containsFence(_ body: String) -> Bool {
+        body.contains("```") || body.contains("~~~")
     }
 
     /// A note aside: one blockquote paragraph. The note body flattens to one
