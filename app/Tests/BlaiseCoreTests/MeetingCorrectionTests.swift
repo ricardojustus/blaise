@@ -366,4 +366,25 @@ private func makeRow(
         // The orphan keeps its stored occurrence for the eventual re-pin.
         #expect(updates.first { $0.id == orphan.id }?.occurrence == 0)
     }
+
+    @Test("FIX E: occurrence from the block's position among fold-matches anchors identical duplicates distinctly")
+    func occurrenceDisambiguatesIdenticalBlocks() throws {
+        // Two blocks share identical text; a third differs. This is what the
+        // UI's `matchOccurrence` computes at menu-action time — the position
+        // of a block's own index among the blocks that fold-match its text.
+        let blocks = ["Ship it.", "Ship it.", "Hold the launch."]
+        let firstOccurrence = CorrectionAnchoring.matches(quote: blocks[0], in: blocks).firstIndex(of: 0)
+        let secondOccurrence = CorrectionAnchoring.matches(quote: blocks[1], in: blocks).firstIndex(of: 1)
+        #expect(firstOccurrence == 0)
+        #expect(secondOccurrence == 1)
+        // Round-trip: each stored occurrence resolves back to ITS OWN block.
+        // The previous hard-coded occurrence 0 anchored BOTH duplicates to the
+        // first block — the mis-anchoring FIX E removes.
+        #expect(
+            CorrectionAnchoring.resolve(quote: "Ship it.", occurrence: try #require(firstOccurrence), in: blocks)?
+                .blockIndex == 0)
+        #expect(
+            CorrectionAnchoring.resolve(quote: "Ship it.", occurrence: try #require(secondOccurrence), in: blocks)?
+                .blockIndex == 1)
+    }
 }

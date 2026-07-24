@@ -16,6 +16,11 @@ struct CorrectionTarget: Identifiable, Equatable {
     var action: Action
     var section: MeetingCorrection.Section
     var blockText: String
+    /// FIX E: which fold-match within the section this block is (0-based),
+    /// computed at menu-action time so a correction/note anchors to the RIGHT
+    /// block when two blocks share identical text. Summary/detailed keep 0
+    /// (their UI granularity does not map 1:1 to the fold-split blocks).
+    var occurrence: Int = 0
 }
 
 /// What the correction popover hands back on save.
@@ -23,6 +28,8 @@ struct CorrectionSubmission {
     var section: MeetingCorrection.Section
     var quotedText: String
     var userText: String
+    /// FIX E: threaded from the target (the block's fold-match occurrence).
+    var occurrence: Int
     /// The demoted escape hatch: re-transcribe from the kept audio.
     var fullReprocess: Bool
 }
@@ -33,6 +40,9 @@ struct CorrectionSubmission {
 struct CorrectableBlock<Content: View>: View {
     var section: MeetingCorrection.Section
     var blockText: String
+    /// FIX E: the block's fold-match occurrence within its section (0 for the
+    /// single-block / coarse sections). Carried into the target on action.
+    var occurrence: Int = 0
     var enabled: Bool
     var onAction: (CorrectionTarget) -> Void
     @ViewBuilder var content: () -> Content
@@ -69,12 +79,14 @@ struct CorrectableBlock<Content: View>: View {
     @ViewBuilder
     private var menuItems: some View {
         Button {
-            onAction(CorrectionTarget(action: .correct, section: section, blockText: blockText))
+            onAction(CorrectionTarget(
+                action: .correct, section: section, blockText: blockText, occurrence: occurrence))
         } label: {
             Label("Suggest a correction…", systemImage: "pencil.line")
         }
         Button {
-            onAction(CorrectionTarget(action: .note, section: section, blockText: blockText))
+            onAction(CorrectionTarget(
+                action: .note, section: section, blockText: blockText, occurrence: occurrence))
         } label: {
             Label("Add a note…", systemImage: "note.text.badge.plus")
         }
@@ -142,7 +154,8 @@ struct CorrectionPopover: View {
                 Button(fullReprocess ? "Save & re-transcribe" : "Save & re-write") {
                     onSave(CorrectionSubmission(
                         section: target.section, quotedText: quote,
-                        userText: userText, fullReprocess: fullReprocess))
+                        userText: userText, occurrence: target.occurrence,
+                        fullReprocess: fullReprocess))
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
