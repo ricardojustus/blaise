@@ -502,22 +502,24 @@ private func makeRow(
 
     @Test("occurrence from the block's position among fold-matches anchors identical duplicates distinctly")
     func occurrenceDisambiguatesIdenticalBlocks() throws {
-        // Two blocks share identical text; a third differs. This is what the
-        // UI's `matchOccurrence` computes at menu-action time — the position
-        // of a block's own index among the blocks that fold-match its text.
+        // Two blocks share identical text; a third differs. This is the rule
+        // the UI applies at menu-action time — the position of a block's own
+        // index among the blocks that fold-match its text.
         let blocks = ["Ship it.", "Ship it.", "Hold the launch."]
-        let firstOccurrence = CorrectionAnchoring.matches(quote: blocks[0], in: blocks).firstIndex(of: 0)
-        let secondOccurrence = CorrectionAnchoring.matches(quote: blocks[1], in: blocks).firstIndex(of: 1)
+        let firstOccurrence = CorrectionAnchoring.occurrence(ofBlockAt: 0, in: blocks)
+        let secondOccurrence = CorrectionAnchoring.occurrence(ofBlockAt: 1, in: blocks)
         #expect(firstOccurrence == 0)
         #expect(secondOccurrence == 1)
+        // An index off the end is total, not a trap for a caller iterating a
+        // list that shrank under it.
+        #expect(CorrectionAnchoring.occurrence(ofBlockAt: 9, in: blocks) == 0)
         // Round-trip: each stored occurrence resolves back to ITS OWN block.
-        // The previous hard-coded occurrence 0 anchored BOTH duplicates to the
-        // first block — the mis-anchoring the occurrence rule removes.
+        // A hard-coded 0 would anchor BOTH duplicates to the first block.
         #expect(
-            CorrectionAnchoring.resolve(quote: "Ship it.", occurrence: try #require(firstOccurrence), in: blocks)?
+            CorrectionAnchoring.resolve(quote: "Ship it.", occurrence: firstOccurrence, in: blocks)?
                 .blockIndex == 0)
         #expect(
-            CorrectionAnchoring.resolve(quote: "Ship it.", occurrence: try #require(secondOccurrence), in: blocks)?
+            CorrectionAnchoring.resolve(quote: "Ship it.", occurrence: secondOccurrence, in: blocks)?
                 .blockIndex == 1)
     }
 }

@@ -689,19 +689,6 @@ private struct NotesPane: View {
             && !correctionBusy
     }
 
-    /// The occurrence to store for a correction/note anchored to the
-    /// block at `index` within `blocks` (the section's blocks in render
-    /// order) — its position among the section blocks that fold-match it, so
-    /// two blocks with identical text anchor distinctly. Blank action-items
-    /// never fold-match a non-empty quote, so computing over the FILTERED
-    /// render list yields the same occurrence as the full block list used at
-    /// resolve time.
-    private func matchOccurrence(_ index: Int, in blocks: [String]) -> Int {
-        guard blocks.indices.contains(index) else { return 0 }
-        return CorrectionAnchoring.matches(quote: blocks[index], in: blocks)
-            .firstIndex(of: index) ?? 0
-    }
-
     /// The occurrence to STORE for a submitted correction, resolved
     /// against the section's real anchor blocks — the popover lets the user
     /// trim the quote, which moves it into a different match space than the
@@ -935,7 +922,7 @@ private struct NotesPane: View {
         let meetingID = meeting.id
         let uiState = uiState
         let quote = blocks[index]
-        let occurrence = matchOccurrence(index, in: blocks)
+        let occurrence = CorrectionAnchoring.occurrence(ofBlockAt: index, in: blocks)
         Task {
             do {
                 let refused = try await pipeline.updateCorrection(
@@ -1158,7 +1145,8 @@ private struct NotesPane: View {
                     ForEach(Array(structured.decisions.enumerated()), id: \.offset) { index, decision in
                         CorrectableBlock(
                             section: .decision, blockText: decision,
-                            occurrence: matchOccurrence(index, in: structured.decisions),
+                            occurrence: CorrectionAnchoring.occurrence(
+                                ofBlockAt: index, in: structured.decisions),
                             enabled: correctionsEnabled,
                             onAction: { correctionTarget = $0 }
                         ) {
@@ -1196,9 +1184,15 @@ private struct NotesPane: View {
             NoteSection(title: portuguese ? "Itens de Ação" : "Action Items", kind: .actions) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(actionItems.enumerated()), id: \.offset) { index, item in
+                        // Blank items are already dropped from `actionItems`,
+                        // and a blank block can never fold-match a non-empty
+                        // quote — so the occurrence computed over this FILTERED
+                        // list equals the one the full block list yields at
+                        // resolve time.
                         CorrectableBlock(
                             section: .actionItem, blockText: item.text,
-                            occurrence: matchOccurrence(index, in: actionItems.map(\.text)),
+                            occurrence: CorrectionAnchoring.occurrence(
+                                ofBlockAt: index, in: actionItems.map(\.text)),
                             enabled: correctionsEnabled,
                             onAction: { correctionTarget = $0 }
                         ) {
@@ -1262,7 +1256,8 @@ private struct NotesPane: View {
                         // targets. Blank blocks are dropped — they can never
                         // fold-match a non-empty quote, so they are unpinnable
                         // AND their absence cannot shift the occurrence
-                        // computed here (the occurrence rule above).
+                        // `CorrectionAnchoring.occurrence(ofBlockAt:in:)`
+                        // computes when one is picked.
                         let targets = CorrectionAnchoring
                             .blocks(of: structured, section: note.section)
                             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -1607,28 +1602,22 @@ struct MarkdownBlocksView: View {
         // block's correction affordance can carry its own occurrence.
         let texts = blocks.map { String($0.text.characters) }
         VStack(alignment: .leading, spacing: 8) {
+            // Honest limit on the occurrence computed here: these are the UI's
+            // markdown blocks, not the anchoring blocks
+            // (`CorrectionAnchoring.blocks` splits detailed notes on blank
+            // lines, and a single anchoring block can render as several list
+            // items). The two agree for the duplicate-block case that makes
+            // the occurrence matter at all; where they diverge, the stored
+            // occurrence can name a different match, and the re-anchor pass
+            // surfaces that as a stale note rather than a silent
+            // mis-attachment. A trimmed quote is recomputed against the real
+            // anchor space at save time (`NotesPane.storedOccurrence`).
             ForEach(Array(blocks.enumerated()), id: \.element.id) { index, block in
-                anchoredBlock(block, occurrence: Self.occurrence(of: index, in: texts))
+                anchoredBlock(
+                    block,
+                    occurrence: CorrectionAnchoring.occurrence(ofBlockAt: index, in: texts))
             }
         }
-    }
-
-    /// Which fold-match this block is among the section's blocks — the
-    /// same rule the pipeline resolves with, so a correction on the SECOND of
-    /// two identical paragraphs anchors to the second instead of collapsing
-    /// onto the first.
-    ///
-    /// Honest limit: these are the UI's markdown blocks, not the anchoring
-    /// blocks (`CorrectionAnchoring.blocks` splits detailed notes on blank
-    /// lines, and a single anchoring block can render as several list items).
-    /// The two agree for the duplicate-block case this fixes; where they
-    /// diverge, the stored occurrence can still name a different match, and
-    /// the re-anchor pass surfaces that as a stale note rather than a silent
-    /// mis-attachment. A trimmed quote is recomputed against the real anchor
-    /// space at save time (`NotesPane.storedOccurrence`).
-    private static func occurrence(of index: Int, in texts: [String]) -> Int {
-        CorrectionAnchoring.matches(quote: texts[index], in: texts)
-            .firstIndex(of: index) ?? 0
     }
 
     @ViewBuilder

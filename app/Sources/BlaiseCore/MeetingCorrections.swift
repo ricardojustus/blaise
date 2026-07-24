@@ -277,6 +277,16 @@ public enum CorrectionAnchoring {
         return (hits[clamped], clamped)
     }
 
+    /// The occurrence to STORE for an anchor taken whole from the block at
+    /// `index`: that block's position among the blocks whose folded text
+    /// matches its own, so two blocks with identical text anchor distinctly
+    /// instead of both collapsing onto the first. An out-of-range index
+    /// yields 0 — the same fallback a quote that matches nothing gets.
+    public static func occurrence(ofBlockAt index: Int, in blocks: [String]) -> Int {
+        guard blocks.indices.contains(index) else { return 0 }
+        return matches(quote: blocks[index], in: blocks).firstIndex(of: index) ?? 0
+    }
+
     /// The occurrence to STORE when the user trims the quote away from the
     /// block it was taken from. A trimmed quote lives in a DIFFERENT match
     /// space than the whole block — "Ship it" matches both "Ship it after
