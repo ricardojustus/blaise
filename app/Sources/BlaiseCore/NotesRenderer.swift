@@ -64,7 +64,7 @@ public enum NotesRenderer {
         blocks.append("## \(strings.detailedNotes)")
         if weave.detailedAsides.isEmpty {
             blocks.append(detailedNotes.isEmpty ? strings.noneMarker : demoteHeadings(in: detailedNotes))
-        } else if containsFence(detailedNotes) {
+        } else if containsCode(detailedNotes) {
             // FIX B: the per-paragraph path splits on blank lines, but a
             // fenced code block that spans a blank line is split mid-fence and
             // `demoteHeadings` force-closes it per fragment — corrupting the
@@ -157,12 +157,29 @@ public enum NotesRenderer {
         }
     }
 
-    /// FIX B: whether the raw detailed-notes blob carries a fenced code block.
-    /// A conservative substring check on the fence markers — any fence sends
-    /// the section down the whole-blob path, because the per-paragraph aside
-    /// weaving corrupts a fence that spans a blank line.
-    private static func containsFence(_ body: String) -> Bool {
-        body.contains("```") || body.contains("~~~")
+    /// FIX B/L: whether the raw detailed-notes blob carries code that the
+    /// per-paragraph aside weaving would corrupt. Two shapes qualify:
+    ///
+    /// - A FENCE (``` / ~~~), which the paragraph split can cut in half — each
+    ///   fragment then gets its own force-closed fence from `demoteHeadings`.
+    /// - An INDENTED code block (4+ spaces or a tab), which the paragraph
+    ///   split destroys more quietly: the split TRIMS each paragraph, so the
+    ///   leading indent that made it code is simply gone and the lines
+    ///   re-render as prose.
+    ///
+    /// Either sends the section down the whole-blob path, where the text is
+    /// rendered once, intact, with the asides appended in quoted form.
+    private static func containsCode(_ body: String) -> Bool {
+        if body.contains("```") || body.contains("~~~") { return true }
+        return body
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: "\n\n")
+            .contains { paragraph in
+                guard let first = paragraph.split(separator: "\n", omittingEmptySubsequences: false)
+                    .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+                else { return false }
+                return first.hasPrefix("    ") || first.hasPrefix("\t")
+            }
     }
 
     /// A note aside: one blockquote paragraph. The note body flattens to one

@@ -295,6 +295,36 @@ private func makeRow(
         #expect(!markdown.contains("```\n\n```"))
     }
 
+    @Test("FIX L: an INDENTED code block survives aside weaving too")
+    func indentedCodeKeepsItsIndentAndAppendsAside() throws {
+        let indented = NotesStructured(
+            title: "Sync",
+            summary: "Setup summary.",
+            detailedNotes: """
+                Intro paragraph before the code.
+
+                    swift build --configuration release
+                    swift test
+
+                Closing paragraph.
+                """,
+            decisions: [],
+            actionItems: [],
+            userActionItems: [])
+        let markdown = try NotesRenderer.render(
+            indented, language: "en", meetingTitle: "Sync", userName: "Sam",
+            annotations: [
+                annotation(
+                    section: .detailedNotes, quote: "Intro paragraph before the code",
+                    text: "Link the PR here.")
+            ])
+        // The indent IS the code block. The per-paragraph path trims every
+        // paragraph, so these lines came out as prose with no indent left.
+        #expect(markdown.contains("    swift build --configuration release\n    swift test"))
+        #expect(markdown.contains(
+            "> **Your note** (on \u{201C}Intro paragraph before the code.\u{201D}): Link the PR here."))
+    }
+
     @Test("Portuguese localization for asides and tail")
     func portuguese() throws {
         let markdown = try NotesRenderer.render(
