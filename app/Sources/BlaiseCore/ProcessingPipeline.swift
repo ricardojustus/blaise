@@ -1015,13 +1015,14 @@ public actor ProcessingPipeline {
     /// re-run is attempted — a failed rewrite leaves it `pending` for the
     /// next run. Returns the inserted row (the UI threads it into the
     /// follow-up action: `rewriteNotes`, full `regenerate`, or — for
-    /// annotations — `remintNotesArtifacts`).
+    /// annotations — `remintNotesArtifacts`) plus whether that re-mint
+    /// refused (FIX K).
     @discardableResult
     public func addCorrection(
         meetingID: MeetingID, kind: MeetingCorrection.Kind,
         section: MeetingCorrection.Section, quotedText: String, occurrence: Int,
         userText: String
-    ) async throws -> MeetingCorrection {
+    ) async throws -> CorrectionWriteResult {
         let row = MeetingCorrection(
             meetingID: meetingID, kind: kind, section: section,
             quotedText: quotedText.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1031,44 +1032,54 @@ public actor ProcessingPipeline {
         try await database.pool.write { db in
             try MeetingCorrectionStore.insert(db, row)
         }
-        if kind == .annotation {
-            _ = try await remintNotesArtifacts(meetingID: meetingID)
-        }
-        return row
+        return CorrectionWriteResult(
+            row: row, remintRefused: try await remintIfAnnotation(row, meetingID: meetingID))
     }
 
     /// G17 §UX-3: edit of an existing row. An annotation edit re-mints (its
     /// rendered aside must move now); an understanding edit returns the row
-    /// to `pending` (the notes change on the next rewrite).
+    /// to `pending` (the notes change on the next rewrite). Returns FIX K's
+    /// refusal flag.
+    @discardableResult
     public func updateCorrection(
         meetingID: MeetingID, id: String, quotedText: String, occurrence: Int,
         userText: String
-    ) async throws {
+    ) async throws -> Bool {
         let rows = await correctionRows(meetingID: meetingID)
-        guard let row = rows.first(where: { $0.id == id }) else { return }
+        guard let row = rows.first(where: { $0.id == id }) else { return false }
         try await database.pool.write { db in
             try MeetingCorrectionStore.update(
                 db, id: id, quotedText: quotedText, occurrence: occurrence,
                 userText: userText,
                 status: row.kind == .understanding ? .pending : row.status)
         }
-        if row.kind == .annotation {
-            _ = try await remintNotesArtifacts(meetingID: meetingID)
-        }
+        return try await remintIfAnnotation(row, meetingID: meetingID)
     }
 
     /// G17 §UX-3: deletion IS the undo. An annotation delete re-mints (the
     /// aside must leave notes.md + payload now); an understanding delete is
     /// row-only — the notes change on the user's next rewrite/regenerate.
-    public func deleteCorrection(meetingID: MeetingID, id: String) async throws {
+    /// Returns FIX K's refusal flag.
+    @discardableResult
+    public func deleteCorrection(meetingID: MeetingID, id: String) async throws -> Bool {
         let rows = await correctionRows(meetingID: meetingID)
-        guard let row = rows.first(where: { $0.id == id }) else { return }
+        guard let row = rows.first(where: { $0.id == id }) else { return false }
         try await database.pool.write { db in
             try MeetingCorrectionStore.delete(db, id: id)
         }
-        if row.kind == .annotation {
-            _ = try await remintNotesArtifacts(meetingID: meetingID)
-        }
+        return try await remintIfAnnotation(row, meetingID: meetingID)
+    }
+
+    /// FIX K: the shared annotation re-mint step. Returns TRUE when the
+    /// re-mint was REFUSED — the meeting is not ready, or carries the
+    /// notes-pending marker — so the caller can say so instead of implying
+    /// the delivered notes already carry the change. An understanding row
+    /// never re-mints (its follow-up is the rewrite), so it never refuses.
+    private func remintIfAnnotation(
+        _ row: MeetingCorrection, meetingID: MeetingID
+    ) async throws -> Bool {
+        guard row.kind == .annotation else { return false }
+        return try await !remintNotesArtifacts(meetingID: meetingID)
     }
 
     /// G17: user-origin notes-only re-run for a READY meeting — the

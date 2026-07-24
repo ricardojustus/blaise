@@ -147,6 +147,21 @@ public enum MeetingCorrectionStore {
     }
 }
 
+/// FIX K: what a correction write actually accomplished. The row is always
+/// durable; `remintRefused` says the deterministic re-mint an ANNOTATION
+/// needs could not run (meeting not ready, or notes-pending), so notes.md and
+/// the delivered payload do not carry it yet — the next content run weaves it
+/// instead. The UI must say that rather than imply the change already shipped.
+public struct CorrectionWriteResult: Sendable, Equatable {
+    public var row: MeetingCorrection
+    public var remintRefused: Bool
+
+    public init(row: MeetingCorrection, remintRefused: Bool) {
+        self.row = row
+        self.remintRefused = remintRefused
+    }
+}
+
 /// G17 FIX H: the single-line fold for USER-authored correction text and the
 /// quotes that travel with it.
 ///

@@ -785,6 +785,12 @@ private struct NotesPane: View {
         // FIX J: resolved against the CURRENT notes, on the main actor, before
         // the task detaches.
         let occurrence = storedOccurrence(for: submission)
+        // FIX K: a popover opened BEFORE a run started can still be saved
+        // mid-run. The row must be saved (it is the user's truth), but the
+        // follow-up must not run: the live synthesis built its request before
+        // this row existed, and a rewrite would only be refused (the meeting
+        // is not `ready` while a run holds it).
+        let runActive = activity.activeRuns[meeting.id] != nil
         correctionBusy = true
         Task {
             defer { correctionBusy = false }
@@ -794,17 +800,20 @@ private struct NotesPane: View {
                     section: submission.section, quotedText: submission.quotedText,
                     occurrence: occurrence, userText: submission.userText)
                 await loadCorrections()
-                if submission.fullReprocess {
+                if runActive {
+                    uiState.lastActionError =
+                        "Correction saved. The run already in progress doesn't include it — use \u{201C}Re-write notes now\u{201D} once that run finishes."
+                } else if submission.fullReprocess {
                     // The escape hatch is today's full Regenerate — the queue
                     // path (origin .user) with all its guards; corrections
                     // ride along at request build.
-                    // FIX D: a nil enqueue result is NOT success — it means
-                    // the job collapsed into a live one OR the queue write
-                    // failed. The correction is durable either way, but the
-                    // user must not be told a run was scheduled when none was.
+                    // FIX D/K: `enqueue` returns the EXISTING job when a live
+                    // job collapses the new one, and nil ONLY when the durable
+                    // queue write threw. So nil means exactly one thing: the
+                    // run was not scheduled and nothing will retry it.
                     let scheduled = await appEnv.processingQueue.enqueue(meetingID, origin: .user)
                     uiState.lastActionError = scheduled == nil
-                        ? "Correction saved, but no new processing run was scheduled (a run may already be active or the queue write failed). It applies on the next Regenerate."
+                        ? "Correction saved, but the processing run could not be queued (the queue write failed). It applies on the next Regenerate."
                         : nil
                 } else {
                     let record = try await pipeline.rewriteNotes(meetingID: meetingID)
@@ -826,13 +835,19 @@ private struct NotesPane: View {
         let pipeline = appEnv.pipeline
         let meetingID = meeting.id
         let uiState = uiState
+        // FIX K: mid-run, the re-mint still runs — it queues behind the run on
+        // the single-flight chain and weaves the note when the run drains, so
+        // the note cannot be lost in the window after the run's own weave. But
+        // it is NOT instant any more, and the copy says so.
+        let runActive = activity.activeRuns[meeting.id] != nil
         Task {
             do {
-                _ = try await pipeline.addCorrection(
+                let result = try await pipeline.addCorrection(
                     meetingID: meetingID, kind: .annotation,
                     section: target.section, quotedText: target.blockText,
                     occurrence: target.occurrence, userText: text)
-                uiState.lastActionError = nil
+                uiState.lastActionError = Self.noteFeedback(
+                    remintRefused: result.remintRefused, runActive: runActive)
             } catch {
                 uiState.lastActionError = "Could not add the note: \(error.localizedDescription)"
             }
@@ -847,14 +862,31 @@ private struct NotesPane: View {
         let uiState = uiState
         Task {
             do {
-                try await pipeline.deleteCorrection(meetingID: meetingID, id: row.id)
-                uiState.lastActionError = nil
+                // FIX K: an annotation delete that could not re-mint has NOT
+                // left the delivered notes yet.
+                let refused = try await pipeline.deleteCorrection(
+                    meetingID: meetingID, id: row.id)
+                uiState.lastActionError = refused
+                    ? "Note deleted — it leaves the delivered notes when processing completes."
+                    : nil
             } catch {
                 uiState.lastActionError =
                     "Could not delete the correction: \(error.localizedDescription)"
             }
             await loadCorrections()
         }
+    }
+
+    /// FIX K: the honest banner for a saved margin note. nil when the note is
+    /// already in notes.md and the minted payload.
+    static func noteFeedback(remintRefused: Bool, runActive: Bool) -> String? {
+        if remintRefused {
+            return "Note saved — it will appear in the delivered notes when processing completes."
+        }
+        if runActive {
+            return "Note saved — it appears in the notes when the current run finishes."
+        }
+        return nil
     }
 
     /// PIN PICKER (§AC4): re-anchor a stale note onto the block the user
@@ -873,10 +905,12 @@ private struct NotesPane: View {
         let occurrence = matchOccurrence(index, in: blocks)
         Task {
             do {
-                try await pipeline.updateCorrection(
+                let refused = try await pipeline.updateCorrection(
                     meetingID: meetingID, id: row.id, quotedText: quote,
                     occurrence: occurrence, userText: row.userText)
-                uiState.lastActionError = nil
+                uiState.lastActionError = refused
+                    ? "Note pinned — it moves in the delivered notes when processing completes."
+                    : nil
             } catch {
                 uiState.lastActionError = "Could not pin the note: \(error.localizedDescription)"
             }

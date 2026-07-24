@@ -544,6 +544,39 @@ private func liveStatus(
     }
 }
 
+// FIX K: the correction write paths report whether the artifacts actually
+// moved, so the UI can stop implying a note already shipped when it did not.
+@Suite struct CorrectionWriteHonestyTests {
+    @Test("a note on a meeting that cannot re-mint reports the refusal, and the row stays durable")
+    func annotationOnUnreadyMeetingReportsRefusal() async throws {
+        let harness = try await makePipelineHarness()
+        // Imported, never processed: no notes, status .processing.
+        let meeting = try await harness.importTestMeeting()
+
+        let added = try await harness.pipeline.addCorrection(
+            meetingID: meeting.id, kind: .annotation, section: .summary,
+            quotedText: "anything", occurrence: 0, userText: "Check this later.")
+        #expect(added.remintRefused, "no notes to re-mint -> the note has not shipped")
+        #expect(
+            try await liveStatus(harness.database, meeting.id, added.row.id) == .pending,
+            "the row is durable regardless; the next content run weaves it")
+
+        // The delete path is equally honest.
+        #expect(try await harness.pipeline.deleteCorrection(meetingID: meeting.id, id: added.row.id))
+    }
+
+    @Test("an understanding correction never claims a refusal — it has no re-mint to refuse")
+    func understandingRowNeverReportsRefusal() async throws {
+        let harness = try await makePipelineHarness()
+        let meeting = try await harness.importTestMeeting()
+        let added = try await harness.pipeline.addCorrection(
+            meetingID: meeting.id, kind: .understanding, section: .summary,
+            quotedText: "anything", occurrence: 0, userText: "Actually it was Tuesday.")
+        #expect(!added.remintRefused)
+        #expect(!(try await harness.pipeline.deleteCorrection(meetingID: meeting.id, id: added.row.id)))
+    }
+}
+
 // FIX F: the legacy re-mint paths (rename meeting / rename speaker / correct
 // name in notes) re-WEAVE annotations into the markdown, so they must also
 // re-ANCHOR the live `meeting_correction` rows — otherwise an edit that moved
@@ -559,10 +592,12 @@ private func liveStatus(
 
         // Anchored on the summary as synthesized. The add path re-mints and
         // re-anchors, so the row starts out `applied`.
-        let row = try await harness.pipeline.addCorrection(
+        let added = try await harness.pipeline.addCorrection(
             meetingID: meeting.id, kind: .annotation, section: .summary,
             quotedText: "Caco fechou o contrato", occurrence: 0,
             userText: "Valor do contrato ainda pendente.")
+        #expect(!added.remintRefused, "a ready meeting re-mints on the spot")
+        let row = added.row
         #expect(try await liveStatus(harness.database, meeting.id, row.id) == .applied)
 
         // The correction rewrites the very prose the note quotes.
