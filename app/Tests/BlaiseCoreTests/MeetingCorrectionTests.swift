@@ -192,6 +192,27 @@ private func makeRow(
             "- Important reminder. *(on \u{201C}a paragraph the re-write removed\u{201D})*"))
     }
 
+    @Test("FIX G: exotic Unicode line breaks in a note flatten to spaces — the aside stays one blockquote line")
+    func exoticLineBreaksFlattenInsideAsides() throws {
+        // U+000B/U+000C/U+2028/U+2029 end a line for renderers that are not
+        // strictly CommonMark; a survivor would let the note's tail escape
+        // its `>` aside downstream.
+        for separator in ["\u{000B}", "\u{000C}", "\u{2028}", "\u{2029}"] {
+            #expect(NotesRenderer.flattenToTitleLine("one\(separator)two") == "one two")
+            let markdown = try NotesRenderer.render(
+                structured, language: "en", meetingTitle: "Sync", userName: "Sam",
+                annotations: [
+                    annotation(
+                        section: .detailedNotes, quote: "second paragraph",
+                        text: "one\(separator)two")
+                ])
+            #expect(markdown.contains("> **Your note:** one two"))
+            #expect(!markdown.contains(separator))
+        }
+        // CRLF still collapses to ONE space (the pair is a single break).
+        #expect(NotesRenderer.flattenToTitleLine("one\r\ntwo") == "one two")
+    }
+
     @Test("FIX B: a fenced detailed-notes block spanning a blank line stays intact; the aside lands after the blob")
     func fencedDetailedNotesKeepFenceAndAppendAside() throws {
         let fenced = NotesStructured(

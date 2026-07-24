@@ -248,11 +248,18 @@ public enum NotesRenderer {
 
     /// Title/meetingTitle → single line: newlines become spaces, leading `#`
     /// run stripped, surrounding whitespace trimmed.
+    ///
+    /// FIX G: "newline" means EVERY Unicode line break, not just LF/CR/CRLF —
+    /// U+000B, U+000C, U+0085, U+2028 and U+2029 all end a line for renderers
+    /// that are not strictly CommonMark. G17 flattens user annotation text
+    /// through here before it goes into a `>` aside, so a surviving separator
+    /// would let the note's tail escape its blockquote downstream. CRLF
+    /// collapses first so the pair still yields ONE space.
     static func flattenToTitleLine(_ raw: String) -> String {
         var line = raw
             .replacingOccurrences(of: "\r\n", with: " ")
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\r", with: " ")
+            .components(separatedBy: .newlines)
+            .joined(separator: " ")
             .trimmingCharacters(in: .whitespaces)
         while line.hasPrefix("#") {
             line.removeFirst()
