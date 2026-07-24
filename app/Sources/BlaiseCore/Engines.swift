@@ -153,6 +153,11 @@ public struct NotesRequest: Codable, Sendable, Equatable {
     /// block). Decoded via `decodeIfPresent ?? []` so payloads predating the
     /// field round-trip unchanged.
     public var groundedPersonHints: [GroundedPersonHint]
+    /// G17: the meeting's durable user corrections/notes, injected into every
+    /// synthesis run (partial or full — a later Regenerate can never erase
+    /// user truth). Empty renders NO block (byte-identical user message);
+    /// `decodeIfPresent ?? []` keeps pre-G17 requests round-tripping.
+    public var corrections: [NotesCorrection]
 
     public init(
         meeting: Meeting,
@@ -160,7 +165,8 @@ public struct NotesRequest: Codable, Sendable, Equatable {
         dominantLanguage: String,
         vocabulary: [String],
         user: UserIdentity,
-        groundedPersonHints: [GroundedPersonHint] = []
+        groundedPersonHints: [GroundedPersonHint] = [],
+        corrections: [NotesCorrection] = []
     ) {
         self.meeting = meeting
         self.transcript = transcript
@@ -168,10 +174,11 @@ public struct NotesRequest: Codable, Sendable, Equatable {
         self.vocabulary = vocabulary
         self.user = user
         self.groundedPersonHints = groundedPersonHints
+        self.corrections = corrections
     }
 
     enum CodingKeys: String, CodingKey {
-        case meeting, transcript, vocabulary, user
+        case meeting, transcript, vocabulary, user, corrections
         case dominantLanguage = "dominant_language"
         case groundedPersonHints = "grounded_person_hints"
     }
@@ -186,6 +193,8 @@ public struct NotesRequest: Codable, Sendable, Equatable {
         // Presence-preserving: payloads predating #101 carry no key → [].
         self.groundedPersonHints =
             try container.decodeIfPresent([GroundedPersonHint].self, forKey: .groundedPersonHints) ?? []
+        self.corrections =
+            try container.decodeIfPresent([NotesCorrection].self, forKey: .corrections) ?? []
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -196,6 +205,7 @@ public struct NotesRequest: Codable, Sendable, Equatable {
         try container.encode(vocabulary, forKey: .vocabulary)
         try container.encode(user, forKey: .user)
         try container.encode(groundedPersonHints, forKey: .groundedPersonHints)
+        try container.encode(corrections, forKey: .corrections)
     }
 }
 

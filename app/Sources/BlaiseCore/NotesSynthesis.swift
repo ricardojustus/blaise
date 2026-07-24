@@ -278,12 +278,67 @@ public enum NotesPromptBuilder {
         metadata.append("The user is: \(request.user.name)\(aliases)")
         sections.append("MEETING:\n" + metadata.joined(separator: "\n"))
 
+        // G17: presence-gated USER CORRECTIONS / USER NOTES blocks, after the
+        // meeting metadata and before the transcript (instructions precede the
+        // material). HARD presence guard like the vocabulary/hints blocks:
+        // no corrections → byte-identical user message.
+        if let correctionsBlock = Self.correctionsBlock(request.corrections) {
+            sections.append(correctionsBlock)
+        }
+
         let transcript = request.transcript.map { segment in
             "[\(segment.speakerName ?? segment.speakerLabel)] \(segment.text)"
         }.joined(separator: "\n")
         sections.append("TRANSCRIPT:\n" + transcript)
 
         return sections.joined(separator: "\n\n")
+    }
+
+    /// G17: the corrections/notes block. Corrections are AUTHORITATIVE (the
+    /// user reviewed an earlier draft; their statement of fact outranks
+    /// transcript inference). Notes are context to honor, never to restate as
+    /// findings. nil when the meeting has no rows (presence gate).
+    ///
+    /// Every user-authored string is folded to ONE line first. A newline
+    /// inside a quote or a note body otherwise forges additional
+    /// numbered entries inside a block the prompt itself labels authoritative
+    /// — the highest-trust position in the whole message.
+    static func correctionsBlock(_ corrections: [NotesCorrection]) -> String? {
+        guard !corrections.isEmpty else { return nil }
+        var lines: [String] = []
+
+        let understanding = corrections.filter { $0.kind == .understanding }
+        if !understanding.isEmpty {
+            lines.append(
+                "USER CORRECTIONS (authoritative — the user reviewed an earlier draft of these notes; these corrections override anything the transcript seems to imply):")
+            lines.append(
+                "Where a correction conflicts with the transcript, the correction wins: treat the transcript passage as misheard or misunderstood.")
+            for (index, correction) in understanding.enumerated() {
+                lines.append(
+                    "\(index + 1). In the \(sectionLabel(correction.section)), an earlier draft said: \"\(CorrectionSanitize.flatten(correction.quotedText))\". The user corrects: \(CorrectionSanitize.flatten(correction.userText))")
+            }
+        }
+
+        let annotations = corrections.filter { $0.kind == .annotation }
+        if !annotations.isEmpty {
+            if !lines.isEmpty { lines.append("") }
+            lines.append(
+                "USER NOTES (the user's own margin notes; do not contradict them and do not restate them as your own findings):")
+            for note in annotations {
+                lines.append(
+                    "- (on \"\(CorrectionSanitize.flatten(note.quotedText))\") \(CorrectionSanitize.flatten(note.userText))")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func sectionLabel(_ section: MeetingCorrection.Section) -> String {
+        switch section {
+        case .summary: return "summary"
+        case .detailedNotes: return "detailed notes"
+        case .decision: return "decisions"
+        case .actionItem: return "action items"
+        }
     }
 
     /// DD/MM/YYYY in `timeZone` (default: the system time zone).

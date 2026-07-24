@@ -80,8 +80,9 @@ public enum MeetingDeletion {
             // The meeting row drops the CASCADE children (transcript_segment +
             // its FTS sync triggers, meeting_notes, meeting_speaker_event,
             // meet_roster_pending, action_item_state, meeting_capture_part,
-            // speaker_rename) and SET-NULLs the by-design survivors
-            // (cloud_spend_receipt.meeting_id, name_correction.source_meeting_id).
+            // speaker_rename, processing_queue, meeting_correction) and
+            // SET-NULLs the by-design survivors (cloud_spend_receipt.meeting_id,
+            // name_correction.source_meeting_id).
             try db.execute(sql: "DELETE FROM meeting WHERE id = ?", arguments: [meetingID])
             // The tombstone, in the SAME transaction: no crash window can erase
             // the rows without recording the dir still owed removal.

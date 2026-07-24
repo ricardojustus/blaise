@@ -29,8 +29,17 @@ public enum NotesRenderer {
     ///     identity) → the neutral "My action items" / "Minhas ações" (G3).
     /// - Throws: `EngineError.invalidStructuredNotes` if `summary` is
     ///   empty/whitespace (refusal, not rendering — anti-hallucination).
+    ///
+    /// G17 `annotations`: the meeting's correction rows. Only `.annotation`
+    /// rows weave (callers pass the whole set; understanding corrections act
+    /// through re-synthesis and render nothing). An anchored note becomes a
+    /// blockquote aside by its matched block; an unanchored one lands under a
+    /// final "Your notes" heading with its original anchor quote, never
+    /// silently dropped. HARD presence gate: no annotation rows →
+    /// byte-identical pre-G17 output.
     public static func render(
-        _ s: NotesStructured, language: String, meetingTitle: String, userName: String = ""
+        _ s: NotesStructured, language: String, meetingTitle: String, userName: String = "",
+        annotations: [MeetingCorrection] = []
     ) throws -> String {
         let strings = LocalizedStrings.match(language, userName: userName)
 
@@ -47,24 +56,153 @@ public enum NotesRenderer {
         }
 
         let detailedNotes = s.detailedNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let weave = AnnotationWeave.plan(annotations: annotations, structured: s)
 
         var blocks: [String] = []
         blocks.append("# \(titleLine)")
         blocks.append("## \(strings.summary)")
         blocks.append(demoteHeadings(in: summary))
+        blocks.append(contentsOf: weave.summaryAsides.map { aside($0, strings: strings) })
         blocks.append("## \(strings.detailedNotes)")
-        blocks.append(detailedNotes.isEmpty ? strings.noneMarker : demoteHeadings(in: detailedNotes))
+        if weave.detailedAsides.isEmpty {
+            blocks.append(detailedNotes.isEmpty ? strings.noneMarker : demoteHeadings(in: detailedNotes))
+        } else if containsCode(detailedNotes) {
+            // The per-paragraph path splits on blank lines, but a fenced
+            // code block that spans a blank line is split mid-fence and
+            // `demoteHeadings` force-closes it per fragment — corrupting the
+            // block. When this section has anchored asides AND a fence, render
+            // the whole blob once (fence intact) and append the asides after
+            // it in the quoted form (they can no longer sit under their exact
+            // paragraph, so the quote names the anchor). Deterministic order:
+            // by block index, then row order within a block.
+            blocks.append(demoteHeadings(in: detailedNotes))
+            for entry in weave.detailedAsides.sorted(by: { $0.key < $1.key }).flatMap(\.value) {
+                blocks.append(aside(entry.text, on: entry.quote, strings: strings))
+            }
+        } else {
+            // Per-paragraph render so each aside lands under its anchor. The
+            // paragraph split mirrors `CorrectionAnchoring.blocks`; demoting
+            // per paragraph is equivalent for fence-free prose (the fenced
+            // case is handled above).
+            let paragraphs = CorrectionAnchoring.blocks(of: s, section: .detailedNotes)
+            for (index, paragraph) in paragraphs.enumerated() {
+                blocks.append(demoteHeadings(in: paragraph))
+                for entry in weave.detailedAsides[index] ?? [] {
+                    blocks.append(aside(entry.text, strings: strings))
+                }
+            }
+            if paragraphs.isEmpty {
+                blocks.append(strings.noneMarker)
+            }
+        }
         blocks.append("## \(strings.decisions)")
         blocks.append(renderList(s.decisions.map { "- \(normalizeListText($0))" }, emptyMarker: strings.noneMarker))
+        blocks.append(contentsOf: weave.decisionAsides.map { aside($0.text, on: $0.quote, strings: strings) })
         blocks.append("## \(strings.actionItems)")
         blocks.append(renderList(
             s.actionItems.filter { !normalizeListText($0.text).isEmpty }.map(renderActionItem),
             emptyMarker: strings.noneMarker))
+        blocks.append(contentsOf: weave.actionAsides.map { aside($0.text, on: $0.quote, strings: strings) })
         blocks.append("## \(strings.userActionItems)")
         blocks.append(renderList(
             s.userActionItems.filter { !normalizeListText($0.text).isEmpty }.map(renderActionItem),
             emptyMarker: strings.userNoneMarker))
+        if !weave.unanchored.isEmpty {
+            blocks.append("## \(strings.yourNotes)")
+            blocks.append(weave.unanchored.map { note in
+                "- \(CorrectionSanitize.flatten(note.text)) *(\(strings.wasOn) \u{201C}\(anchorQuote(note.quote))\u{201D})*"
+            }.joined(separator: "\n"))
+        }
         return blocks.joined(separator: "\n\n") + "\n"
+    }
+
+    // MARK: - G17 annotation weaving
+
+    /// Where each annotation lands: an aside under its anchor, or the tail
+    /// "Your notes" list. Pure and order-preserving (row order = display
+    /// order within each bucket).
+    struct AnnotationWeave {
+        var summaryAsides: [String] = []
+        // Detailed asides carry their anchor quote as well as the text.
+        // The per-paragraph path renders the text under its paragraph (quote
+        // redundant there); the fenced-blob path renders the quoted form after
+        // the whole blob, where adjacency no longer names the anchor.
+        var detailedAsides: [Int: [(quote: String, text: String)]] = [:]
+        var decisionAsides: [(quote: String, text: String)] = []
+        var actionAsides: [(quote: String, text: String)] = []
+        var unanchored: [(quote: String, text: String)] = []
+
+        static func plan(annotations: [MeetingCorrection], structured: NotesStructured) -> AnnotationWeave {
+            var weave = AnnotationWeave()
+            for row in annotations where row.kind == .annotation {
+                let blocks = CorrectionAnchoring.blocks(of: structured, section: row.section)
+                guard
+                    let hit = CorrectionAnchoring.resolve(
+                        quote: row.quotedText, occurrence: row.occurrence, in: blocks)
+                else {
+                    weave.unanchored.append((row.quotedText, row.userText))
+                    continue
+                }
+                switch row.section {
+                case .summary:
+                    weave.summaryAsides.append(row.userText)
+                case .detailedNotes:
+                    weave.detailedAsides[hit.blockIndex, default: []]
+                        .append((blocks[hit.blockIndex], row.userText))
+                case .decision:
+                    weave.decisionAsides.append((blocks[hit.blockIndex], row.userText))
+                case .actionItem:
+                    weave.actionAsides.append((blocks[hit.blockIndex], row.userText))
+                }
+            }
+            return weave
+        }
+    }
+
+    /// Whether the raw detailed-notes blob carries code that the
+    /// per-paragraph aside weaving would corrupt. Two shapes qualify:
+    ///
+    /// - A FENCE (``` / ~~~), which the paragraph split can cut in half — each
+    ///   fragment then gets its own force-closed fence from `demoteHeadings`.
+    /// - An INDENTED code block (4+ spaces or a tab), which the paragraph
+    ///   split destroys more quietly: the split TRIMS each paragraph, so the
+    ///   leading indent that made it code is simply gone and the lines
+    ///   re-render as prose.
+    ///
+    /// Either sends the section down the whole-blob path, where the text is
+    /// rendered once, intact, with the asides appended in quoted form.
+    private static func containsCode(_ body: String) -> Bool {
+        if body.contains("```") || body.contains("~~~") { return true }
+        return body
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: "\n\n")
+            .contains { paragraph in
+                guard let first = paragraph.split(separator: "\n", omittingEmptySubsequences: false)
+                    .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+                else { return false }
+                return first.hasPrefix("    ") || first.hasPrefix("\t")
+            }
+    }
+
+    /// A note aside: one blockquote paragraph. The note body flattens to one
+    /// line (a multi-line note must not escape the blockquote) through the
+    /// correction fold, which keeps a `#`-only note's body.
+    private static func aside(_ text: String, strings: LocalizedStrings) -> String {
+        "> **\(strings.yourNote):** \(CorrectionSanitize.flatten(text))"
+    }
+
+    /// A list-adjacent aside names its anchor (the aside sits after the list,
+    /// so adjacency alone cannot associate it).
+    private static func aside(_ text: String, on quote: String, strings: LocalizedStrings) -> String {
+        "> **\(strings.yourNote)** (\(strings.wasOn) \u{201C}\(anchorQuote(quote))\u{201D}): \(CorrectionSanitize.flatten(text))"
+    }
+
+    /// Anchor quotes render flattened and bounded (a full paragraph quote
+    /// would swallow the document).
+    private static func anchorQuote(_ quote: String) -> String {
+        let flat = CorrectionSanitize.flatten(quote)
+        guard flat.count > 60 else { return flat }
+        return flat.prefix(59).trimmingCharacters(in: .whitespaces) + "…"
     }
 
     // MARK: - Localization (BCP-47 primary-subtag match)
@@ -78,6 +216,11 @@ public enum NotesRenderer {
         /// anti-hallucination pattern: an empty section is stated, not invented.
         let noneMarker: String
         let userNoneMarker: String
+        /// G17: the anchored-aside tag, the unanchored tail heading, and the
+        /// anchor-quote intro ("on" / "sobre").
+        let yourNote: String
+        let yourNotes: String
+        let wasOn: String
 
         /// G3 name-driven: `userName` empty → neutral "My action items" /
         /// "Minhas ações"; otherwise `<name>'s action items` (EN) / "Ações de
@@ -91,7 +234,10 @@ public enum NotesRenderer {
                 actionItems: "Action items",
                 userActionItems: name.isEmpty ? "My action items" : "\(name)'s action items",
                 noneMarker: "None noted.",
-                userNoneMarker: name.isEmpty ? "No action items for me." : "No action items for \(name)."
+                userNoneMarker: name.isEmpty ? "No action items for me." : "No action items for \(name).",
+                yourNote: "Your note",
+                yourNotes: "Your notes",
+                wasOn: "on"
             )
         }
 
@@ -104,7 +250,10 @@ public enum NotesRenderer {
                 actionItems: "Itens de ação",
                 userActionItems: name.isEmpty ? "Minhas ações" : "Ações de \(name)",
                 noneMarker: "Nada registrado.",
-                userNoneMarker: name.isEmpty ? "Nenhuma ação para mim." : "Nenhuma ação para \(name)."
+                userNoneMarker: name.isEmpty ? "Nenhuma ação para mim." : "Nenhuma ação para \(name).",
+                yourNote: "Sua nota",
+                yourNotes: "Suas notas",
+                wasOn: "sobre"
             )
         }
 
@@ -119,6 +268,13 @@ public enum NotesRenderer {
 
     /// Title/meetingTitle → single line: newlines become spaces, leading `#`
     /// run stripped, surrounding whitespace trimmed.
+    ///
+    /// Deliberately NOT widened to the other Unicode line separators: this
+    /// function owns TITLE bytes for every meeting, including the ones with
+    /// no corrections at all, so widening it would move the rendered output
+    /// of a pre-G17 title containing U+2028. User correction text has its own
+    /// fold (`CorrectionSanitize.flatten`), which is where that hardening
+    /// belongs.
     static func flattenToTitleLine(_ raw: String) -> String {
         var line = raw
             .replacingOccurrences(of: "\r\n", with: " ")

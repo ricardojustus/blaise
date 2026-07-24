@@ -509,6 +509,41 @@ public final class BlaiseDatabase: Sendable {
                 t.add(column: "scoped_alias_bindings", .text) // nullable; JSON [AliasPair]
             }
         }
+
+        // G17 (additive): span-anchored user corrections and margin notes on
+        // a finished meeting. Durable rows survive every re-run (synthesis
+        // re-reads them); anchoring is quote + section + occurrence. Payload
+        // impact is presence-gated (a meeting with no rows emits no new keys),
+        // so C8 re-materialization byte-equality is untouched.
+        migrator.registerMigration("v18") { db in
+            try db.create(table: "meeting_correction") { t in
+                t.primaryKey("id", .text) // ULID
+                t.column("meeting_id", .text).notNull()
+                    .references("meeting", onDelete: .cascade)
+                t.column("kind", .text).notNull() // 'understanding' | 'annotation'
+                t.column("section", .text).notNull()
+                t.column("quoted_text", .text).notNull()
+                t.column("occurrence", .integer).notNull().defaults(to: 0)
+                t.column("user_text", .text).notNull()
+                t.column("status", .text).notNull().defaults(to: "pending")
+                t.column("created_at", .datetime).notNull()
+                t.column("applied_at", .datetime)
+            }
+            // Every read is "this meeting's rows, in creation order" (the
+            // store's only query shape, run on every synthesis, every re-mint
+            // and every notes-pane load), and the FK cascade deletes by
+            // meeting_id too. Without this SQLite scans the whole table.
+            try db.create(
+                index: "idx_meeting_correction_meeting",
+                on: "meeting_correction", columns: ["meeting_id", "created_at", "id"])
+            // The mint-time snapshot of the rows that shaped a notes artifact
+            // (the payload's hash-stable re-materialization source; live rows
+            // are user-mutable). Nullable JSON, the v17 precedent. No FTS
+            // impact — the triggers re-index `markdown` only.
+            try db.alter(table: "meeting_notes") { t in
+                t.add(column: "user_corrections", .text) // nullable; JSON [NotesCorrectionSnapshot]
+            }
+        }
         return migrator
     }
 

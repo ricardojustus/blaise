@@ -286,6 +286,9 @@ private struct NotesPane: View {
     @Environment(AppEnvironment.self) private var appEnv
     @Environment(AppUIState.self) private var uiState
     @Environment(LibraryModel.self) private var library
+    // The live pipeline activity — a correction save that races an
+    // in-flight run would never be seen by that run's synthesis.
+    @Environment(PipelineActivityHolder.self) private var activity
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let meeting: Meeting
     let notes: MeetingNotes?
@@ -298,6 +301,14 @@ private struct NotesPane: View {
     var searchTerms: [String] = []
     /// Monotonic request token so repeated clicks on the same result re-scroll.
     var searchRequest = 0
+
+    // G17: correction/note flow state. `correctionRows` mirrors the durable
+    // table (loaded on appear, refreshed after every mutation);
+    // `correctionBusy` is the in-flight rewrite indicator.
+    @State private var correctionTarget: CorrectionTarget?
+    @State private var correctionRows: [MeetingCorrection] = []
+    @State private var showCorrectionsList = false
+    @State private var correctionBusy = false
     var userActionBoxRequest = 0
     /// Fluido: the header's one-shot settle entrance (armed per selection).
     @Binding var heroArmed: Bool
@@ -416,6 +427,31 @@ private struct NotesPane: View {
                     .changeEffect(
                         .shine(duration: 1.1), value: shineTick,
                         isEnabled: Design.direction == .fluido && !reduceMotion)
+                    // G17: one popover for both actions, anchored to the notes
+                    // column; the target carries the section + block text.
+                    .popover(item: $correctionTarget) { target in
+                        if target.action == .correct {
+                            CorrectionPopover(
+                                target: target,
+                                onCancel: { correctionTarget = nil },
+                                onSave: { submission in
+                                    correctionTarget = nil
+                                    submitCorrection(submission)
+                                })
+                        } else {
+                            AddNotePopover(
+                                target: target,
+                                onCancel: { correctionTarget = nil },
+                                onSave: { text in
+                                    correctionTarget = nil
+                                    submitNote(target: target, text: text)
+                                })
+                        }
+                    }
+                    .task(id: meeting.id) { await loadCorrections() }
+                    .onChange(of: notes.generatedAt) { _, _ in
+                        Task { await loadCorrections() }
+                    }
                 } else if meeting.status == .processing || meeting.status == .recording {
                     Text("Notes will appear here when processing finishes.")
                         .foregroundStyle(.secondary)
@@ -589,8 +625,38 @@ private struct NotesPane: View {
                         .frame(width: 360)
                 }
             }
+            // G17 §UX-3: corrections + notes counted SEPARATELY —
+            // one chip opens the management popover (delete = undo). Gated on
+            // the BASE availability (not `correctionsEnabled`) so the
+            // "Re-writing notes…" chip survives while a rewrite is in flight.
+            if correctionsAvailable, !correctionRows.isEmpty || correctionBusy {
+                Button {
+                    showCorrectionsList.toggle()
+                } label: {
+                    Label(correctionChipTitle, systemImage: correctionBusy ? "arrow.clockwise" : "pencil.and.list.clipboard")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+                .popover(isPresented: $showCorrectionsList) {
+                    CorrectionsListView(
+                        rows: correctionRows, busy: correctionBusy,
+                        onDelete: { deleteCorrectionRow($0) },
+                        onEdit: { editCorrectionRow($0, text: $1) },
+                        onRewrite: { rewriteNow() })
+                }
+            }
         }
         .transientScrollIndicators()
+    }
+
+    private var correctionChipTitle: String {
+        if correctionBusy { return "Re-writing notes…" }
+        let corrections = correctionRows.filter { $0.kind == .understanding }.count
+        let notesCount = correctionRows.count - corrections
+        var parts: [String] = []
+        if corrections > 0 { parts.append("\(corrections) correction\(corrections == 1 ? "" : "s")") }
+        if notesCount > 0 { parts.append("\(notesCount) note\(notesCount == 1 ? "" : "s")") }
+        return parts.joined(separator: " · ")
     }
 
     private var timeAndDuration: String {
@@ -600,6 +666,310 @@ private struct NotesPane: View {
             line += " · \(max(1, Int(ended.timeIntervalSince(meeting.startedAt) / 60))) min"
         }
         return line
+    }
+
+    // MARK: - G17 correction/note actions
+
+    /// The base gate: final notes on a ready meeting (the same gate as the
+    /// correct-name flow). Correction/note ROWS may exist and be managed
+    /// (viewed, deleted) whenever this holds — including while a rewrite is
+    /// in flight, so the busy chip stays visible.
+    private var correctionsAvailable: Bool {
+        notes != nil && meeting.status == .ready
+    }
+
+    /// NEW corrections/notes may be INITIATED only when no pipeline run
+    /// is in flight for this meeting and no rewrite is already running.
+    /// Otherwise the row is saved but the running synthesis never sees it
+    /// (it built its `NotesRequest` before the save) — a silent no-op. This
+    /// gates the block affordances; management (delete = undo) uses the base.
+    private var correctionsEnabled: Bool {
+        correctionsAvailable
+            && activity.activeRuns[meeting.id] == nil
+            && !correctionBusy
+    }
+
+    /// The occurrence to STORE for a submitted correction, resolved
+    /// against the section's real anchor blocks — the popover lets the user
+    /// trim the quote, which moves it into a different match space than the
+    /// block it came from.
+    private func storedOccurrence(for submission: CorrectionSubmission) -> Int {
+        guard let structured = notes?.structured else { return submission.occurrence }
+        return CorrectionAnchoring.occurrence(
+            forQuote: submission.quotedText, takenFrom: submission.blockText,
+            blockOccurrence: submission.occurrence,
+            in: CorrectionAnchoring.blocks(of: structured, section: submission.section))
+    }
+
+    // MARK: - G17: visible annotation asides in the native notes pane
+
+    /// The loaded margin-note rows (annotations). Understanding corrections
+    /// act through re-synthesis and carry no aside.
+    private var annotationRows: [MeetingCorrection] {
+        correctionRows.filter { $0.kind == .annotation }
+    }
+
+    /// Annotation rows in `section` that currently resolve to `blockIndex`
+    /// against `blocks` (the section's blocks in the SAME order the ForEach
+    /// renders them — filtered, for action items — so the index aligns).
+    private func annotations(
+        in blocks: [String], section: MeetingCorrection.Section, blockIndex: Int
+    ) -> [MeetingCorrection] {
+        annotationRows.filter { row in
+            row.section == section
+                && CorrectionAnchoring.resolve(
+                    quote: row.quotedText, occurrence: row.occurrence, in: blocks)?.blockIndex == blockIndex
+        }
+    }
+
+    /// Annotation rows in `section` that resolve to SOME block — placed
+    /// coarsely (summary: under the summary; detailed notes: at the end of the
+    /// section, because the pane's markdown blocks don't map 1:1 to the
+    /// fold-split paragraphs used for anchoring).
+    private func anchoredAnnotations(
+        section: MeetingCorrection.Section, structured: NotesStructured
+    ) -> [MeetingCorrection] {
+        let blocks = CorrectionAnchoring.blocks(of: structured, section: section)
+        return annotationRows.filter { row in
+            row.section == section
+                && CorrectionAnchoring.resolve(
+                    quote: row.quotedText, occurrence: row.occurrence, in: blocks) != nil
+        }
+    }
+
+    /// Annotation rows whose anchor no longer fold-matches any block in their
+    /// section — surfaced under the "Your notes" tail with a stale badge,
+    /// never silently dropped (§UX-5).
+    private func unanchoredAnnotations(_ structured: NotesStructured) -> [MeetingCorrection] {
+        annotationRows.filter { row in
+            let blocks = CorrectionAnchoring.blocks(of: structured, section: row.section)
+            return CorrectionAnchoring.resolve(
+                quote: row.quotedText, occurrence: row.occurrence, in: blocks) == nil
+        }
+    }
+
+    private func loadCorrections() async {
+        let database = appEnv.database
+        let meetingID = meeting.id
+        let rows: [MeetingCorrection] =
+            (try? await database.pool.read { db in
+                try MeetingCorrectionStore.all(db, meetingID: meetingID)
+            }) ?? []
+        correctionRows = rows
+    }
+
+    /// Understanding correction: the row is durable first; then the default
+    /// notes-only rewrite (or the escape-hatch full regenerate) runs. The
+    /// rewrite awaits completion so the busy chip is honest.
+    private func submitCorrection(_ submission: CorrectionSubmission) {
+        // Refuse a second submission while a rewrite is already in
+        // flight (the affordance is disabled too, but a queued interaction
+        // could still land) — the row would save but the running synthesis
+        // never re-reads it.
+        guard !correctionBusy else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        // Resolved against the CURRENT notes, on the main actor, before
+        // the task detaches.
+        let occurrence = storedOccurrence(for: submission)
+        // A popover opened BEFORE a run started can still be saved
+        // mid-run. The row must be saved (it is the user's truth), but the
+        // follow-up must not run: the live synthesis built its request before
+        // this row existed, and a rewrite would only be refused (the meeting
+        // is not `ready` while a run holds it).
+        let runActive = activity.activeRuns[meeting.id] != nil
+        correctionBusy = true
+        Task {
+            defer { correctionBusy = false }
+            do {
+                _ = try await pipeline.addCorrection(
+                    meetingID: meetingID, kind: .understanding,
+                    section: submission.section, quotedText: submission.quotedText,
+                    occurrence: occurrence, userText: submission.userText)
+                await loadCorrections()
+                if runActive {
+                    uiState.lastActionError =
+                        "Correction saved. The run already in progress doesn't include it — use \u{201C}Re-write notes now\u{201D} once that run finishes."
+                } else if submission.fullReprocess {
+                    // The escape hatch is today's full Regenerate — the queue
+                    // path (origin .user) with all its guards; corrections
+                    // ride along at request build.
+                    // `enqueue` returns the EXISTING job when a live job
+                    // collapses the new one, and nil ONLY when the durable
+                    // queue write threw. So nil means exactly one thing: the
+                    // run was not scheduled and nothing will retry it.
+                    let scheduled = await appEnv.processingQueue.enqueue(meetingID, origin: .user)
+                    uiState.lastActionError = scheduled == nil
+                        ? "Correction saved, but the processing run could not be queued (the queue write failed). It applies on the next Regenerate."
+                        : nil
+                } else {
+                    let record = try await pipeline.rewriteNotes(meetingID: meetingID)
+                    // A parked or refused rewrite is NOT silent (the demo-run
+                    // finding): the correction is saved either way, but the
+                    // user must know the notes didn't change yet.
+                    uiState.lastActionError = Self.rewriteFeedback(record)
+                }
+            } catch {
+                uiState.lastActionError =
+                    "Could not apply the correction: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// Margin note: deterministic, instant, no engine call.
+    private func submitNote(target: CorrectionTarget, text: String) {
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        // Mid-run, the re-mint still runs — it queues behind the run on
+        // the single-flight chain and weaves the note when the run drains, so
+        // the note cannot be lost in the window after the run's own weave. But
+        // it is NOT instant any more, and the copy says so.
+        let runActive = activity.activeRuns[meeting.id] != nil
+        Task {
+            do {
+                let result = try await pipeline.addCorrection(
+                    meetingID: meetingID, kind: .annotation,
+                    section: target.section, quotedText: target.blockText,
+                    occurrence: target.occurrence, userText: text)
+                uiState.lastActionError = Self.noteFeedback(
+                    remintRefused: result.remintRefused, runActive: runActive)
+            } catch {
+                uiState.lastActionError = "Could not add the note: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// Deletion is the undo (G17 §UX-3).
+    private func deleteCorrectionRow(_ row: MeetingCorrection) {
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        Task {
+            do {
+                // An annotation delete that could not re-mint has NOT
+                // left the delivered notes yet.
+                let refused = try await pipeline.deleteCorrection(
+                    meetingID: meetingID, id: row.id)
+                uiState.lastActionError = refused
+                    ? "Note deleted — it leaves the delivered notes when processing completes."
+                    : nil
+            } catch {
+                uiState.lastActionError =
+                    "Could not delete the correction: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// The honest banner for a saved margin note. nil when the note is
+    /// already in notes.md and the minted payload.
+    static func noteFeedback(remintRefused: Bool, runActive: Bool) -> String? {
+        if remintRefused {
+            return "Note saved — it will appear in the delivered notes when processing completes."
+        }
+        if runActive {
+            return "Note saved — it appears in the notes when the current run finishes."
+        }
+        return nil
+    }
+
+    /// §UX-3: edit the row's TEXT, keeping its anchor. An annotation edit
+    /// re-mints (the aside's wording must move now); an understanding edit
+    /// returns the row to `pending`, so the chip's "Re-write notes now" is the
+    /// user's next step — the edit is not silently applied to existing notes.
+    private func editCorrectionRow(_ row: MeetingCorrection, text: String) {
+        guard !text.isEmpty, text != row.userText, !correctionBusy else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        Task {
+            do {
+                let refused = try await pipeline.updateCorrection(
+                    meetingID: meetingID, id: row.id, quotedText: row.quotedText,
+                    occurrence: row.occurrence, userText: text)
+                uiState.lastActionError = editFeedback(row, refused: refused)
+            } catch {
+                uiState.lastActionError = "Could not edit: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    private func editFeedback(_ row: MeetingCorrection, refused: Bool) -> String? {
+        if row.kind == .understanding {
+            return "Correction updated — use \u{201C}Re-write notes now\u{201D} to apply it to these notes."
+        }
+        return refused
+            ? "Note updated — it reaches the delivered notes when processing completes."
+            : nil
+    }
+
+    /// PIN PICKER (§AC4): re-anchor a stale note onto the block the user
+    /// picked. The block's CURRENT text becomes the quote (that is what the
+    /// note is now about) with its fold-match occurrence, so a paragraph
+    /// repeated verbatim still anchors distinctly. `updateCorrection` re-mints for
+    /// annotations, so notes.md + the payload follow without a second call.
+    private func pinNote(_ row: MeetingCorrection, toBlockAt index: Int, in blocks: [String]) {
+        // The menu is disabled while a run/rewrite is in flight (the same
+        // gate as the block affordances); a queued interaction could still
+        // land here.
+        guard correctionsEnabled, blocks.indices.contains(index) else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        let quote = blocks[index]
+        let occurrence = CorrectionAnchoring.occurrence(ofBlockAt: index, in: blocks)
+        Task {
+            do {
+                let refused = try await pipeline.updateCorrection(
+                    meetingID: meetingID, id: row.id, quotedText: quote,
+                    occurrence: occurrence, userText: row.userText)
+                uiState.lastActionError = refused
+                    ? "Note pinned — it moves in the delivered notes when processing completes."
+                    : nil
+            } catch {
+                uiState.lastActionError = "Could not pin the note: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    private func rewriteNow() {
+        // Never launch a second rewrite over an in-flight one.
+        guard !correctionBusy else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        correctionBusy = true
+        Task {
+            defer { correctionBusy = false }
+            do {
+                let record = try await pipeline.rewriteNotes(meetingID: meetingID)
+                uiState.lastActionError = Self.rewriteFeedback(record)
+            } catch {
+                uiState.lastActionError =
+                    "Could not re-write the notes: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// The honest post-rewrite banner: nil on success; explicit copy when the
+    /// rewrite was parked (notes-pending, e.g. no engine configured) or
+    /// refused (meeting not ready). The correction row is durable in both
+    /// cases and rides the next successful run.
+    static func rewriteFeedback(_ record: PipelineRunRecord?) -> String? {
+        guard let record else {
+            return "Correction saved — but the notes could not be re-written now (the meeting is not ready). It applies on the next Regenerate."
+        }
+        if let pending = record.notesPending {
+            return "Correction saved. The re-write is waiting on the notes engine (\(pending)) and will run automatically — or use \u{201C}Re-write notes now\u{201D} once the engine is available."
+        }
+        return nil
     }
 
     /// Marks/unmarks one user item done (`action_item_state`, local-only).
@@ -683,9 +1053,19 @@ private struct NotesPane: View {
         }
 
         NoteSection(title: portuguese ? "Resumo" : "Summary", kind: .summary) {
-            MarkdownBlocksView(
-                markdown: structured.summary, searchTerms: searchTerms,
-                anchorPrefix: "notes-summary")
+            VStack(alignment: .leading, spacing: 8) {
+                MarkdownBlocksView(
+                    markdown: structured.summary, searchTerms: searchTerms,
+                    anchorPrefix: "notes-summary",
+                    correctionSection: correctionsEnabled ? .summary : nil,
+                    onCorrectionAction: { correctionTarget = $0 })
+                // Summary margin notes render as visible asides under
+                // the summary (the markdown weaving in NotesRenderer never
+                // reaches this native pane, which renders from notes.structured).
+                ForEach(anchoredAnnotations(section: .summary, structured: structured), id: \.id) { note in
+                    AnnotationAside(note: note, portuguese: portuguese)
+                }
+            }
         }
 
         // Drop blank user action items (empty text) before the box renders.
@@ -763,18 +1143,33 @@ private struct NotesPane: View {
             NoteSection(title: portuguese ? "Decisões" : "Decisions", kind: .decisions) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(structured.decisions.enumerated()), id: \.offset) { index, decision in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "checkmark.seal.fill")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Design.support)
-                                .accessibilityHidden(true)
-                            SearchHighlightedText(
-                                source: AttributedString(decision), terms: searchTerms)
-                                .font(Design.readingFont(14))
-                                .lineSpacing(Design.readingLineSpacing - 2)
-                                .textSelection(.enabled)
+                        CorrectableBlock(
+                            section: .decision, blockText: decision,
+                            occurrence: CorrectionAnchoring.occurrence(
+                                ofBlockAt: index, in: structured.decisions),
+                            enabled: correctionsEnabled,
+                            onAction: { correctionTarget = $0 }
+                        ) {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Design.support)
+                                    .accessibilityHidden(true)
+                                SearchHighlightedText(
+                                    source: AttributedString(decision), terms: searchTerms)
+                                    .font(Design.readingFont(14))
+                                    .lineSpacing(Design.readingLineSpacing - 2)
+                                    .textSelection(.enabled)
+                            }
                         }
                         .id("notes-decision-\(index)")
+                        // Inline margin-note asides under this decision.
+                        ForEach(
+                            annotations(in: structured.decisions, section: .decision, blockIndex: index),
+                            id: \.id
+                        ) { note in
+                            AnnotationAside(note: note, portuguese: portuguese)
+                        }
                     }
                 }
             }
@@ -789,17 +1184,39 @@ private struct NotesPane: View {
             NoteSection(title: portuguese ? "Itens de Ação" : "Action Items", kind: .actions) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(actionItems.enumerated()), id: \.offset) { index, item in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text("•").foregroundStyle(Design.support)
-                            SearchHighlightedText(
-                                source: AttributedString(
-                                    item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                        ? item.text : "\(item.owner): \(item.text)"),
-                                terms: searchTerms)
-                            .font(Design.readingFont(14))
+                        // Blank items are already dropped from `actionItems`,
+                        // and a blank block can never fold-match a non-empty
+                        // quote — so the occurrence computed over this FILTERED
+                        // list equals the one the full block list yields at
+                        // resolve time.
+                        CorrectableBlock(
+                            section: .actionItem, blockText: item.text,
+                            occurrence: CorrectionAnchoring.occurrence(
+                                ofBlockAt: index, in: actionItems.map(\.text)),
+                            enabled: correctionsEnabled,
+                            onAction: { correctionTarget = $0 }
+                        ) {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text("•").foregroundStyle(Design.support)
+                                SearchHighlightedText(
+                                    source: AttributedString(
+                                        item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                            ? item.text : "\(item.owner): \(item.text)"),
+                                    terms: searchTerms)
+                                .font(Design.readingFont(14))
+                            }
+                            .textSelection(.enabled)
                         }
-                        .textSelection(.enabled)
                         .id("notes-action-\(index)")
+                        // Inline margin-note asides under this action
+                        // item. Anchoring resolves over the FILTERED item
+                        // texts so the block index aligns with this ForEach.
+                        ForEach(
+                            annotations(in: actionItems.map(\.text), section: .actionItem, blockIndex: index),
+                            id: \.id
+                        ) { note in
+                            AnnotationAside(note: note, portuguese: portuguese)
+                        }
                     }
                 }
             }
@@ -808,11 +1225,138 @@ private struct NotesPane: View {
         let detailed = structured.detailedNotes.trimmingCharacters(in: .whitespacesAndNewlines)
         if !detailed.isEmpty {
             NoteSection(title: portuguese ? "Notas Detalhadas" : "Detailed Notes", kind: .detailed) {
-                MarkdownBlocksView(
-                    markdown: detailed, searchTerms: searchTerms,
-                    anchorPrefix: "notes-detailed")
+                VStack(alignment: .leading, spacing: 8) {
+                    MarkdownBlocksView(
+                        markdown: detailed, searchTerms: searchTerms,
+                        anchorPrefix: "notes-detailed",
+                        correctionSection: correctionsEnabled ? .detailedNotes : nil,
+                        onCorrectionAction: { correctionTarget = $0 })
+                    // Detailed-notes margin notes render at the END of
+                    // the section (coarse v1 — the native pane's markdown
+                    // blocks don't map 1:1 to the fold-split paragraphs used
+                    // for anchoring, so per-block placement isn't reliable
+                    // here yet). Each names its anchor quote.
+                    ForEach(anchoredAnnotations(section: .detailedNotes, structured: structured), id: \.id) { note in
+                        AnnotationAside(note: note, showQuote: true, portuguese: portuguese)
+                    }
+                }
             }
         }
+
+        // Annotations whose anchor no longer fold-matches any block
+        // land under a "Your notes" tail with their original quote + a stale
+        // badge — still visible, still shipped (§UX-5). Understanding rows are
+        // never here (they weave nothing).
+        let unanchored = unanchoredAnnotations(structured)
+        if !unanchored.isEmpty {
+            NoteSection(title: portuguese ? "Suas notas" : "Your notes", kind: .detailed) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(unanchored, id: \.id) { note in
+                        // PIN PICKER: the note's own section supplies the
+                        // targets. Blank blocks are dropped — they can never
+                        // fold-match a non-empty quote, so they are unpinnable
+                        // AND their absence cannot shift the occurrence
+                        // `CorrectionAnchoring.occurrence(ofBlockAt:in:)`
+                        // computes when one is picked.
+                        let targets = CorrectionAnchoring
+                            .blocks(of: structured, section: note.section)
+                            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                        AnnotationAside(
+                            note: note, showQuote: true, stale: true,
+                            pinBlocks: targets, pinDisabled: !correctionsEnabled,
+                            onPin: { pinNote(note, toBlockAt: $0, in: targets) },
+                            portuguese: portuguese)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// G17: a woven margin note rendered as a VISIBLE aside in the native
+/// notes pane. The markdown weaving in `NotesRenderer` only lands in
+/// `notes.markdown`, which this pane never shows — so the aside is rebuilt
+/// here from the durable `MeetingCorrection` row. Compact, yellow-tinted
+/// highlighter feel (matching the "Note" capsule tint in CorrectionsListView);
+/// deliberately calm — a pencil glyph, the note text, an optional anchor
+/// quote, and a stale badge when it has lost its paragraph.
+private struct AnnotationAside: View {
+    let note: MeetingCorrection
+    /// Show the anchor quote — for coarse placements (detailed notes) and the
+    /// stale tail, where adjacency alone can't say what the note is about.
+    var showQuote = false
+    /// The note no longer resolves to a block: a red "lost its paragraph"
+    /// badge, the same language as the management popover's stale status.
+    var stale = false
+    /// PIN PICKER (§AC4): the blocks of the note's section offered as new
+    /// anchors, with `onPin` taking the chosen index. Empty (the default) =
+    /// no picker — every non-stale placement is already where it belongs.
+    var pinBlocks: [String] = []
+    var pinDisabled = false
+    var onPin: ((Int) -> Void)?
+    var portuguese: Bool
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Image(systemName: "pencil")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(note.userText)
+                    .font(Design.readingFont(13))
+                    .foregroundStyle(.primary.opacity(0.9))
+                    .textSelection(.enabled)
+                if showQuote {
+                    Text("\(portuguese ? "sobre" : "on") \u{201C}\(AddNotePopover.shortQuote(note.quotedText))\u{201D}")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if stale {
+                    Text(portuguese ? "perdeu seu parágrafo" : "lost its paragraph")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                }
+                // PIN PICKER (§AC4): the way BACK from stale. A re-synthesis
+                // can rewrite the paragraph a note was hung on; without this
+                // the note is stranded in the tail forever (nothing else in
+                // the app calls `updateCorrection`). Deliberately a plain
+                // menu of the section's paragraphs — no drag, no re-anchor
+                // guessing.
+                if stale, !pinBlocks.isEmpty, let onPin {
+                    Menu(portuguese ? "Fixar em um parágrafo…" : "Pin next to a paragraph…") {
+                        ForEach(Array(pinBlocks.enumerated()), id: \.offset) { index, block in
+                            Button(Self.blockTitle(block)) { onPin(index) }
+                        }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .font(.system(size: 11))
+                    .fixedSize()
+                    .disabled(pinDisabled)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.yellow.opacity(0.13), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.yellow.opacity(0.28), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(portuguese ? "Sua nota" : "Your note"): \(note.userText)")
+    }
+
+    /// A pin-menu entry: one calm line. A paragraph's opening is enough to
+    /// recognize it — the full text is right there in the pane above.
+    private static func blockTitle(_ text: String) -> String {
+        let flat = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return flat.count > 60 ? flat.prefix(59) + "…" : flat
     }
 }
 
@@ -1045,21 +1589,59 @@ struct MarkdownBlocksView: View {
     let markdown: String
     var searchTerms: [String] = []
     var anchorPrefix: String?
+    /// G17: when set, each block gets the hover/right-click correction
+    /// affordance anchored with this section + the block's plain text. The
+    /// anchoring fold strips markdown tokens, so plain rendered text matches
+    /// the styled structured source.
+    var correctionSection: MeetingCorrection.Section?
+    var onCorrectionAction: ((CorrectionTarget) -> Void)?
 
     var body: some View {
         let blocks = MarkdownBlocks.parse(markdown)
+        // The plain text of every block in this section, so each
+        // block's correction affordance can carry its own occurrence.
+        let texts = blocks.map { String($0.text.characters) }
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(blocks) { block in
-                anchoredBlock(block)
+            // Honest limit on the occurrence computed here: these are the UI's
+            // markdown blocks, not the anchoring blocks
+            // (`CorrectionAnchoring.blocks` splits detailed notes on blank
+            // lines, and a single anchoring block can render as several list
+            // items). The two agree for the duplicate-block case that makes
+            // the occurrence matter at all; where they diverge, the stored
+            // occurrence can name a different match, and the re-anchor pass
+            // surfaces that as a stale note rather than a silent
+            // mis-attachment. A trimmed quote is recomputed against the real
+            // anchor space at save time (`NotesPane.storedOccurrence`).
+            ForEach(Array(blocks.enumerated()), id: \.element.id) { index, block in
+                anchoredBlock(
+                    block,
+                    occurrence: CorrectionAnchoring.occurrence(ofBlockAt: index, in: texts))
             }
         }
     }
 
     @ViewBuilder
-    private func anchoredBlock(_ block: MarkdownBlock) -> some View {
+    private func anchoredBlock(_ block: MarkdownBlock, occurrence: Int) -> some View {
         if let anchorPrefix {
-            blockView(block)
+            correctableBlock(block, occurrence: occurrence)
                 .id("\(anchorPrefix)-\(block.id)")
+        } else {
+            correctableBlock(block, occurrence: occurrence)
+        }
+    }
+
+    @ViewBuilder
+    private func correctableBlock(_ block: MarkdownBlock, occurrence: Int) -> some View {
+        if let correctionSection, let onCorrectionAction {
+            CorrectableBlock(
+                section: correctionSection,
+                blockText: String(block.text.characters),
+                occurrence: occurrence,
+                enabled: true,
+                onAction: onCorrectionAction
+            ) {
+                blockView(block)
+            }
         } else {
             blockView(block)
         }

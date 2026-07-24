@@ -202,6 +202,24 @@ public enum EvidencePayloadBuilder {
         if let digest = notes.memoryDigest {
             topLevel.append(("memory_digest", .string(digest)))
         }
+        // G17: user corrections/notes as attributable downstream provenance —
+        // ADDITIVE + presence-gated. Reads the notes row's mint-time SNAPSHOT
+        // (never live `meeting_correction` rows, which are user-mutable and
+        // would break re-materialization hash equality). A meeting with no
+        // rows omits the field: byte-identical to pre-G17 payloads.
+        if !notes.userCorrections.isEmpty {
+            topLevel.append((
+                "user_corrections",
+                .array(notes.userCorrections.map { snapshot -> CanonicalJSONValue in
+                    .object([
+                        ("kind", .string(snapshot.kind.rawValue)),
+                        ("section", .string(snapshot.section.rawValue)),
+                        ("quoted_text", .string(snapshot.quotedText)),
+                        ("user_text", .string(snapshot.userText)),
+                        ("created_at_ms", .integer(milliseconds(date: snapshot.createdAt))),
+                    ])
+                })))
+        }
         return .object(topLevel)
     }
 
