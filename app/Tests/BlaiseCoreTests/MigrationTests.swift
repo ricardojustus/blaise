@@ -229,6 +229,17 @@ import Testing
     /// the current binary's v1 already includes it, so this pins the rebuild's
     /// MECHANICS — data preserved, indexes recreated, `slack` insertable —
     /// which is what must never corrupt an upgraded database).
+    ///
+    /// The child rows are the load-bearing half: `meeting` is the FK parent of
+    /// the whole content model (transcript_segment, meeting_notes,
+    /// processing_queue, … all `ON DELETE CASCADE`). The rebuild drops the old
+    /// `meeting` table, which — were foreign keys enforced during migration —
+    /// would cascade-delete every child row in the database. GRDB's `.deferred`
+    /// mode disables FK enforcement (`PRAGMA foreign_keys = OFF`) around the
+    /// migration, which is what makes the drop safe. This test pins that with
+    /// populated children: a regression (a GRDB behavior change, or someone
+    /// switching the migration to `.immediate`) silently destroys every user's
+    /// transcripts, and ONLY a populated-children test catches it.
     @Test func v18RebuildPreservesDataAndWidensSource() throws {
         let url = try makeTempRoot().appendingPathComponent("v17-populated.sqlite")
         let queue = try DatabaseQueue(path: url.path)
@@ -240,6 +251,25 @@ import Testing
                     VALUES ('M1', 'kept', ?, 'meet', 'ready', '[]', ?, ?, 'abc-defg-hij')
                     """,
                 arguments: [msDate(), msDate(), msDate()])
+            // CASCADE children of M1 — the rows the rebuild must not destroy.
+            try db.execute(
+                sql: """
+                    INSERT INTO transcript_segment (meeting_id, ord, start_seconds, end_seconds, speaker_label, text)
+                    VALUES ('M1', 0, 0.0, 2.5, 'S1', 'kept segment one'),
+                           ('M1', 1, 2.5, 4.0, 'S2', 'kept segment two')
+                    """)
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting_notes (meeting_id, markdown, language, generated_at, provenance, structured)
+                    VALUES ('M1', '# kept notes', 'en', ?, '{}', '{}')
+                    """,
+                arguments: [msDate()])
+            try db.execute(
+                sql: """
+                    INSERT INTO processing_queue (id, meeting_id, state, origin, enqueued_at, created_seq)
+                    VALUES ('J1', 'M1', 'pending', 'auto', ?, 1)
+                    """,
+                arguments: [msDate()])
         }
 
         try BlaiseDatabase.migrator.migrate(queue, upTo: "v18")
@@ -251,6 +281,20 @@ import Testing
             #expect(kept?["title"] == "kept")
             #expect(kept?["meeting_code"] == "abc-defg-hij")
             #expect(kept?["title_source"] == "default")
+            // Children survived the parent-table drop (FKs off during the
+            // migration; the drop must NOT have cascaded).
+            #expect(
+                try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM transcript_segment WHERE meeting_id = 'M1'") == 2)
+            #expect(
+                try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM meeting_notes WHERE meeting_id = 'M1'") == 1)
+            #expect(
+                try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM processing_queue WHERE meeting_id = 'M1'") == 1)
+            // And the FK relationship still holds after the rename: cascades
+            // work post-migration exactly as before.
+            #expect(try Bool.fetchOne(db, sql: "PRAGMA foreign_keys") == true)
             // slack inserts.
             try db.execute(
                 sql: """

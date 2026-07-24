@@ -96,8 +96,8 @@ settings load (`setSelfUserID`); empty = safe no-op, no huddle ever tracked.
 
 ```json
 { "type": "user_huddle_changed",
-  "user": { "id": "U012AB3CD", "name": "arthur",
-    "profile": { "display_name": "Arthur", "real_name": "Arthur Soares",
+  "user": { "id": "U012AB3CD", "name": "sam",
+    "profile": { "display_name": "Sam", "real_name": "Sam Rivera",
                  "huddle_state": "in_a_huddle",
                  "huddle_state_expiration_ts": 1781136000,
                  "huddle_state_call_id": "R0123ABC456" } },

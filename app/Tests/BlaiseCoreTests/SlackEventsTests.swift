@@ -34,8 +34,8 @@ struct SlackEventsTests {
             { "envelope_id": "env-1", "type": "events_api",
               "payload": { "event": {
                 "type": "user_huddle_changed",
-                "user": { "id": "U012AB3CD", "name": "arthur",
-                  "profile": { "display_name": "Arthur", "real_name": "Arthur Soares",
+                "user": { "id": "U012AB3CD", "name": "sam",
+                  "profile": { "display_name": "Sam", "real_name": "Sam Rivera",
                     "huddle_state": "in_a_huddle",
                     "huddle_state_expiration_ts": 1781136000,
                     "huddle_state_call_id": "R0123ABC456" } },
@@ -51,7 +51,7 @@ struct SlackEventsTests {
         #expect(event.isInHuddle)
         #expect(event.callID == "R0123ABC456")
         #expect(event.expirationTs == 1_781_136_000)
-        #expect(event.preferredDisplayName == "Arthur")
+        #expect(event.preferredDisplayName == "Sam")
     }
 
     @Test("leave event: state cleared, no call id")

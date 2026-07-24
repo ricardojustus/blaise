@@ -137,16 +137,51 @@ struct SlackHuddlesModelTests {
         #expect(model.socketLive)
         #expect(model.statusTitle == "Connected")
         // Three sessions that never reach hello → surface the persistent failure.
-        model.handleSocketStatus(.sessionEnded(healthy: false))
+        model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: false))
         #expect(model.lastError == nil)
-        model.handleSocketStatus(.sessionEnded(healthy: false))
-        model.handleSocketStatus(.sessionEnded(healthy: false))
+        model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: false))
+        model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: false))
         #expect(model.lastError == SlackHuddlesModel.reconnectFailureMessage)
         // A healthy session clears it.
         model.handleSocketStatus(.connected)
         #expect(model.lastError == nil)
         #expect(model.socketLive)
         await model.disconnect()
+    }
+
+    @Test("offline sessions are neutral: a Wi-Fi blip never surfaces the revoked-tokens banner")
+    func offlineSessionsAreNeutral() async throws {
+        let (model, _, _) = try makeModel(client: parkingClient(transport: okTransport))
+        model.appToken = "xapp"
+        model.botToken = "xoxb"
+        model.memberID = "U012AB3CD"
+        await model.connect()
+        // Any number of connectivity-class failures must not accumulate toward
+        // the banner (offline says nothing about the Slack app or its tokens)…
+        for _ in 0 ..< 6 {
+            model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: true))
+        }
+        #expect(model.lastError == nil)
+        // …and must not RESET a genuine no-hello streak either: two real
+        // failures + an offline blip + a third real failure still surfaces it.
+        model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: false))
+        model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: false))
+        model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: true))
+        #expect(model.lastError == nil)
+        model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: false))
+        #expect(model.lastError == SlackHuddlesModel.reconnectFailureMessage)
+        await model.disconnect()
+    }
+
+    @Test("URLError connectivity classification")
+    func connectivityErrorClassification() {
+        #expect(SlackSocketClient.isConnectivityError(URLError(.notConnectedToInternet)))
+        #expect(SlackSocketClient.isConnectivityError(URLError(.networkConnectionLost)))
+        #expect(SlackSocketClient.isConnectivityError(URLError(.dnsLookupFailed)))
+        // Auth-shaped and protocol-shaped failures still count toward the streak.
+        #expect(!SlackSocketClient.isConnectivityError(URLError(.userAuthenticationRequired)))
+        #expect(!SlackSocketClient.isConnectivityError(URLError(.badServerResponse)))
+        #expect(!SlackSocketClient.isConnectivityError(SlackClientError.api("invalid_auth")))
     }
 
     @Test("a Keychain read failure at load surfaces through settingsError")

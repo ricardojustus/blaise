@@ -161,15 +161,20 @@ public actor SlackHuddleTracker {
             await flushRoster(at: clock)
         }
 
-        // Expiration backstop: `now > huddle_state_expiration_ts + 120 s` with
-        // no refreshing self event (a refresh advances `expirationTs`). Nil
-        // expiry → rely on MeetCallTracker's watchdog via heartbeats.
+        // Expiration ADVISORY: `now > huddle_state_expiration_ts + 120 s` with
+        // no refreshing self event. Slack's refresh cadence for
+        // `huddle_state_expiration_ts` during a long huddle is UNVERIFIED (the
+        // spec's live-workspace touchpoint is open), so a passed expiry must
+        // never end the call — a stale stamp on a live huddle would auto-stop a
+        // real recording mid-meeting (hard floor 1). Log once and clear the
+        // stamp; automatic stops belong to the audio-keyed silence watchdog and
+        // an explicit self leave event, both grounded in signals we trust.
         if let exp = expirationTs,
             clock.timeIntervalSince1970 > Double(exp) + Self.expirationBackstopSeconds
         {
-            logger.notice("huddle expiration backstop fired for \(callID, privacy: .public)")
-            await endCurrentCall(reason: "expired", at: clock)
-            return
+            logger.notice(
+                "huddle expiry passed for \(callID, privacy: .public) with no refresh — advisory only, call kept alive")
+            expirationTs = nil
         }
 
         // Heartbeat.

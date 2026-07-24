@@ -140,8 +140,8 @@ struct SlackHuddleTrackerTests {
         #expect(rec.all[0].roster.allSatisfy { $0.isSelf })  // only self
     }
 
-    @Test("expiration backstop ends the call")
-    func expirationBackstop() async {
+    @Test("expiration is advisory: a passed expiry never ends the call")
+    func expirationAdvisory() async {
         let rec = BatchRecorder()
         let tracker = makeTracker(rec)
         let expiry = Int64(t(10).timeIntervalSince1970)
@@ -149,9 +149,19 @@ struct SlackHuddleTrackerTests {
             selfEvent(callID: "R1", inHuddle: true, ts: "1000.1", expiration: expiry), at: t(0))
         await tracker.tick(now: t(50))  // < expiry + 120 (and < 60 s, no heartbeat) → still live
         #expect(rec.lifecycleKinds == [.callStarted])
-        await tracker.tick(now: t(131))  // > expiry + 120 → backstop fires
+        // > expiry + 120: the stale stamp must NOT end the call — Slack's
+        // refresh cadence for the stamp is unverified, and a false end here
+        // would auto-stop a live recording (hard floor 1). The call stays
+        // alive and heartbeats keep flowing.
+        await tracker.tick(now: t(131))
+        #expect(rec.all.compactMap(\.lifecycle).allSatisfy { $0.kind != .callEnded })
+        #expect(rec.all.last?.lifecycle?.kind == .heartbeat)
+        await tracker.tick(now: t(200))  // stamp cleared → no re-fire either
+        #expect(rec.all.compactMap(\.lifecycle).allSatisfy { $0.kind != .callEnded })
+        // The trusted signal keeps its power: an explicit self leave ends it.
+        await tracker.handle(selfEvent(callID: nil, inHuddle: false, ts: "1000.9"), at: t(210))
         #expect(rec.all.last?.lifecycle?.kind == .callEnded)
-        #expect(rec.all.last?.lifecycle?.reason == "expired")
+        #expect(rec.all.last?.lifecycle?.reason == "left")
     }
 
     @Test("heartbeat emitted on cadence while in a call")

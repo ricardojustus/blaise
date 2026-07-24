@@ -139,9 +139,18 @@ final class SlackHuddlesModel {
         enabled = value
         Task {
             if value {
+                // Re-push the member id: a prior disable cleared the tracker's
+                // identity, and an identity-less tracker ignores every event.
+                await tracker.setSelfUserID(memberID)
                 startSocket()
             } else {
                 await stopSocket()
+                // Clear tracker state (current call, roster, heartbeat clock).
+                // Without this, a disable mid-huddle leaves the call stuck
+                // forever: no events can ever arrive to end it, so it would
+                // heartbeat a phantom meeting for the process lifetime,
+                // defeating auto-stop and re-posting start notifications.
+                await tracker.setSelfUserID("")
             }
             await saveSettings()
         }
@@ -225,6 +234,10 @@ final class SlackHuddlesModel {
         // not write fresh tokens and silently undo the disconnect.
         cancelConnect()
         await stopSocket()
+        // Same phantom-call hygiene as setEnabled(false): a disconnect
+        // mid-huddle must not leave the tracker heartbeating a call that no
+        // event can ever end.
+        await tracker.setSelfUserID("")
         try? secrets.delete(key: Self.appTokenKey)
         try? secrets.delete(key: Self.botTokenKey)
         appToken = ""
@@ -295,10 +308,15 @@ final class SlackHuddlesModel {
             socketLive = true
             noHelloStreak = 0
             if lastError == Self.reconnectFailureMessage { lastError = nil }
-        case .sessionEnded(let healthy):
+        case .sessionEnded(let healthy, let networkDown):
             socketLive = false
             if healthy {
                 noHelloStreak = 0
+            } else if networkDown {
+                // Offline is NEUTRAL: it neither accumulates toward the
+                // revoked-tokens banner nor clears a genuine auth-failure
+                // streak. The machine being offline says nothing about the
+                // Slack app's health.
             } else {
                 noHelloStreak += 1
                 if noHelloStreak >= Self.maxFailedSessions {
@@ -353,8 +371,11 @@ final class SlackHuddlesModel {
 enum SlackSocketStatus: Sendable, Equatable {
     /// A `hello` arrived — the session is healthy.
     case connected
-    /// A session ended and a reconnect will follow. `healthy` = it had a hello.
-    case sessionEnded(healthy: Bool)
+    /// A session ended and a reconnect will follow. `healthy` = it had a hello;
+    /// `networkDown` = it failed with a connectivity-class URLError (offline,
+    /// link lost, DNS). Offline sessions are NEUTRAL for the failure streak —
+    /// a Wi-Fi blip must never surface the "tokens revoked" banner.
+    case sessionEnded(healthy: Bool, networkDown: Bool)
 }
 
 /// A minimal text-frame WebSocket, injectable so the client's ack/reconnect
@@ -404,6 +425,22 @@ actor SlackSocketClient {
     /// Exponential backoff, capped (jitter added at the call site).
     static func nextBackoff(_ current: Double) -> Double {
         min(maxBackoffSeconds, current * 2)
+    }
+
+    /// Connectivity-class failures (offline, link lost, DNS, unreachable) —
+    /// the machine's network is the problem, not the Slack app or its tokens.
+    /// These are excluded from the no-hello failure streak so a Wi-Fi blip
+    /// never surfaces the "reconnect with fresh tokens" banner (M-1-005).
+    static func isConnectivityError(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .notConnectedToInternet, .networkConnectionLost, .timedOut,
+            .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+            .dataNotAllowed, .internationalRoamingOff:
+            return true
+        default:
+            return false
+        }
     }
 
     // MARK: Web API
@@ -457,6 +494,7 @@ actor SlackSocketClient {
         var backoff = Self.initialBackoffSeconds
         while !Task.isCancelled {
             sessionSawHello = false
+            var networkDown = false
             do {
                 let url = try await openConnection(appToken: appToken)
                 let channel = try await opener(url)
@@ -465,12 +503,14 @@ actor SlackSocketClient {
             } catch is CancellationError {
                 return
             } catch {
+                networkDown = Self.isConnectivityError(error)
                 logger.notice("slack socket session ended: \(error.localizedDescription, privacy: .public)")
             }
             if Task.isCancelled { return }
-            // Report the ended session (healthy = it saw a hello) so the model
-            // can distinguish a routine link refresh from a failing loop.
-            await onStatus(.sessionEnded(healthy: sessionSawHello))
+            // Report the ended session (healthy = it saw a hello; networkDown =
+            // a connectivity-class failure) so the model can distinguish a
+            // routine link refresh from a failing loop from plain offline.
+            await onStatus(.sessionEnded(healthy: sessionSawHello, networkDown: networkDown))
             if sessionSawHello { backoff = Self.initialBackoffSeconds }
             let jitter = Double.random(in: 0 ... 0.3) * backoff
             try? await backoffSleep(backoff + jitter)

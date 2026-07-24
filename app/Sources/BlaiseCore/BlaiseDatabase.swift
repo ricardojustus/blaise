@@ -521,9 +521,14 @@ public final class BlaiseDatabase: Sendable {
         // the validity boundary (the same stance v1 took for `status`, whose
         // vocabulary is likewise expected to evolve), so a future source
         // addition never needs another rebuild. `meeting` is referenced by
-        // child FKs; the migrator defers foreign-key checks by default, so the
-        // drop/rename preserves them (rows keep their ids; the end-of-migration
-        // check passes).
+        // child FKs with ON DELETE CASCADE; what makes the drop safe is that
+        // GRDB's default `.deferred` mode runs `PRAGMA foreign_keys = OFF`
+        // around the migration — with FKs off, DROP TABLE fires no cascade
+        // actions, so child rows (transcripts, notes, queue jobs) survive and
+        // re-attach to the renamed table. (Deferring FK *checks* alone would
+        // NOT be enough: deferral postpones violation reporting, not cascade
+        // actions.) Pinned by MigrationTests with populated children — do not
+        // switch this migration to `.immediate`.
         migrator.registerMigration("v18") { db in
             try db.create(table: "meeting_new") { t in
                 t.primaryKey("id", .text)

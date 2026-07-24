@@ -210,11 +210,11 @@ struct SlackSocketClientTests {
                 statuses.withLock { $0.append(status) }
             }
         }
-        _ = await waitUntilApp { statuses.withLock { $0.contains(.sessionEnded(healthy: true)) } }
+        _ = await waitUntilApp { statuses.withLock { $0.contains(.sessionEnded(healthy: true, networkDown: false)) } }
         runTask.cancel()
         let seen = statuses.withLock { $0 }
         #expect(seen.first == .connected)
-        #expect(seen.contains(.sessionEnded(healthy: true)))
+        #expect(seen.contains(.sessionEnded(healthy: true, networkDown: false)))
     }
 
     @Test("a frame that fails strict decode is still ACKed (no infinite redelivery)")
