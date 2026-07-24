@@ -224,7 +224,7 @@ import Testing
         }
     }
 
-    // FIX O: v18 over a POPULATED v17 database. The G17 migration adds a table,
+    // v18 over a POPULATED v17 database. The G17 migration adds a table,
     // an index and a nullable column to a live schema; a populated upgrade is
     // the only shape that proves the pre-existing meeting_notes row survives it
     // and reads back through the CURRENT decoder (user_corrections NULL → []).

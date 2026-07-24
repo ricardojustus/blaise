@@ -124,7 +124,7 @@ private func makeRow(
         #expect(blockRange.lowerBound < transcriptRange.lowerBound)
     }
 
-    @Test("FIX H: a newline inside a quote or note body cannot forge extra authoritative entries")
+    @Test("a newline inside a quote or note body cannot forge extra authoritative entries")
     func userTextCannotForgeNumberedInstructions() throws {
         let block = try #require(NotesPromptBuilder.correctionsBlock([
             NotesCorrection(
@@ -218,7 +218,7 @@ private func makeRow(
             "- Important reminder. *(on \u{201C}a paragraph the re-write removed\u{201D})*"))
     }
 
-    @Test("FIX H: exotic Unicode line breaks in a note flatten to spaces — the aside stays one blockquote line")
+    @Test("exotic Unicode line breaks in a note flatten to spaces — the aside stays one blockquote line")
     func exoticLineBreaksFlattenInsideAsides() throws {
         // U+000B/U+000C/U+2028/U+2029 end a line for renderers that are not
         // strictly CommonMark; a survivor would let the note's tail escape
@@ -237,7 +237,7 @@ private func makeRow(
         }
         // CRLF still collapses to ONE space (the pair is a single break).
         #expect(CorrectionSanitize.flatten("one\r\ntwo") == "one two")
-        // FIX H: the TITLE fold stayed exactly as it was — widening it moved
+        // The TITLE fold stayed exactly as it was — widening it moved
         // the rendered bytes of meetings that have no corrections at all.
         #expect(NotesRenderer.flattenToTitleLine("one\u{2028}two") == "one\u{2028}two")
         // ...and the correction fold keeps a heading-only note's body, which
@@ -245,7 +245,7 @@ private func makeRow(
         #expect(CorrectionSanitize.flatten("### TODO") == "### TODO")
     }
 
-    @Test("FIX H: an unanchored note whose body is only heading syntax keeps its body in the tail")
+    @Test("an unanchored note whose body is only heading syntax keeps its body in the tail")
     func headingOnlyNoteKeepsBodyInTail() throws {
         let markdown = try NotesRenderer.render(
             structured, language: "en", meetingTitle: "Sync", userName: "Sam",
@@ -257,7 +257,7 @@ private func makeRow(
         #expect(markdown.contains("- ### TODO *(on \u{201C}a paragraph the re-write removed\u{201D})*"))
     }
 
-    @Test("FIX B: a fenced detailed-notes block spanning a blank line stays intact; the aside lands after the blob")
+    @Test("a fenced detailed-notes block spanning a blank line stays intact; the aside lands after the blob")
     func fencedDetailedNotesKeepFenceAndAppendAside() throws {
         let fenced = NotesStructured(
             title: "Sync",
@@ -295,7 +295,7 @@ private func makeRow(
         #expect(!markdown.contains("```\n\n```"))
     }
 
-    @Test("FIX L: an INDENTED code block survives aside weaving too")
+    @Test("an INDENTED code block survives aside weaving too")
     func indentedCodeKeepsItsIndentAndAppendsAside() throws {
         let indented = NotesStructured(
             title: "Sync",
@@ -471,7 +471,7 @@ private func makeRow(
         #expect(updates.first { $0.id == orphan.id }?.occurrence == 0)
     }
 
-    @Test("FIX J: trimming the quote recomputes the occurrence against the trimmed match space")
+    @Test("trimming the quote recomputes the occurrence against the trimmed match space")
     func trimmedQuoteReanchorsToTheBlockTheUserActedOn() throws {
         // The user opens the correction popover on the SECOND decision and
         // trims the quote to a prefix both decisions share.
@@ -503,7 +503,7 @@ private func makeRow(
                 blockOccurrence: 0, in: blocks) == 0)
     }
 
-    @Test("FIX E: occurrence from the block's position among fold-matches anchors identical duplicates distinctly")
+    @Test("occurrence from the block's position among fold-matches anchors identical duplicates distinctly")
     func occurrenceDisambiguatesIdenticalBlocks() throws {
         // Two blocks share identical text; a third differs. This is what the
         // UI's `matchOccurrence` computes at menu-action time — the position
@@ -515,7 +515,7 @@ private func makeRow(
         #expect(secondOccurrence == 1)
         // Round-trip: each stored occurrence resolves back to ITS OWN block.
         // The previous hard-coded occurrence 0 anchored BOTH duplicates to the
-        // first block — the mis-anchoring FIX E removes.
+        // first block — the mis-anchoring the occurrence rule removes.
         #expect(
             CorrectionAnchoring.resolve(quote: "Ship it.", occurrence: try #require(firstOccurrence), in: blocks)?
                 .blockIndex == 0)
@@ -540,12 +540,12 @@ private func liveStatus(
     try await liveRow(database, meetingID, id)?.status
 }
 
-// FIX I: the G17 rewrite refuses to touch the transcript (AC1), but a rewrite
+// The G17 rewrite refuses to touch the transcript (AC1), but a rewrite
 // that PARKS heals later through resumePendingNotes — a path that used to
 // apply the healing response's speaker-name proposals and mutate the very
 // transcript the rewrite had protected.
 @Suite struct G17RewriteResumeTests {
-    /// FIX Q (AC1/AC2/AC5): the happy path of the "Re-write the notes" action
+    /// AC1/AC2/AC5: the happy path of the "Re-write the notes" action
     /// end to end — new notes, an untouched transcript, the consumed row
     /// flipped, and a fresh payload on the queue.
     @Test("a rewrite re-synthesizes the notes, consumes the correction and leaves the transcript alone")
@@ -668,7 +668,7 @@ private func liveStatus(
     }
 }
 
-// FIX N: the payload snapshot claims the rows that SHAPED the artifact. A
+// The payload snapshot claims the rows that SHAPED the artifact. A
 // correction nobody has run yet shapes nothing.
 @Suite struct CorrectionSnapshotHonestyTests {
     @Test("an unconsumed correction does not ride an unrelated re-mint into the snapshot")
@@ -705,7 +705,7 @@ private func liveStatus(
     }
 }
 
-// FIX K: the correction write paths report whether the artifacts actually
+// The correction write paths report whether the artifacts actually
 // moved, so the UI can stop implying a note already shipped when it did not.
 @Suite struct CorrectionWriteHonestyTests {
     @Test("a note on a meeting that cannot re-mint reports the refusal, and the row stays durable")
@@ -738,13 +738,13 @@ private func liveStatus(
     }
 }
 
-// FIX F: the legacy re-mint paths (rename meeting / rename speaker / correct
+// The legacy re-mint paths (rename meeting / rename speaker / correct
 // name in notes) re-WEAVE annotations into the markdown, so they must also
 // re-ANCHOR the live `meeting_correction` rows — otherwise an edit that moved
 // or dissolved an anchor leaves a wrong status/occurrence behind until the
 // next synthesis, and the management popover disagrees with the pane.
 @Suite struct CorrectionRemintReanchorTests {
-    @Test("FIX M: a name correction rewrites the anchor quote, so the note stays attached")
+    @Test("a name correction rewrites the anchor quote, so the note stays attached")
     func correctNameInNotesCarriesTheAnchorQuote() async throws {
         let harness = try await makePipelineHarness()
         harness.notesPrimary.state.withLock { $0.summary = "Caco fechou o contrato" }
@@ -799,11 +799,11 @@ private func liveStatus(
                 meetingID: meeting.id, original: "Caco", replacement: "Sammy",
                 allOccurrences: false) == 1)
 
-        // FIX M rewrote BOTH mentions in the quote (the memoryDigest rule)
+        // The quote rewrite touched BOTH mentions (the memoryDigest rule)
         // while the prose kept its second "Caco", so the anchor genuinely no
-        // longer matches. Pre-FIX F the row stayed `applied` — a note pointing
-        // at text that does not exist, with no stale badge and no way to
-        // re-pin it.
+        // longer matches. Without the re-anchor pass the row would stay
+        // `applied` — a note pointing at text that does not exist, with no
+        // stale badge and no way to re-pin it.
         #expect(try await liveStatus(harness.database, meeting.id, added.row.id) == .stale)
     }
 }

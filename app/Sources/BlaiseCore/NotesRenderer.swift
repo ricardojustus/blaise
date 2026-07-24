@@ -65,8 +65,8 @@ public enum NotesRenderer {
         if weave.detailedAsides.isEmpty {
             blocks.append(detailedNotes.isEmpty ? strings.noneMarker : demoteHeadings(in: detailedNotes))
         } else if containsCode(detailedNotes) {
-            // FIX B: the per-paragraph path splits on blank lines, but a
-            // fenced code block that spans a blank line is split mid-fence and
+            // The per-paragraph path splits on blank lines, but a fenced
+            // code block that spans a blank line is split mid-fence and
             // `demoteHeadings` force-closes it per fragment — corrupting the
             // block. When this section has anchored asides AND a fence, render
             // the whole blob once (fence intact) and append the asides after
@@ -121,7 +121,7 @@ public enum NotesRenderer {
     /// order within each bucket).
     struct AnnotationWeave {
         var summaryAsides: [String] = []
-        // FIX B: detailed asides carry their anchor quote as well as the text.
+        // Detailed asides carry their anchor quote as well as the text.
         // The per-paragraph path renders the text under its paragraph (quote
         // redundant there); the fenced-blob path renders the quoted form after
         // the whole blob, where adjacency no longer names the anchor.
@@ -157,7 +157,7 @@ public enum NotesRenderer {
         }
     }
 
-    /// FIX B/L: whether the raw detailed-notes blob carries code that the
+    /// Whether the raw detailed-notes blob carries code that the
     /// per-paragraph aside weaving would corrupt. Two shapes qualify:
     ///
     /// - A FENCE (``` / ~~~), which the paragraph split can cut in half — each
@@ -184,7 +184,7 @@ public enum NotesRenderer {
 
     /// A note aside: one blockquote paragraph. The note body flattens to one
     /// line (a multi-line note must not escape the blockquote) through the
-    /// correction fold, which keeps a `#`-only note's body (FIX H).
+    /// correction fold, which keeps a `#`-only note's body.
     private static func aside(_ text: String, strings: LocalizedStrings) -> String {
         "> **\(strings.yourNote):** \(CorrectionSanitize.flatten(text))"
     }
@@ -267,10 +267,10 @@ public enum NotesRenderer {
     /// Title/meetingTitle → single line: newlines become spaces, leading `#`
     /// run stripped, surrounding whitespace trimmed.
     ///
-    /// FIX H: deliberately NOT widened to the other Unicode line separators.
-    /// This function owns TITLE bytes for every meeting, including the ones
-    /// with no corrections at all — widening it moved the rendered output of
-    /// a pre-G17 title containing U+2028. User correction text has its own
+    /// Deliberately NOT widened to the other Unicode line separators: this
+    /// function owns TITLE bytes for every meeting, including the ones with
+    /// no corrections at all, so widening it would move the rendered output
+    /// of a pre-G17 title containing U+2028. User correction text has its own
     /// fold (`CorrectionSanitize.flatten`), which is where that hardening
     /// belongs.
     static func flattenToTitleLine(_ raw: String) -> String {

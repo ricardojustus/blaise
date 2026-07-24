@@ -3,11 +3,11 @@ import SwiftUI
 
 // G17: the "Suggest a correction… / Add a note…" flow on a finished
 // meeting's notes. Every block gets a hover-revealed affordance (visible
-// control; right-click is the shortcut; keyboard-reachable — the UX-review
-// discoverability decision), the correction popover leads solely with
-// "What's actually true?" (re-transcription is a demoted escape hatch), and
-// the provenance line counts corrections and notes separately with a
-// management popover where deletion is the undo.
+// control; right-click is the shortcut; keyboard-reachable — §UX-2), the
+// correction popover leads solely with "What's actually true?"
+// (re-transcription is a demoted escape hatch — §UX-1), and the provenance
+// line counts corrections and notes separately with a management popover
+// where deletion is the undo (§UX-3).
 
 /// The block a popover is anchored to.
 struct CorrectionTarget: Identifiable, Equatable {
@@ -16,7 +16,7 @@ struct CorrectionTarget: Identifiable, Equatable {
     var action: Action
     var section: MeetingCorrection.Section
     var blockText: String
-    /// FIX E: which fold-match within the section this block is (0-based),
+    /// Which fold-match within the section this block is (0-based),
     /// computed at menu-action time so a correction/note anchors to the RIGHT
     /// block when two blocks share identical text. Summary/detailed keep 0
     /// (their UI granularity does not map 1:1 to the fold-split blocks).
@@ -28,9 +28,9 @@ struct CorrectionSubmission {
     var section: MeetingCorrection.Section
     var quotedText: String
     var userText: String
-    /// FIX E: threaded from the target (the block's fold-match occurrence).
+    /// Threaded from the target (the block's fold-match occurrence).
     var occurrence: Int
-    /// FIX J: the UNTRIMMED text of the block the user acted on. The quote is
+    /// The UNTRIMMED text of the block the user acted on. The quote is
     /// editable, and a trimmed quote lives in a different match space than the
     /// whole block — this is what lets the save path find the block that was
     /// actually targeted and recompute the occurrence against the trim.
@@ -45,7 +45,7 @@ struct CorrectionSubmission {
 struct CorrectableBlock<Content: View>: View {
     var section: MeetingCorrection.Section
     var blockText: String
-    /// FIX E: the block's fold-match occurrence within its section (0 for the
+    /// The block's fold-match occurrence within its section (0 for the
     /// single-block / coarse sections). Carried into the target on action.
     var occurrence: Int = 0
     var enabled: Bool
@@ -100,7 +100,7 @@ struct CorrectableBlock<Content: View>: View {
 
 /// "Suggest a correction": quoted span (trimmable), "What's actually true?",
 /// and the demoted re-transcription disclosure. The save button's label
-/// follows the effective scope (UX review #4).
+/// follows the effective scope (§UX-1).
 struct CorrectionPopover: View {
     var target: CorrectionTarget
     var onCancel: () -> Void

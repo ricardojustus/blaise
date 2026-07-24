@@ -732,7 +732,7 @@ public actor ProcessingPipeline {
             // G17: every re-mint re-weaves current annotations and refreshes
             // the payload snapshot (an unrelated rename must not drop them).
             let correctionRows = await self.correctionRows(meetingID: meetingID)
-            // FIX N: only the rows that shaped THIS artifact.
+            // Only the rows that shaped THIS artifact.
             notes.userCorrections = NotesCorrectionSnapshot.shaping(correctionRows)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: title,
@@ -746,8 +746,8 @@ public actor ProcessingPipeline {
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
-            // FIX F: the re-mint re-WEAVES annotations, so the live rows must
-            // also be re-ANCHORED here — a rename that shifted or dropped an
+            // The re-mint re-WEAVES annotations, so the live rows must also
+            // be re-ANCHORED here — a rename that shifted or dropped an
             // anchor would otherwise leave stale status/occurrence in
             // `meeting_correction` until the next synthesis, diverging the
             // management list from what notes.md actually shows. Computed
@@ -859,7 +859,7 @@ public actor ProcessingPipeline {
                 notes: notes.structured, labelMap: labelMap, language: notes.language).notes
             // G17: re-weave annotations + refresh the payload snapshot.
             let correctionRows = await self.correctionRows(meetingID: meetingID)
-            // FIX N: only the rows that shaped THIS artifact.
+            // Only the rows that shaped THIS artifact.
             notes.userCorrections = NotesCorrectionSnapshot.shaping(correctionRows)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: finalMeeting.title,
@@ -873,7 +873,7 @@ public actor ProcessingPipeline {
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
-            // FIX F: a speaker rename rewrites notes.structured (layer-1
+            // A speaker rename rewrites notes.structured (layer-1
             // substitution + S-label neutralization), so an anchor quoting the
             // old surface may move or vanish — re-anchor the live rows in the
             // same transaction as the re-woven mint. Computed outside the
@@ -958,7 +958,7 @@ public actor ProcessingPipeline {
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: edited, labelMap: labelMap, language: notes.language).notes
             // G17: re-weave annotations + refresh the payload snapshot.
-            // FIX M: the name correction applies to the ANCHORS too. A note
+            // The name correction applies to the ANCHORS too. A note
             // hung on "Caco fechou o contrato" is about that sentence, not
             // about the spelling of the name in it — leaving the quote behind
             // orphans the note into "Your notes" on a fix the user made one
@@ -980,7 +980,7 @@ public actor ProcessingPipeline {
                 }
                 correctionRows.append(row)
             }
-            // FIX N: only the rows that shaped THIS artifact.
+            // Only the rows that shaped THIS artifact.
             notes.userCorrections = NotesCorrectionSnapshot.shaping(correctionRows)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: meeting.title,
@@ -1005,8 +1005,8 @@ public actor ProcessingPipeline {
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
-            // FIX F: the name replacement edits the very prose anchors quote,
-            // so an anchor containing the old surface stops matching — re-anchor
+            // The name replacement edits the very prose anchors quote, so an
+            // anchor containing the old surface stops matching — re-anchor
             // the live rows here rather than leaving them wrong until the next
             // synthesis. Computed outside the write closure (`notes` is a
             // captured var).
@@ -1015,9 +1015,9 @@ public actor ProcessingPipeline {
             let rootURL = self.database.rootURL
             try await self.database.pool.write { [notes, quoteRewrites] db in
                 try notes.upsert(db)
-                // FIX M before FIX F's re-anchor: the rewritten quotes are what
-                // the re-anchor result was computed against, so both land in
-                // one transaction with the mint they describe.
+                // Quote rewrites before the re-anchor: the rewritten quotes
+                // are what the re-anchor result was computed against, so both
+                // land in one transaction with the mint they describe.
                 try MeetingCorrectionStore.applyQuoteRewrites(db, rewrites: quoteRewrites)
                 try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
                 _ = try HandoffRepository.enqueue(
@@ -1044,7 +1044,7 @@ public actor ProcessingPipeline {
     /// next run. Returns the inserted row (the UI threads it into the
     /// follow-up action: `rewriteNotes`, full `regenerate`, or — for
     /// annotations — `remintNotesArtifacts`) plus whether that re-mint
-    /// refused (FIX K).
+    /// refused.
     @discardableResult
     public func addCorrection(
         meetingID: MeetingID, kind: MeetingCorrection.Kind,
@@ -1066,8 +1066,8 @@ public actor ProcessingPipeline {
 
     /// G17 §UX-3: edit of an existing row. An annotation edit re-mints (its
     /// rendered aside must move now); an understanding edit returns the row
-    /// to `pending` (the notes change on the next rewrite). Returns FIX K's
-    /// refusal flag.
+    /// to `pending` (the notes change on the next rewrite). Returns the
+    /// re-mint refusal flag.
     @discardableResult
     public func updateCorrection(
         meetingID: MeetingID, id: String, quotedText: String, occurrence: Int,
@@ -1087,7 +1087,7 @@ public actor ProcessingPipeline {
     /// G17 §UX-3: deletion IS the undo. An annotation delete re-mints (the
     /// aside must leave notes.md + payload now); an understanding delete is
     /// row-only — the notes change on the user's next rewrite/regenerate.
-    /// Returns FIX K's refusal flag.
+    /// Returns the re-mint refusal flag.
     @discardableResult
     public func deleteCorrection(meetingID: MeetingID, id: String) async throws -> Bool {
         let rows = await correctionRows(meetingID: meetingID)
@@ -1098,8 +1098,8 @@ public actor ProcessingPipeline {
         return try await remintIfAnnotation(row, meetingID: meetingID)
     }
 
-    /// FIX K: the shared annotation re-mint step. Returns TRUE when the
-    /// re-mint was REFUSED — the meeting is not ready, or carries the
+    /// The shared annotation re-mint step. Returns TRUE when the re-mint
+    /// was REFUSED — the meeting is not ready, or carries the
     /// notes-pending marker — so the caller can say so instead of implying
     /// the delivered notes already carry the change. An understanding row
     /// never re-mints (its follow-up is the rewrite), so it never refuses.
@@ -1180,7 +1180,7 @@ public actor ProcessingPipeline {
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: notes.structured, labelMap: labelMap, language: notes.language).notes
-            // FIX N: only the rows that shaped THIS artifact.
+            // Only the rows that shaped THIS artifact.
             notes.userCorrections = NotesCorrectionSnapshot.shaping(correctionRows)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: meeting.title,
@@ -1243,8 +1243,8 @@ public actor ProcessingPipeline {
         /// had persisted notes before this run, `.generation` for a meeting's
         /// first-ever notes produced via the pending path.
         var notesPurpose: CloudSpendPurpose?
-        /// G17 (review #2): the understanding rows the request ACTUALLY
-        /// carried — id + content, captured at request build. Post-finalize
+        /// G17: the understanding rows the request ACTUALLY carried — id +
+        /// content, captured at request build. Post-finalize
         /// bookkeeping flips a row to `applied` only when its CURRENT content
         /// still equals the captured content: a row inserted OR edited while
         /// the model ran stays `pending` for the next run.
@@ -2696,9 +2696,9 @@ public actor ProcessingPipeline {
             // hash-stable source). Presence-gated: no rows → byte-identical
             // markdown and a NULL snapshot column.
             let correctionRows = await self.correctionRows(meetingID: meetingID)
-            // FIX N at the synthesis site: annotations are always woven, and
-            // an understanding row shaped THESE notes exactly when this run
-            // sent it — matched on the content sent, not just the id, because
+            // The snapshot at the synthesis site: annotations are always
+            // woven, and an understanding row shaped THESE notes exactly when
+            // this run sent it — matched on the content sent, not just the id, because
             // a row edited mid-run is a different instruction (the same triple
             // the post-finalize markApplied uses). Those rows are still
             // `pending` here; they flip only after finalize.
@@ -2765,8 +2765,8 @@ public actor ProcessingPipeline {
         }
 
         // G17 post-finalize bookkeeping: EXACTLY the understanding rows the
-        // request carried flip to `applied` (review #2: a row inserted or
-        // edited while the model ran stays `pending` for the next run);
+        // request carried flip to `applied` (a row inserted or edited while
+        // the model ran stays `pending` for the next run);
         // annotations re-anchor against the persisted notes (matched →
         // applied + occurrence refresh, orphaned → stale). Runs on every path
         // that mints notes. Failure-soft and idempotent: a crash between
@@ -2951,8 +2951,8 @@ public actor ProcessingPipeline {
         let userLoad = vocabularyProvider()
         reportGlossaryLoad(userLoad, meetingID: meetingID)
         let vocabulary = userLoad.vocabulary
-        // FIX I: proposals apply ONLY when this resume is minting the
-        // meeting's first notes. A meeting that already had notes reaches
+        // Proposals apply ONLY when this resume is minting the meeting's
+        // first notes. A meeting that already had notes reaches
         // here through a parked G17 rewrite (rewriteNotes passes
         // applyNameProposals: false, then parks with the notes-pending
         // marker) — healing it with the default `true` would apply speaker
@@ -2972,8 +2972,8 @@ public actor ProcessingPipeline {
     /// FIRST notes applies the response's speaker-name proposals to the
     /// persisted transcript (that run never had them). Every other notes-only
     /// path passes FALSE — the G17 user rewrite directly, and the resume via
-    /// `!hadNotesBefore` (FIX I) — because a notes rewrite must leave the
-    /// transcript byte-identical (spec AC1; review #3).
+    /// `!hadNotesBefore` — because a notes rewrite must leave the transcript
+    /// byte-identical (G17 AC1).
     private func notesOnlyStages(
         meeting: Meeting, segments: [TranscriptSegment], dominantLanguage: String,
         asrProvenance: ASRProvenance, context: RunContext, vocabulary: PipelineVocabulary,

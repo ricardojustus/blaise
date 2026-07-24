@@ -135,10 +135,10 @@ public enum MeetingCorrectionStore {
             arguments: StatementArguments([now] + ids))
     }
 
-    /// FIX M: rewrites anchor quotes in place, keyed by row id. A
-    /// deterministic name correction applies to the ANCHORS as well as the
-    /// prose — a note hung on a sentence is about the sentence, not its
-    /// spelling. Sorted for a deterministic statement order.
+    /// Rewrites anchor quotes in place, keyed by row id. A deterministic name
+    /// correction applies to the ANCHORS as well as the prose — a note hung on
+    /// a sentence is about the sentence, not its spelling. Sorted for a
+    /// deterministic statement order.
     public static func applyQuoteRewrites(_ db: Database, rewrites: [String: String]) throws {
         for (id, quote) in rewrites.sorted(by: { $0.key < $1.key }) {
             try db.execute(
@@ -159,10 +159,10 @@ public enum MeetingCorrectionStore {
     }
 }
 
-/// FIX K: what a correction write actually accomplished. The row is always
-/// durable; `remintRefused` says the deterministic re-mint an ANNOTATION
-/// needs could not run (meeting not ready, or notes-pending), so notes.md and
-/// the delivered payload do not carry it yet — the next content run weaves it
+/// What a correction write actually accomplished. The row is always durable;
+/// `remintRefused` says the deterministic re-mint an ANNOTATION needs could
+/// not run (meeting not ready, or notes-pending), so notes.md and the
+/// delivered payload do not carry it yet — the next content run weaves it
 /// instead. The UI must say that rather than imply the change already shipped.
 public struct CorrectionWriteResult: Sendable, Equatable {
     public var row: MeetingCorrection
@@ -174,8 +174,8 @@ public struct CorrectionWriteResult: Sendable, Equatable {
     }
 }
 
-/// G17 FIX H: the single-line fold for USER-authored correction text and the
-/// quotes that travel with it.
+/// G17: the single-line fold for USER-authored correction text and the quotes
+/// that travel with it.
 ///
 /// Deliberately separate from `NotesRenderer.flattenToTitleLine`: that one
 /// owns TITLE bytes for every meeting (including the ones with no corrections
@@ -276,8 +276,8 @@ public enum CorrectionAnchoring {
         return (hits[clamped], clamped)
     }
 
-    /// FIX J: the occurrence to STORE when the user trims the quote away from
-    /// the block it was taken from. A trimmed quote lives in a DIFFERENT match
+    /// The occurrence to STORE when the user trims the quote away from the
+    /// block it was taken from. A trimmed quote lives in a DIFFERENT match
     /// space than the whole block — "Ship it" matches both "Ship it after
     /// security review" and "Ship it after legal review", where the full block
     /// matched only its own — so carrying the block's occurrence through
@@ -345,8 +345,8 @@ public struct NotesCorrectionSnapshot: Codable, Sendable, Equatable {
         case createdAt = "created_at"
     }
 
-    /// FIX N: the rows that actually SHAPED the artifact being minted, in
-    /// store order (created_at, id).
+    /// The rows that actually SHAPED the artifact being minted, in store
+    /// order (created_at, id).
     ///
     /// An annotation always shapes it — it is woven deterministically into
     /// the markdown, stale ones included (they render in the "Your notes"

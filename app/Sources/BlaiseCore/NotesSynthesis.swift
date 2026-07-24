@@ -299,8 +299,8 @@ public enum NotesPromptBuilder {
     /// transcript inference). Notes are context to honor, never to restate as
     /// findings. nil when the meeting has no rows (presence gate).
     ///
-    /// FIX H: every user-authored string is folded to ONE line first. A
-    /// newline inside a quote or a note body otherwise forges additional
+    /// Every user-authored string is folded to ONE line first. A newline
+    /// inside a quote or a note body otherwise forges additional
     /// numbered entries inside a block the prompt itself labels authoritative
     /// — the highest-trust position in the whole message.
     static func correctionsBlock(_ corrections: [NotesCorrection]) -> String? {

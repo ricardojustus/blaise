@@ -286,7 +286,7 @@ private struct NotesPane: View {
     @Environment(AppEnvironment.self) private var appEnv
     @Environment(AppUIState.self) private var uiState
     @Environment(LibraryModel.self) private var library
-    // FIX C: the live pipeline activity — a correction save that races an
+    // The live pipeline activity — a correction save that races an
     // in-flight run would never be seen by that run's synthesis.
     @Environment(PipelineActivityHolder.self) private var activity
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -625,7 +625,7 @@ private struct NotesPane: View {
                         .frame(width: 360)
                 }
             }
-            // G17: corrections + notes counted SEPARATELY (UX review #6) —
+            // G17 §UX-3: corrections + notes counted SEPARATELY —
             // one chip opens the management popover (delete = undo). Gated on
             // the BASE availability (not `correctionsEnabled`) so the
             // "Re-writing notes…" chip survives while a rewrite is in flight.
@@ -678,7 +678,7 @@ private struct NotesPane: View {
         notes != nil && meeting.status == .ready
     }
 
-    /// FIX C: NEW corrections/notes may be INITIATED only when no pipeline run
+    /// NEW corrections/notes may be INITIATED only when no pipeline run
     /// is in flight for this meeting and no rewrite is already running.
     /// Otherwise the row is saved but the running synthesis never sees it
     /// (it built its `NotesRequest` before the save) — a silent no-op. This
@@ -689,7 +689,7 @@ private struct NotesPane: View {
             && !correctionBusy
     }
 
-    /// FIX E: the occurrence to store for a correction/note anchored to the
+    /// The occurrence to store for a correction/note anchored to the
     /// block at `index` within `blocks` (the section's blocks in render
     /// order) — its position among the section blocks that fold-match it, so
     /// two blocks with identical text anchor distinctly. Blank action-items
@@ -702,7 +702,7 @@ private struct NotesPane: View {
             .firstIndex(of: index) ?? 0
     }
 
-    /// FIX J: the occurrence to STORE for a submitted correction, resolved
+    /// The occurrence to STORE for a submitted correction, resolved
     /// against the section's real anchor blocks — the popover lets the user
     /// trim the quote, which moves it into a different match space than the
     /// block it came from.
@@ -714,7 +714,7 @@ private struct NotesPane: View {
             in: CorrectionAnchoring.blocks(of: structured, section: submission.section))
     }
 
-    // MARK: - G17 FIX A: visible annotation asides in the native notes pane
+    // MARK: - G17: visible annotation asides in the native notes pane
 
     /// The loaded margin-note rows (annotations). Understanding corrections
     /// act through re-synthesis and carry no aside.
@@ -775,7 +775,7 @@ private struct NotesPane: View {
     /// notes-only rewrite (or the escape-hatch full regenerate) runs. The
     /// rewrite awaits completion so the busy chip is honest.
     private func submitCorrection(_ submission: CorrectionSubmission) {
-        // FIX C: refuse a second submission while a rewrite is already in
+        // Refuse a second submission while a rewrite is already in
         // flight (the affordance is disabled too, but a queued interaction
         // could still land) — the row would save but the running synthesis
         // never re-reads it.
@@ -783,10 +783,10 @@ private struct NotesPane: View {
         let pipeline = appEnv.pipeline
         let meetingID = meeting.id
         let uiState = uiState
-        // FIX J: resolved against the CURRENT notes, on the main actor, before
+        // Resolved against the CURRENT notes, on the main actor, before
         // the task detaches.
         let occurrence = storedOccurrence(for: submission)
-        // FIX K: a popover opened BEFORE a run started can still be saved
+        // A popover opened BEFORE a run started can still be saved
         // mid-run. The row must be saved (it is the user's truth), but the
         // follow-up must not run: the live synthesis built its request before
         // this row existed, and a rewrite would only be refused (the meeting
@@ -808,8 +808,8 @@ private struct NotesPane: View {
                     // The escape hatch is today's full Regenerate — the queue
                     // path (origin .user) with all its guards; corrections
                     // ride along at request build.
-                    // FIX D/K: `enqueue` returns the EXISTING job when a live
-                    // job collapses the new one, and nil ONLY when the durable
+                    // `enqueue` returns the EXISTING job when a live job
+                    // collapses the new one, and nil ONLY when the durable
                     // queue write threw. So nil means exactly one thing: the
                     // run was not scheduled and nothing will retry it.
                     let scheduled = await appEnv.processingQueue.enqueue(meetingID, origin: .user)
@@ -836,7 +836,7 @@ private struct NotesPane: View {
         let pipeline = appEnv.pipeline
         let meetingID = meeting.id
         let uiState = uiState
-        // FIX K: mid-run, the re-mint still runs — it queues behind the run on
+        // Mid-run, the re-mint still runs — it queues behind the run on
         // the single-flight chain and weaves the note when the run drains, so
         // the note cannot be lost in the window after the run's own weave. But
         // it is NOT instant any more, and the copy says so.
@@ -863,7 +863,7 @@ private struct NotesPane: View {
         let uiState = uiState
         Task {
             do {
-                // FIX K: an annotation delete that could not re-mint has NOT
+                // An annotation delete that could not re-mint has NOT
                 // left the delivered notes yet.
                 let refused = try await pipeline.deleteCorrection(
                     meetingID: meetingID, id: row.id)
@@ -878,7 +878,7 @@ private struct NotesPane: View {
         }
     }
 
-    /// FIX K: the honest banner for a saved margin note. nil when the note is
+    /// The honest banner for a saved margin note. nil when the note is
     /// already in notes.md and the minted payload.
     static func noteFeedback(remintRefused: Bool, runActive: Bool) -> String? {
         if remintRefused {
@@ -923,12 +923,13 @@ private struct NotesPane: View {
 
     /// PIN PICKER (§AC4): re-anchor a stale note onto the block the user
     /// picked. The block's CURRENT text becomes the quote (that is what the
-    /// note is now about) with the FIX E occurrence, so a paragraph repeated
-    /// verbatim still anchors distinctly. `updateCorrection` re-mints for
+    /// note is now about) with its fold-match occurrence, so a paragraph
+    /// repeated verbatim still anchors distinctly. `updateCorrection` re-mints for
     /// annotations, so notes.md + the payload follow without a second call.
     private func pinNote(_ row: MeetingCorrection, toBlockAt index: Int, in blocks: [String]) {
-        // The menu is disabled while a run/rewrite is in flight (FIX C's
-        // discipline); a queued interaction could still land here.
+        // The menu is disabled while a run/rewrite is in flight (the same
+        // gate as the block affordances); a queued interaction could still
+        // land here.
         guard correctionsEnabled, blocks.indices.contains(index) else { return }
         let pipeline = appEnv.pipeline
         let meetingID = meeting.id
@@ -951,7 +952,7 @@ private struct NotesPane: View {
     }
 
     private func rewriteNow() {
-        // FIX C: never launch a second rewrite over an in-flight one.
+        // Never launch a second rewrite over an in-flight one.
         guard !correctionBusy else { return }
         let pipeline = appEnv.pipeline
         let meetingID = meeting.id
@@ -1071,7 +1072,7 @@ private struct NotesPane: View {
                     anchorPrefix: "notes-summary",
                     correctionSection: correctionsEnabled ? .summary : nil,
                     onCorrectionAction: { correctionTarget = $0 })
-                // FIX A: summary margin notes render as visible asides under
+                // Summary margin notes render as visible asides under
                 // the summary (the markdown weaving in NotesRenderer never
                 // reaches this native pane, which renders from notes.structured).
                 ForEach(anchoredAnnotations(section: .summary, structured: structured), id: \.id) { note in
@@ -1174,7 +1175,7 @@ private struct NotesPane: View {
                             }
                         }
                         .id("notes-decision-\(index)")
-                        // FIX A: inline margin-note asides under this decision.
+                        // Inline margin-note asides under this decision.
                         ForEach(
                             annotations(in: structured.decisions, section: .decision, blockIndex: index),
                             id: \.id
@@ -1213,7 +1214,7 @@ private struct NotesPane: View {
                             .textSelection(.enabled)
                         }
                         .id("notes-action-\(index)")
-                        // FIX A: inline margin-note asides under this action
+                        // Inline margin-note asides under this action
                         // item. Anchoring resolves over the FILTERED item
                         // texts so the block index aligns with this ForEach.
                         ForEach(
@@ -1236,7 +1237,7 @@ private struct NotesPane: View {
                         anchorPrefix: "notes-detailed",
                         correctionSection: correctionsEnabled ? .detailedNotes : nil,
                         onCorrectionAction: { correctionTarget = $0 })
-                    // FIX A: detailed-notes margin notes render at the END of
+                    // Detailed-notes margin notes render at the END of
                     // the section (coarse v1 — the native pane's markdown
                     // blocks don't map 1:1 to the fold-split paragraphs used
                     // for anchoring, so per-block placement isn't reliable
@@ -1248,7 +1249,7 @@ private struct NotesPane: View {
             }
         }
 
-        // FIX A: annotations whose anchor no longer fold-matches any block
+        // Annotations whose anchor no longer fold-matches any block
         // land under a "Your notes" tail with their original quote + a stale
         // badge — still visible, still shipped (§UX-5). Understanding rows are
         // never here (they weave nothing).
@@ -1261,7 +1262,7 @@ private struct NotesPane: View {
                         // targets. Blank blocks are dropped — they can never
                         // fold-match a non-empty quote, so they are unpinnable
                         // AND their absence cannot shift the occurrence
-                        // computed here (the FIX E argument).
+                        // computed here (the occurrence rule above).
                         let targets = CorrectionAnchoring
                             .blocks(of: structured, section: note.section)
                             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -1277,7 +1278,7 @@ private struct NotesPane: View {
     }
 }
 
-/// G17 FIX A: a woven margin note rendered as a VISIBLE aside in the native
+/// G17: a woven margin note rendered as a VISIBLE aside in the native
 /// notes pane. The markdown weaving in `NotesRenderer` only lands in
 /// `notes.markdown`, which this pane never shows — so the aside is rebuilt
 /// here from the durable `MeetingCorrection` row. Compact, yellow-tinted
@@ -1602,7 +1603,7 @@ struct MarkdownBlocksView: View {
 
     var body: some View {
         let blocks = MarkdownBlocks.parse(markdown)
-        // FIX J: the plain text of every block in this section, so each
+        // The plain text of every block in this section, so each
         // block's correction affordance can carry its own occurrence.
         let texts = blocks.map { String($0.text.characters) }
         VStack(alignment: .leading, spacing: 8) {
@@ -1612,7 +1613,7 @@ struct MarkdownBlocksView: View {
         }
     }
 
-    /// FIX J: which fold-match this block is among the section's blocks — the
+    /// Which fold-match this block is among the section's blocks — the
     /// same rule the pipeline resolves with, so a correction on the SECOND of
     /// two identical paragraphs anchors to the second instead of collapsing
     /// onto the first.
