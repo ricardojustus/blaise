@@ -463,6 +463,55 @@ private func liveStatus(
     }
 }
 
+// FIX I: the G17 rewrite refuses to touch the transcript (AC1), but a rewrite
+// that PARKS heals later through resumePendingNotes — a path that used to
+// apply the healing response's speaker-name proposals and mutate the very
+// transcript the rewrite had protected.
+@Suite struct G17RewriteResumeTests {
+    @Test("a parked rewrite heals without mutating the transcript")
+    func parkedRewriteHealsWithoutTouchingTranscript() async throws {
+        // A heavyweight-only fallback never auto-loads, so a primary-engine
+        // failure resolves to notes-pending instead of quietly succeeding.
+        let harness = try await makePipelineHarness(
+            fallbackLoadProfile: .heavyweight(estimatedPeakBytes: 18 * 1_073_741_824))
+        let meeting = try await harness.importTestMeeting()
+        _ = try await harness.pipeline.process(meetingID: meeting.id)
+        let before = try await harness.segments(meeting.id)
+        #expect(before.allSatisfy { $0.speakerName == nil }, "no proposals on the first run")
+
+        // The rewrite parks (no engine configured): the notes-pending marker
+        // goes down and the correction stays durable.
+        harness.notesPrimary.state.withLock { $0.error = .configurationMissing(key: "apiKey") }
+        let parked = try await harness.pipeline.rewriteNotes(meetingID: meeting.id)
+        #expect(parked?.notesPending != nil)
+
+        // The heal succeeds AND the response carries a proposal that WOULD
+        // land (transcript-verbatim name, high confidence) if this path
+        // applied proposals.
+        harness.notesPrimary.state.withLock { state in
+            state.error = nil
+            state.summary = "Resumo reescrito."
+            state.mapping = [
+                SpeakerNameProposal(
+                    label: "S1", name: "Fábio", confidence: .high,
+                    evidence: "O Fábio vai mandar o contrato.")
+            ]
+        }
+        await harness.pipeline.resumePendingNotes()
+
+        let healed = try #require(try await harness.meeting(meeting.id))
+        #expect(healed.status == .ready)
+        #expect(healed.lastProcessingError == nil)
+        #expect(
+            try await harness.segments(meeting.id) == before,
+            "AC1: the rewrite's transcript immutability survives the detour through the healer")
+        // The rewrite itself did land — this is not immutability by no-op.
+        let notes = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+        #expect(notes.structured.summary.contains("Resumo reescrito"))
+    }
+}
+
 // FIX F: the legacy re-mint paths (rename meeting / rename speaker / correct
 // name in notes) re-WEAVE annotations into the markdown, so they must also
 // re-ANCHOR the live `meeting_correction` rows — otherwise an edit that moved

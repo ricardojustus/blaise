@@ -2898,15 +2898,29 @@ public actor ProcessingPipeline {
         let userLoad = vocabularyProvider()
         reportGlossaryLoad(userLoad, meetingID: meetingID)
         let vocabulary = userLoad.vocabulary
+        // FIX I: proposals apply ONLY when this resume is minting the
+        // meeting's first notes. A meeting that already had notes reaches
+        // here through a parked G17 rewrite (rewriteNotes passes
+        // applyNameProposals: false, then parks with the notes-pending
+        // marker) — healing it with the default `true` would apply speaker
+        // proposals the rewrite itself refused, mutating a transcript the
+        // user's correction was never allowed to touch (AC1). The same
+        // reasoning tightens the pre-existing regeneration-class heal: a
+        // second opinion on speaker names is not a reason to rewrite a
+        // transcript the user has already seen (and may have renamed
+        // speakers in) — those names are final.
         return try await notesOnlyStages(
             meeting: meeting, segments: segments, dominantLanguage: dominantLanguage,
-            asrProvenance: asrProvenance, context: context, vocabulary: vocabulary)
+            asrProvenance: asrProvenance, context: context, vocabulary: vocabulary,
+            applyNameProposals: !hadNotesBefore)
     }
 
-    /// `applyNameProposals`: the D17 pending-resume applies the response's
-    /// speaker-name proposals to the persisted transcript (that run never had
-    /// them). The G17 user rewrite passes FALSE — a notes rewrite must leave
-    /// the transcript byte-identical (spec AC1; review #3).
+    /// `applyNameProposals`: a D17 pending-resume that mints the meeting's
+    /// FIRST notes applies the response's speaker-name proposals to the
+    /// persisted transcript (that run never had them). Every other notes-only
+    /// path passes FALSE — the G17 user rewrite directly, and the resume via
+    /// `!hadNotesBefore` (FIX I) — because a notes rewrite must leave the
+    /// transcript byte-identical (spec AC1; review #3).
     private func notesOnlyStages(
         meeting: Meeting, segments: [TranscriptSegment], dominantLanguage: String,
         asrProvenance: ASRProvenance, context: RunContext, vocabulary: PipelineVocabulary,
