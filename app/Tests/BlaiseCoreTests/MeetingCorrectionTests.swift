@@ -7,17 +7,22 @@ import Testing
 // G17 AC7: store CRUD + status transitions, and the pure anchoring
 // discipline (fold-contains matching, occurrence resolution, re-anchor pass).
 
+/// The meeting the pure (non-harness) suites hang their rows on.
+private let testMeetingID: MeetingID = "01TESTMEETING0000000000000"
+
 private func makeRow(
-    meetingID: MeetingID,
+    meetingID: MeetingID = testMeetingID,
     kind: MeetingCorrection.Kind = .understanding,
     section: MeetingCorrection.Section = .detailedNotes,
     quote: String = "committed to migrating",
     occurrence: Int = 0,
-    text: String = "Only an evaluation was agreed."
+    text: String = "Only an evaluation was agreed.",
+    status: MeetingCorrection.Status = .pending
 ) -> MeetingCorrection {
     MeetingCorrection(
         meetingID: meetingID, kind: kind, section: section,
-        quotedText: quote, occurrence: occurrence, userText: text, createdAt: msDate())
+        quotedText: quote, occurrence: occurrence, userText: text, status: status,
+        createdAt: msDate())
 }
 
 @Suite struct MeetingCorrectionStoreTests {
@@ -163,9 +168,7 @@ private func makeRow(
     private func annotation(
         section: MeetingCorrection.Section, quote: String, text: String
     ) -> MeetingCorrection {
-        MeetingCorrection(
-            meetingID: "01TESTMEETING0000000000000", kind: .annotation, section: section,
-            quotedText: quote, userText: text, createdAt: msDate())
+        makeRow(kind: .annotation, section: section, quote: quote, text: text)
     }
 
     @Test("no annotations -> byte-identical to the pre-G17 render")
@@ -177,9 +180,8 @@ private func makeRow(
         #expect(before == after)
         // An understanding row alone weaves nothing either (asides are
         // annotation-only; corrections act through re-synthesis).
-        let understanding = MeetingCorrection(
-            meetingID: "01TESTMEETING0000000000000", kind: .understanding, section: .summary,
-            quotedText: "under evaluation", userText: "fix", createdAt: msDate())
+        let understanding = makeRow(
+            section: .summary, quote: "under evaluation", text: "fix")
         let withUnderstanding = try NotesRenderer.render(
             structured, language: "en", meetingTitle: "Sync", userName: "Sam",
             annotations: [understanding])
@@ -448,18 +450,13 @@ private func makeRow(
     }
 
     @Test func reanchorAppliesMatchedAndStalesOrphans() {
-        let meetingID: MeetingID = "01TESTMEETING0000000000000"
-        let anchored = MeetingCorrection(
-            meetingID: meetingID, kind: .annotation, section: .detailedNotes,
-            quotedText: "evaluate fluidaudio v2", occurrence: 0,
-            userText: "Ask about Yeti gain too.", status: .pending, createdAt: msDate())
-        let orphan = MeetingCorrection(
-            meetingID: meetingID, kind: .annotation, section: .detailedNotes,
-            quotedText: "a paragraph that was rewritten away", occurrence: 0,
-            userText: "Note on removed text.", status: .applied, createdAt: msDate())
-        let understanding = MeetingCorrection(
-            meetingID: meetingID, kind: .understanding, section: .summary,
-            quotedText: "anything", occurrence: 0, userText: "fix", createdAt: msDate())
+        let anchored = makeRow(
+            kind: .annotation, quote: "evaluate fluidaudio v2",
+            text: "Ask about Yeti gain too.")
+        let orphan = makeRow(
+            kind: .annotation, quote: "a paragraph that was rewritten away",
+            text: "Note on removed text.", status: .applied)
+        let understanding = makeRow(section: .summary, quote: "anything", text: "fix")
 
         let updates = CorrectionAnchoring.reanchor(
             annotations: [anchored, orphan, understanding], against: structured)
