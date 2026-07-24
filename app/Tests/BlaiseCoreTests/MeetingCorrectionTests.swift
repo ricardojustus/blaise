@@ -545,6 +545,85 @@ private func liveStatus(
 // apply the healing response's speaker-name proposals and mutate the very
 // transcript the rewrite had protected.
 @Suite struct G17RewriteResumeTests {
+    /// FIX Q (AC1/AC2/AC5): the happy path of the "Re-write the notes" action
+    /// end to end — new notes, an untouched transcript, the consumed row
+    /// flipped, and a fresh payload on the queue.
+    @Test("a rewrite re-synthesizes the notes, consumes the correction and leaves the transcript alone")
+    func rewriteConsumesCorrectionsAndKeepsTheTranscript() async throws {
+        let harness = try await makePipelineHarness()
+        let meeting = try await harness.importTestMeeting()
+        try await harness.pipeline.process(meetingID: meeting.id)
+        let segmentsBefore = try await harness.segments(meeting.id)
+        let queueBefore = try await harness.queueRows(meeting.id)
+        let firstNotes = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+
+        let added = try await harness.pipeline.addCorrection(
+            meetingID: meeting.id, kind: .understanding, section: .summary,
+            quotedText: "Resumo", occurrence: 0, userText: "Na verdade foi só uma avaliação.")
+        #expect(try await liveStatus(harness.database, meeting.id, added.row.id) == .pending)
+
+        // The rewrite's engine returns different notes AND a speaker proposal
+        // that a rewrite must ignore (AC1).
+        harness.notesPrimary.state.withLock { state in
+            state.summary = "Somente uma avaliação foi acordada."
+            state.mapping = [
+                SpeakerNameProposal(
+                    label: "S1", name: "Fábio", confidence: .high,
+                    evidence: "O Fábio vai mandar o contrato.")
+            ]
+        }
+        let record = try #require(try await harness.pipeline.rewriteNotes(meetingID: meeting.id))
+        #expect(record.notesPending == nil)
+
+        // The correction reached the engine as authoritative context.
+        let request = try #require(harness.notesPrimary.state.withLock { $0.requests.last })
+        #expect(request.corrections.contains { $0.userText == "Na verdade foi só uma avaliação." })
+
+        let after = try #require(try await harness.meeting(meeting.id))
+        #expect(after.status == .ready, "a rewrite never regresses status")
+        let rewritten = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+        #expect(rewritten.structured.summary == "Somente uma avaliação foi acordada.")
+        #expect(rewritten.structured != firstNotes.structured)
+        // AC1: proposals dropped, transcript byte-identical.
+        #expect(try await harness.segments(meeting.id) == segmentsBefore)
+        // AC5: the consumed row is bookkept, and the payload snapshot claims it.
+        #expect(try await liveStatus(harness.database, meeting.id, added.row.id) == .applied)
+        #expect(rewritten.userCorrections.map(\.userText) == ["Na verdade foi só uma avaliação."])
+        // A NEW payload rode out with it.
+        #expect(try await harness.queueRows(meeting.id) == queueBefore + 1)
+    }
+
+    /// AC2: failure is no-regress — the meeting keeps its notes and the row
+    /// stays pending for the next attempt.
+    @Test("a failed rewrite leaves the notes and the pending correction intact")
+    func failedRewriteIsNoRegress() async throws {
+        let harness = try await makePipelineHarness(
+            fallbackLoadProfile: .heavyweight(estimatedPeakBytes: 18 * 1_073_741_824))
+        let meeting = try await harness.importTestMeeting()
+        try await harness.pipeline.process(meetingID: meeting.id)
+        let notesBefore = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+
+        let added = try await harness.pipeline.addCorrection(
+            meetingID: meeting.id, kind: .understanding, section: .summary,
+            quotedText: "Resumo", occurrence: 0, userText: "Na verdade foi só uma avaliação.")
+
+        harness.notesPrimary.state.withLock { $0.error = .configurationMissing(key: "apiKey") }
+        let record = try #require(try await harness.pipeline.rewriteNotes(meetingID: meeting.id))
+        #expect(record.notesPending != nil, "parked, not silently succeeded")
+
+        let after = try #require(try await harness.meeting(meeting.id))
+        #expect(after.status == .ready, "no-regress: the meeting keeps its ready notes")
+        let notesAfter = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+        #expect(notesAfter.structured == notesBefore.structured)
+        #expect(notesAfter.markdown == notesBefore.markdown)
+        // The correction survives for the retry.
+        #expect(try await liveStatus(harness.database, meeting.id, added.row.id) == .pending)
+    }
+
     @Test("a parked rewrite heals without mutating the transcript")
     func parkedRewriteHealsWithoutTouchingTranscript() async throws {
         // A heavyweight-only fallback never auto-loads, so a primary-engine
