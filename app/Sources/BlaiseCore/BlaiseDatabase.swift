@@ -529,6 +529,13 @@ public final class BlaiseDatabase: Sendable {
                 t.column("created_at", .datetime).notNull()
                 t.column("applied_at", .datetime)
             }
+            // Every read is "this meeting's rows, in creation order" (the
+            // store's only query shape, run on every synthesis, every re-mint
+            // and every notes-pane load), and the FK cascade deletes by
+            // meeting_id too. Without this SQLite scans the whole table.
+            try db.create(
+                index: "idx_meeting_correction_meeting",
+                on: "meeting_correction", columns: ["meeting_id", "created_at", "id"])
             // The mint-time snapshot of the rows that shaped a notes artifact
             // (the payload's hash-stable re-materialization source; live rows
             // are user-mutable). Nullable JSON, the v17 precedent. No FTS

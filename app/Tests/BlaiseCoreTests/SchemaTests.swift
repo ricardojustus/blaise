@@ -162,7 +162,8 @@ import Testing
         // v11 (G10) + v12 (G11) + v13 (G12: meeting.title_source) + v14 (G14:
         // memory_digest column + the cloud_spend_receipt CHECK-rebuild) + v15
         // (F1: processing_queue substrate) + v16 (F2: notes_fts) + v17 (T3.1:
-        // scoped_alias_bindings column) = 17.
+        // scoped_alias_bindings column) + v18 (G17: meeting_correction table +
+        // its meeting index, and meeting_notes.user_corrections) = 18.
         #expect(health.schemaVersion == 18)
         #expect(health.journalMode == "wal")
     }

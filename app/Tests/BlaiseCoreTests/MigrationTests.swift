@@ -223,4 +223,66 @@ import Testing
             #expect(try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM meeting_notes") == 1)
         }
     }
+
+    // FIX O: v18 over a POPULATED v17 database. The G17 migration adds a table,
+    // an index and a nullable column to a live schema; a populated upgrade is
+    // the only shape that proves the pre-existing meeting_notes row survives it
+    // and reads back through the CURRENT decoder (user_corrections NULL → []).
+    @Test func v18MigratesAPopulatedV17Database() throws {
+        let url = try makeTempRoot().appendingPathComponent("v17-populated.sqlite")
+        let queue = try DatabaseQueue(path: url.path)
+        try BlaiseDatabase.migrator.migrate(queue, upTo: "v17")
+        let meetingID = ULID.generate()
+        try queue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting (id, title, started_at, source, status, attendees, created_at, updated_at)
+                    VALUES (?, 'Reunião antiga', ?, 'meet', 'ready', '[]', ?, ?)
+                    """,
+                arguments: [meetingID, msDate(), msDate(), msDate()])
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting_notes (meeting_id, markdown, language, generated_at, provenance, structured)
+                    VALUES (?, '# Notas antigas', 'pt-BR', ?, ?, ?)
+                    """,
+                arguments: [
+                    meetingID, msDate(),
+                    #"{"engine":"legacy","model":"m","pipeline_version":"1"}"#,
+                    #"{"summary":"Resumo","detailed_notes":"","decisions":[],"action_items":[],"user_action_items":[]}"#,
+                ])
+        }
+
+        try BlaiseDatabase.migrator.migrate(queue)
+
+        try queue.read { db in
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db).last == "v18")
+            // The pre-existing row survives and decodes: the new column is
+            // NULL, which the decoder reads as "no corrections".
+            let notes = try #require(try MeetingNotes.fetchOne(db, key: meetingID))
+            #expect(notes.markdown == "# Notas antigas")
+            #expect(notes.userCorrections.isEmpty)
+            #expect(try MeetingCorrectionStore.all(db, meetingID: meetingID).isEmpty)
+            // The lookup index the store's only query shape needs.
+            let indexes = try Row.fetchAll(db, sql: "PRAGMA index_list(meeting_correction)")
+                .map { $0["name"] as String }
+            #expect(indexes.contains("idx_meeting_correction_meeting"))
+            let indexed = try Row.fetchAll(
+                db, sql: "PRAGMA index_info(idx_meeting_correction_meeting)"
+            ).map { $0["name"] as String }
+            #expect(indexed == ["meeting_id", "created_at", "id"])
+        }
+
+        // And a correction written AFTER the upgrade round-trips.
+        try queue.write { db in
+            try MeetingCorrectionStore.insert(
+                db,
+                MeetingCorrection(
+                    meetingID: meetingID, kind: .annotation, section: .summary,
+                    quotedText: "Resumo", userText: "Conferir.", createdAt: msDate()))
+        }
+        try queue.read { db in
+            let rows = try MeetingCorrectionStore.all(db, meetingID: meetingID)
+            #expect(rows.count == 1)
+        }
+    }
 }
