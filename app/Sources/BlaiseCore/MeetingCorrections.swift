@@ -342,6 +342,25 @@ public struct NotesCorrectionSnapshot: Codable, Sendable, Equatable {
         case userText = "user_text"
         case createdAt = "created_at"
     }
+
+    /// FIX N: the rows that actually SHAPED the artifact being minted, in
+    /// store order (created_at, id).
+    ///
+    /// An annotation always shapes it — it is woven deterministically into
+    /// the markdown, stale ones included (they render in the "Your notes"
+    /// tail). An understanding correction shapes nothing until a synthesis
+    /// run consumes it: publishing a still-`pending` row in the payload
+    /// because an UNRELATED re-mint happened (a rename, a note added
+    /// elsewhere) would claim the notes reflect a correction they do not.
+    ///
+    /// The synthesis path filters separately: the run consuming the rows
+    /// flips them to `applied` only after finalize, so it matches on the
+    /// content it actually sent.
+    public static func shaping(_ rows: [MeetingCorrection]) -> [NotesCorrectionSnapshot] {
+        rows
+            .filter { $0.kind == .annotation || $0.status == .applied }
+            .map(NotesCorrectionSnapshot.init(row:))
+    }
 }
 
 /// The request-level value injected into notes synthesis (`NotesRequest.

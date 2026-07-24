@@ -732,7 +732,8 @@ public actor ProcessingPipeline {
             // G17: every re-mint re-weaves current annotations and refreshes
             // the payload snapshot (an unrelated rename must not drop them).
             let correctionRows = await self.correctionRows(meetingID: meetingID)
-            notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
+            // FIX N: only the rows that shaped THIS artifact.
+            notes.userCorrections = NotesCorrectionSnapshot.shaping(correctionRows)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: title,
                 userName: user.name, annotations: correctionRows)
@@ -858,7 +859,8 @@ public actor ProcessingPipeline {
                 notes: notes.structured, labelMap: labelMap, language: notes.language).notes
             // G17: re-weave annotations + refresh the payload snapshot.
             let correctionRows = await self.correctionRows(meetingID: meetingID)
-            notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
+            // FIX N: only the rows that shaped THIS artifact.
+            notes.userCorrections = NotesCorrectionSnapshot.shaping(correctionRows)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: finalMeeting.title,
                 userName: user.name, annotations: correctionRows)
@@ -978,7 +980,8 @@ public actor ProcessingPipeline {
                 }
                 correctionRows.append(row)
             }
-            notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
+            // FIX N: only the rows that shaped THIS artifact.
+            notes.userCorrections = NotesCorrectionSnapshot.shaping(correctionRows)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: meeting.title,
                 userName: user.name, annotations: correctionRows)
@@ -1177,7 +1180,8 @@ public actor ProcessingPipeline {
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: notes.structured, labelMap: labelMap, language: notes.language).notes
-            notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
+            // FIX N: only the rows that shaped THIS artifact.
+            notes.userCorrections = NotesCorrectionSnapshot.shaping(correctionRows)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: meeting.title,
                 userName: user.name, annotations: correctionRows)
@@ -2688,10 +2692,23 @@ public actor ProcessingPipeline {
                 renderStructured.title = promotedStructuredTitle
             }
             // G17: weave the meeting's margin notes into the markdown and
-            // snapshot ALL rows onto the notes row (the payload's hash-stable
-            // source). Presence-gated: no rows → byte-identical markdown and
-            // a NULL snapshot column.
+            // snapshot the shaping rows onto the notes row (the payload's
+            // hash-stable source). Presence-gated: no rows → byte-identical
+            // markdown and a NULL snapshot column.
             let correctionRows = await self.correctionRows(meetingID: meetingID)
+            // FIX N at the synthesis site: annotations are always woven, and
+            // an understanding row shaped THESE notes exactly when this run
+            // sent it — matched on the content sent, not just the id, because
+            // a row edited mid-run is a different instruction (the same triple
+            // the post-finalize markApplied uses). Those rows are still
+            // `pending` here; they flip only after finalize.
+            let consumedByThisRun = context.consumedCorrections
+            let shapingRows = correctionRows.filter { row in
+                row.kind == .annotation || row.status == .applied
+                    || consumedByThisRun.contains {
+                        $0.id == row.id && $0.quoted == row.quotedText && $0.text == row.userText
+                    }
+            }
             let markdown = try NotesRenderer.render(
                 renderStructured, language: dominantLanguage, meetingTitle: renderTitle,
                 userName: user.name, annotations: correctionRows)
@@ -2714,7 +2731,7 @@ public actor ProcessingPipeline {
                 provenance: provenance,
                 memoryDigest: memoryDigest,
                 scopedAliasBindings: context.resolvedScopedAliasBindings ?? [],
-                userCorrections: correctionRows.map(NotesCorrectionSnapshot.init(row:)))
+                userCorrections: shapingRows.map(NotesCorrectionSnapshot.init(row:)))
             try await NotesRepository(database: self.database).upsert(notes)
             try Data(markdown.utf8).write(to: paths.notesURL(meetingID), options: .atomic)
         }

@@ -580,6 +580,43 @@ private func liveStatus(
     }
 }
 
+// FIX N: the payload snapshot claims the rows that SHAPED the artifact. A
+// correction nobody has run yet shapes nothing.
+@Suite struct CorrectionSnapshotHonestyTests {
+    @Test("an unconsumed correction does not ride an unrelated re-mint into the snapshot")
+    func pendingUnderstandingRowStaysOutOfTheSnapshot() async throws {
+        let harness = try await makePipelineHarness()
+        let meeting = try await harness.importTestMeeting()
+        try await harness.pipeline.process(meetingID: meeting.id)
+
+        // Saved, but no synthesis run has consumed it: the notes do not
+        // reflect it and the payload must not say they do.
+        _ = try await harness.pipeline.addCorrection(
+            meetingID: meeting.id, kind: .understanding, section: .summary,
+            quotedText: "Resumo", occurrence: 0, userText: "Na verdade foi terça.")
+        // A margin note, by contrast, IS woven deterministically.
+        _ = try await harness.pipeline.addCorrection(
+            meetingID: meeting.id, kind: .annotation, section: .summary,
+            quotedText: "Resumo", occurrence: 0, userText: "Conferir com Ricardo.")
+
+        // An UNRELATED re-mint: a rename touches neither row.
+        #expect(try await harness.pipeline.renameMeeting(meetingID: meeting.id, to: "Pauta nova"))
+
+        let notes = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+        #expect(notes.userCorrections.map(\.kind) == [.annotation])
+        #expect(notes.userCorrections.first?.userText == "Conferir com Ricardo.")
+
+        // The pure rule, stated once: annotations always shape, understanding
+        // rows only once applied.
+        let rows = try await harness.database.pool.read { db in
+            try MeetingCorrectionStore.all(db, meetingID: meeting.id)
+        }
+        #expect(rows.count == 2)
+        #expect(NotesCorrectionSnapshot.shaping(rows).count == 1)
+    }
+}
+
 // FIX K: the correction write paths report whether the artifacts actually
 // moved, so the UI can stop implying a note already shipped when it did not.
 @Suite struct CorrectionWriteHonestyTests {
