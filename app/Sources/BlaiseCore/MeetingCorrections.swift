@@ -247,6 +247,27 @@ public enum CorrectionAnchoring {
         return (hits[clamped], clamped)
     }
 
+    /// FIX J: the occurrence to STORE when the user trims the quote away from
+    /// the block it was taken from. A trimmed quote lives in a DIFFERENT match
+    /// space than the whole block — "Ship it" matches both "Ship it after
+    /// security review" and "Ship it after legal review", where the full block
+    /// matched only its own — so carrying the block's occurrence through
+    /// unchanged anchors the correction to the wrong paragraph. Resolve the
+    /// block the user actually acted on, then take ITS position among the
+    /// trimmed quote's matches. An unchanged quote keeps `blockOccurrence`; an
+    /// unresolvable block falls back to 0 (the re-anchor pass will call it
+    /// stale rather than let it mis-attach silently).
+    public static func occurrence(
+        forQuote quote: String, takenFrom blockText: String, blockOccurrence: Int,
+        in blocks: [String]
+    ) -> Int {
+        guard fold(quote) != fold(blockText) else { return blockOccurrence }
+        guard let targeted = resolve(
+            quote: blockText, occurrence: blockOccurrence, in: blocks)
+        else { return 0 }
+        return matches(quote: quote, in: blocks).firstIndex(of: targeted.blockIndex) ?? 0
+    }
+
     /// The re-anchor pass over a meeting's ANNOTATION rows against freshly
     /// synthesized notes: matched → `applied` (occurrence refreshed),
     /// unmatched → `stale`. Understanding rows are untouched (their lifecycle

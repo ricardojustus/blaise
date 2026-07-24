@@ -432,6 +432,38 @@ private func makeRow(
         #expect(updates.first { $0.id == orphan.id }?.occurrence == 0)
     }
 
+    @Test("FIX J: trimming the quote recomputes the occurrence against the trimmed match space")
+    func trimmedQuoteReanchorsToTheBlockTheUserActedOn() throws {
+        // The user opens the correction popover on the SECOND decision and
+        // trims the quote to a prefix both decisions share.
+        let blocks = ["Ship it after security review", "Ship it after legal review"]
+        let blockText = blocks[1]
+        let blockOccurrence = try #require(
+            CorrectionAnchoring.matches(quote: blockText, in: blocks).firstIndex(of: 1))
+        #expect(blockOccurrence == 0, "the full block matches only itself")
+
+        let stored = CorrectionAnchoring.occurrence(
+            forQuote: "Ship it", takenFrom: blockText, blockOccurrence: blockOccurrence,
+            in: blocks)
+        // Carrying the block's occurrence (0) through unchanged would have
+        // anchored the correction to the SECURITY decision.
+        #expect(stored == 1)
+        #expect(
+            CorrectionAnchoring.resolve(quote: "Ship it", occurrence: stored, in: blocks)?
+                .blockIndex == 1)
+
+        // An untrimmed quote keeps the target's occurrence untouched...
+        #expect(
+            CorrectionAnchoring.occurrence(
+                forQuote: blockText, takenFrom: blockText, blockOccurrence: blockOccurrence,
+                in: blocks) == blockOccurrence)
+        // ...and a quote whose block no longer exists falls back to 0.
+        #expect(
+            CorrectionAnchoring.occurrence(
+                forQuote: "Ship it", takenFrom: "a decision that was removed",
+                blockOccurrence: 0, in: blocks) == 0)
+    }
+
     @Test("FIX E: occurrence from the block's position among fold-matches anchors identical duplicates distinctly")
     func occurrenceDisambiguatesIdenticalBlocks() throws {
         // Two blocks share identical text; a third differs. This is what the

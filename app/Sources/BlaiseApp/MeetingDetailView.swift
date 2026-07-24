@@ -701,6 +701,18 @@ private struct NotesPane: View {
             .firstIndex(of: index) ?? 0
     }
 
+    /// FIX J: the occurrence to STORE for a submitted correction, resolved
+    /// against the section's real anchor blocks — the popover lets the user
+    /// trim the quote, which moves it into a different match space than the
+    /// block it came from.
+    private func storedOccurrence(for submission: CorrectionSubmission) -> Int {
+        guard let structured = notes?.structured else { return submission.occurrence }
+        return CorrectionAnchoring.occurrence(
+            forQuote: submission.quotedText, takenFrom: submission.blockText,
+            blockOccurrence: submission.occurrence,
+            in: CorrectionAnchoring.blocks(of: structured, section: submission.section))
+    }
+
     // MARK: - G17 FIX A: visible annotation asides in the native notes pane
 
     /// The loaded margin-note rows (annotations). Understanding corrections
@@ -770,6 +782,9 @@ private struct NotesPane: View {
         let pipeline = appEnv.pipeline
         let meetingID = meeting.id
         let uiState = uiState
+        // FIX J: resolved against the CURRENT notes, on the main actor, before
+        // the task detaches.
+        let occurrence = storedOccurrence(for: submission)
         correctionBusy = true
         Task {
             defer { correctionBusy = false }
@@ -777,7 +792,7 @@ private struct NotesPane: View {
                 _ = try await pipeline.addCorrection(
                     meetingID: meetingID, kind: .understanding,
                     section: submission.section, quotedText: submission.quotedText,
-                    occurrence: submission.occurrence, userText: submission.userText)
+                    occurrence: occurrence, userText: submission.userText)
                 await loadCorrections()
                 if submission.fullReprocess {
                     // The escape hatch is today's full Regenerate — the queue
@@ -1521,29 +1536,51 @@ struct MarkdownBlocksView: View {
 
     var body: some View {
         let blocks = MarkdownBlocks.parse(markdown)
+        // FIX J: the plain text of every block in this section, so each
+        // block's correction affordance can carry its own occurrence.
+        let texts = blocks.map { String($0.text.characters) }
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(blocks) { block in
-                anchoredBlock(block)
+            ForEach(Array(blocks.enumerated()), id: \.element.id) { index, block in
+                anchoredBlock(block, occurrence: Self.occurrence(of: index, in: texts))
             }
         }
     }
 
+    /// FIX J: which fold-match this block is among the section's blocks — the
+    /// same rule the pipeline resolves with, so a correction on the SECOND of
+    /// two identical paragraphs anchors to the second instead of collapsing
+    /// onto the first.
+    ///
+    /// Honest limit: these are the UI's markdown blocks, not the anchoring
+    /// blocks (`CorrectionAnchoring.blocks` splits detailed notes on blank
+    /// lines, and a single anchoring block can render as several list items).
+    /// The two agree for the duplicate-block case this fixes; where they
+    /// diverge, the stored occurrence can still name a different match, and
+    /// the re-anchor pass surfaces that as a stale note rather than a silent
+    /// mis-attachment. A trimmed quote is recomputed against the real anchor
+    /// space at save time (`NotesPane.storedOccurrence`).
+    private static func occurrence(of index: Int, in texts: [String]) -> Int {
+        CorrectionAnchoring.matches(quote: texts[index], in: texts)
+            .firstIndex(of: index) ?? 0
+    }
+
     @ViewBuilder
-    private func anchoredBlock(_ block: MarkdownBlock) -> some View {
+    private func anchoredBlock(_ block: MarkdownBlock, occurrence: Int) -> some View {
         if let anchorPrefix {
-            correctableBlock(block)
+            correctableBlock(block, occurrence: occurrence)
                 .id("\(anchorPrefix)-\(block.id)")
         } else {
-            correctableBlock(block)
+            correctableBlock(block, occurrence: occurrence)
         }
     }
 
     @ViewBuilder
-    private func correctableBlock(_ block: MarkdownBlock) -> some View {
+    private func correctableBlock(_ block: MarkdownBlock, occurrence: Int) -> some View {
         if let correctionSection, let onCorrectionAction {
             CorrectableBlock(
                 section: correctionSection,
                 blockText: String(block.text.characters),
+                occurrence: occurrence,
                 enabled: true,
                 onAction: onCorrectionAction
             ) {

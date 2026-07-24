@@ -30,6 +30,11 @@ struct CorrectionSubmission {
     var userText: String
     /// FIX E: threaded from the target (the block's fold-match occurrence).
     var occurrence: Int
+    /// FIX J: the UNTRIMMED text of the block the user acted on. The quote is
+    /// editable, and a trimmed quote lives in a different match space than the
+    /// whole block — this is what lets the save path find the block that was
+    /// actually targeted and recompute the occurrence against the trim.
+    var blockText: String
     /// The demoted escape hatch: re-transcribe from the kept audio.
     var fullReprocess: Bool
 }
@@ -155,7 +160,7 @@ struct CorrectionPopover: View {
                     onSave(CorrectionSubmission(
                         section: target.section, quotedText: quote,
                         userText: userText, occurrence: target.occurrence,
-                        fullReprocess: fullReprocess))
+                        blockText: target.blockText, fullReprocess: fullReprocess))
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
