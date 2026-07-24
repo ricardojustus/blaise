@@ -51,10 +51,19 @@ code (`MeetEventsIngestor.ingest(batch:)`). A recorded huddle files under
   names*.
 - **Setup needs a personal Slack app** (manifest below). Workspaces that
   restrict app installs need admin approval.
-- **Lingering state.** `huddle_state` can linger after a huddle ends;
-  `huddle_state_expiration_ts` is the backstop. End detection has three legs:
-  an explicit state clear, the expiration passing (+120 s), and the existing
-  recording watchdog fed by heartbeats.
+- **Lingering state.** `huddle_state` can linger after a huddle ends. End
+  detection has two legs: an explicit state clear (the trusted signal), and the
+  existing recording watchdog. `huddle_state_expiration_ts` is **advisory only**
+  — it is untrusted JSON compared against wall clock and Slack's refresh cadence
+  for it is unverified, so a passed expiry is logged and cleared, never treated
+  as a leave. Ending a live recording on it would irrecoverably destroy that
+  meeting's transcript and notes.
+- **Belief is bounded.** Between self events "still in a call" is belief, and
+  the heartbeat is manufactured from it. After 4 hours with no genuine self
+  event the tracker stops heartbeating — it does not end the call — which lets
+  the recording watchdog reclaim the session through its normal
+  notify-with-Resume path. Without that bound a dropped self-leave event would
+  keep a recording running indefinitely.
 
 ## Tokens
 
@@ -120,14 +129,23 @@ Driven per `user_huddle_changed` event plus a periodic evaluation tick:
    otherwise ignored. Blaise only ever tracks huddles you are in.
 5. **Self leaves** (self event, state cleared or a different call id): emit
    `callEnded` (`reason: "left"`); clear state.
-6. **Expiration backstop** (tick): `now > huddle_state_expiration_ts + 120 s`
-   with no refreshing self event → self-left (`reason: "expired"`).
+6. **Expiration advisory** (tick): `now > huddle_state_expiration_ts + 120 s`
+   with no refreshing self event → log once and clear the stamp. **No lifecycle
+   is emitted and the call is never ended**: the stamp is untrusted and its
+   refresh cadence unverified, so it must not stop a possibly-live recording.
 7. **Heartbeat** (tick): while in a call, emit a `heartbeat` lifecycle when no
    other batch has shipped for 60 s (feeds the recording watchdog's 5-min
    silence timer). Every emitted batch — callStarted, a roster flush, callEnded
    — counts as liveness and resets that 60 s window, so a busy call never emits
    a redundant heartbeat, and no two batches ever share a timestamp (which the
    downstream monotonic guard would otherwise reject).
+8. **Liveness-belief bound** (tick): 4 hours past the last genuine self event,
+   heartbeats STOP. The call is not ended — going quiet lets the recording
+   watchdog reclaim the session through its normal notify-with-Resume path.
+   Because every manufactured heartbeat refreshes that watchdog's signal clock,
+   without this bound a dropped self-leave would suppress the watchdog forever
+   and leave a recording running indefinitely. A fresh self event revives the
+   belief and heartbeats resume.
 
 ## App manifest
 

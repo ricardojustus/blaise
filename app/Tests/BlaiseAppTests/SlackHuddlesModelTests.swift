@@ -9,20 +9,58 @@ import Testing
 // clears the Keychain, and the epoch guard (a connect that resolves after
 // Disconnect cannot resurrect the connection — the Google-model lesson).
 
+/// Records every batch the tracker emits, so the model's lifecycle wiring is
+/// observable behaviorally (does the tracker still listen?) rather than by
+/// reaching into private state.
+private final class LifecycleRecorder: MeetBatchIngesting, @unchecked Sendable {
+    private let store = Mutex<[MeetWireBatch]>([])
+    func ingest(batch: MeetWireBatch) async { store.withLock { $0.append(batch) } }
+    var count: Int { store.withLock { $0.count } }
+}
+
 @MainActor
 struct SlackHuddlesModelTests {
     private func makeModel(
         client: SlackSocketClient
     ) throws -> (SlackHuddlesModel, InMemorySecretStore, SettingsStore) {
+        let (model, secrets, settings, _) = try makeModelWithTracker(client: client)
+        return (model, secrets, settings)
+    }
+
+    /// Same as `makeModel` but also returns the tracker, so tests can assert
+    /// the model's lifecycle actually reaches it (enable/disable identity
+    /// pushes). Without this seam the disable/re-enable wiring is unobservable:
+    /// deleting it left the whole suite green.
+    private func makeModelWithTracker(
+        client: SlackSocketClient
+    ) throws -> (SlackHuddlesModel, InMemorySecretStore, SettingsStore, SlackHuddleTracker) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("blaise-slack-tests-\(UUID().uuidString)")
         let database = try BlaiseDatabase(rootURL: root)
         let settings = SettingsStore(database: database)
         let secrets = InMemorySecretStore()
-        let tracker = SlackHuddleTracker(selfUserID: "", emitter: NoopMeetBatchIngestor())
+        let tracker = SlackHuddleTracker(selfUserID: "", emitter: lifecycleRecorder)
         let model = SlackHuddlesModel(
             settings: settings, secrets: secrets, tracker: tracker, client: client)
-        return (model, secrets, settings)
+        return (model, secrets, settings, tracker)
+    }
+
+    /// Records batches emitted by the tracker, so a test can observe whether
+    /// the tracker is actually listening (identity pushed) rather than
+    /// inspecting private state.
+    private let lifecycleRecorder = LifecycleRecorder()
+
+    /// A huddle event for the configured self member id.
+    private func selfHuddleEvent(callID: String?, inHuddle: Bool, ts: String) -> SlackHuddleEvent {
+        SlackHuddleEvent(
+            type: SlackHuddleEvent.huddleChangedType,
+            user: SlackUser(
+                id: "U012AB3CD", name: nil,
+                profile: SlackUserProfile(
+                    displayName: nil, realName: nil,
+                    huddleState: inHuddle ? SlackHuddleEvent.inHuddleState : "default_unset",
+                    huddleStateExpirationTs: nil, huddleStateCallID: callID)),
+            eventTS: ts)
     }
 
     /// Routes auth.test / apps.connections.open to ok responses.
@@ -171,6 +209,64 @@ struct SlackHuddlesModelTests {
         model.handleSocketStatus(.sessionEnded(healthy: false, networkDown: false))
         #expect(model.lastError == SlackHuddlesModel.reconnectFailureMessage)
         await model.disconnect()
+    }
+
+    @Test("disable stops the tracker listening; re-enable restores it")
+    func disableAndReEnableWireTracker() async throws {
+        let (model, _, _, tracker) = try makeModelWithTracker(
+            client: parkingClient(transport: okTransport))
+        model.appToken = "xapp"
+        model.botToken = "xoxb"
+        model.memberID = "U012AB3CD"
+        await model.connect()
+        #expect(model.connected)
+
+        // Baseline: the tracker has the identity and reacts to a self event.
+        await tracker.handle(selfHuddleEvent(callID: "R1", inHuddle: true, ts: "1000.1"), at: Date())
+        let afterConnect = lifecycleRecorder.count
+        #expect(afterConnect > 0)
+
+        // Disable → the tracker is cleared, so a fresh event is ignored.
+        model.setEnabled(false)
+        await settleLifecycle(model)
+        await tracker.handle(selfHuddleEvent(callID: "R2", inHuddle: true, ts: "2000.1"), at: Date())
+        #expect(lifecycleRecorder.count == afterConnect, "disabled ⇒ tracker deaf")
+
+        // Re-enable → the member id is pushed back and events land again.
+        model.setEnabled(true)
+        await settleLifecycle(model)
+        await tracker.handle(selfHuddleEvent(callID: "R3", inHuddle: true, ts: "3000.1"), at: Date())
+        #expect(lifecycleRecorder.count > afterConnect, "re-enabled ⇒ tracker listening again")
+        await model.disconnect()
+    }
+
+    @Test("a rapid disable→enable toggle cannot leave the tracker deaf (lifecycle epoch)")
+    func rapidToggleKeepsTrackerListening() async throws {
+        let (model, _, _, tracker) = try makeModelWithTracker(
+            client: parkingClient(transport: okTransport))
+        model.appToken = "xapp"
+        model.botToken = "xoxb"
+        model.memberID = "U012AB3CD"
+        await model.connect()
+        let baseline = lifecycleRecorder.count
+
+        // Both toggles issued before either unstructured Task completes: the
+        // stale disable must not clear the identity the re-enable just pushed.
+        model.setEnabled(false)
+        model.setEnabled(true)
+        await settleLifecycle(model)
+
+        await tracker.handle(selfHuddleEvent(callID: "R9", inHuddle: true, ts: "9000.1"), at: Date())
+        #expect(
+            lifecycleRecorder.count > baseline,
+            "final state is enabled ⇒ the tracker must still be listening")
+        #expect(model.enabled)
+        await model.disconnect()
+    }
+
+    /// Lets the model's unstructured lifecycle Tasks run to completion.
+    private func settleLifecycle(_ model: SlackHuddlesModel) async {
+        for _ in 0 ..< 20 { await Task.yield() }
     }
 
     @Test("URLError connectivity classification")

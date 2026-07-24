@@ -19,10 +19,36 @@ public actor SlackHuddleTracker {
     /// Heartbeat cadence while in a call (feeds MeetCallTracker's 5-min
     /// watchdog, same role as the extension's 1 s poll heartbeat).
     public static let heartbeatIntervalSeconds: TimeInterval = 60
-    /// Expiration backstop: `huddle_state` can linger after a huddle ends, so
-    /// this many seconds past `huddle_state_expiration_ts` with no refreshing
-    /// self event is treated as self-left.
+    /// Expiration ADVISORY threshold: `huddle_state` can linger after a huddle
+    /// ends, so this many seconds past `huddle_state_expiration_ts` with no
+    /// refreshing self event means the stamp is stale. The stamp is untrusted
+    /// JSON compared against wall clock, and Slack's refresh cadence for it is
+    /// unverified, so a passed expiry is LOGGED AND CLEARED — never treated as
+    /// self-left. Ending a live recording on this signal would destroy the
+    /// meeting's transcript and notes irrecoverably (hard floor 1).
     public static let expirationBackstopSeconds: TimeInterval = 120
+    /// Liveness-belief bound. `currentCallID` is BELIEF, refreshed only by a
+    /// genuine self event; the heartbeat below is manufactured from it, and
+    /// downstream `MeetCallTracker` treats every heartbeat as evidence the call
+    /// is alive (refreshing `lastSignalAt`, so its 5-min stale watchdog can
+    /// never fire while we heartbeat). If Slack never delivers the self-leave
+    /// (dropped frame, client killed mid-huddle), that belief would otherwise
+    /// keep a recording running indefinitely, appending unrelated audio to a
+    /// real meeting — hard floor 1 from the other direction.
+    ///
+    /// Past this age with NO genuine self event, we stop manufacturing
+    /// heartbeats. We do NOT end the call: silence hands the decision to
+    /// `MeetCallTracker`'s stale-signal watchdog, which stops through its normal
+    /// path — a user-visible notification WITH Resume and a grace window — so a
+    /// false trigger costs one click rather than a lost meeting.
+    ///
+    /// Cost of the pin: a legitimate huddle emitting no self event for longer
+    /// than this is stopped (recoverably) at bound + watchdog ≈ 4h05m. Chosen
+    /// generously against a ~45-min average meeting because Slack's self-event
+    /// cadence during a long huddle is UNVERIFIED (the C15 live-workspace
+    /// touchpoint is open). If that touchpoint shows Slack refreshes self state
+    /// periodically, this can tighten by an order of magnitude.
+    public static let livenessBeliefMaxAgeSeconds: TimeInterval = 4 * 60 * 60
     /// Foreign-call events (a co-participant's event that arrives before self's
     /// own join) are retained this long — ordering across the workspace stream
     /// is not guaranteed.
@@ -53,6 +79,9 @@ public actor SlackHuddleTracker {
     private var participants: [String: Participant] = [:]
     private var expirationTs: Int64?
     private var lastSelfEventAt: Date?
+    /// One-shot latch so the liveness-belief-stale notice logs once per call,
+    /// not every 5 s tick. Reset wherever `lastSelfEventAt` is set or cleared.
+    private var livenessBeliefStale = false
 
     private var lastRosterFlushAt: Date?
     private var rosterDirty = false
@@ -100,6 +129,7 @@ public actor SlackHuddleTracker {
         participants = [:]
         expirationTs = nil
         lastSelfEventAt = nil
+        livenessBeliefStale = false
         lastRosterFlushAt = nil
         lastHeartbeatAt = nil
         rosterDirty = false
@@ -177,6 +207,22 @@ public actor SlackHuddleTracker {
             expirationTs = nil
         }
 
+        // Liveness-belief bound: stop MANUFACTURING heartbeats once no genuine
+        // self event has been seen for `livenessBeliefMaxAgeSeconds`. The call
+        // is deliberately NOT ended here — going quiet lets MeetCallTracker's
+        // stale-signal watchdog reclaim the recording through its normal
+        // notify-with-Resume path, which is recoverable; force-ending is not.
+        if let lastSelf = lastSelfEventAt,
+            clock.timeIntervalSince(lastSelf) >= Self.livenessBeliefMaxAgeSeconds
+        {
+            if !livenessBeliefStale {
+                livenessBeliefStale = true
+                logger.notice(
+                    "no genuine self event for \(callID, privacy: .public) in \(Int(Self.livenessBeliefMaxAgeSeconds), privacy: .public)s — heartbeats stop; the recording watchdog now owns the end")
+            }
+            return
+        }
+
         // Heartbeat.
         if let last = lastHeartbeatAt,
             clock.timeIntervalSince(last) >= Self.heartbeatIntervalSeconds
@@ -196,6 +242,7 @@ public actor SlackHuddleTracker {
                 // watchdog, not force-ended on a stale expiry).
                 expirationTs = event.expirationTs
                 lastSelfEventAt = at
+                livenessBeliefStale = false
                 return
             }
             // Self joins a NEW call id (nil or different). A different id means
@@ -217,6 +264,7 @@ public actor SlackHuddleTracker {
         currentCallID = callID
         self.expirationTs = expirationTs
         lastSelfEventAt = at
+        livenessBeliefStale = false
         participants = [selfUserID: Participant(name: nil, joinedAt: at)]
         lastRosterFlushAt = at
         rosterDirty = false
@@ -252,6 +300,7 @@ public actor SlackHuddleTracker {
         participants = [:]
         expirationTs = nil
         lastSelfEventAt = nil
+        livenessBeliefStale = false
         lastRosterFlushAt = nil
         lastHeartbeatAt = nil
         rosterDirty = false

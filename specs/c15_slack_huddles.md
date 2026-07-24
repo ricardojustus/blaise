@@ -32,9 +32,18 @@ call id is a co-participant. Join/leave timing = event arrival times.
 - **Setup requires creating a personal Slack app** (manifest in
   `docs/slack_huddles_contract.md`). Workspaces that restrict app installs need
   admin approval — stated in the docs, not worked around.
-- `huddle_state` can linger after a huddle ends; `huddle_state_expiration_ts` is the
-  backstop. End detection therefore has three legs: explicit state clear, expiration
-  passing, and the existing tracker watchdog.
+- `huddle_state` can linger after a huddle ends. End detection has two legs: an
+  explicit state clear (the trusted signal) and the existing tracker watchdog.
+  `huddle_state_expiration_ts` is ADVISORY — untrusted JSON compared against wall
+  clock, with an unverified refresh cadence, so a passed expiry is logged and
+  cleared and never ends a call (hard floor 1: a false stop irrecoverably
+  destroys that meeting's transcript and notes).
+- Between self events, "in a call" is BELIEF and the heartbeat is manufactured
+  from it. Every heartbeat refreshes the downstream watchdog's signal clock, so
+  an undelivered self-leave would suppress that watchdog indefinitely — hence
+  the belief is BOUNDED: 4 h with no genuine self event stops the heartbeats
+  (never ends the call), handing the end to the watchdog's normal
+  notify-with-Resume path.
 
 ## Repo layout
 
@@ -137,16 +146,29 @@ Transitions (all driven by `user_huddle_changed`):
    call are ignored. Blaise only ever observes huddles the user is in.
 5. **Self leaves** — self event with state cleared or different call id: emit
    `callEnded`, reason `"left"`.
-6. **Expiration backstop** — tick: `now > huddle_state_expiration_ts + 120 s` with
-   no refreshing self event → `callEnded`, reason `"expired"`. The latest self
-   event's expiry is taken verbatim (a refresh omitting it clears the backstop —
-   heartbeats/watchdog carry liveness instead).
+6. **Expiration advisory** — tick: `now > huddle_state_expiration_ts + 120 s` with
+   no refreshing self event → log once, clear the stamp. **No lifecycle emitted;
+   the call is never ended.** The latest self event's expiry is taken verbatim (a
+   refresh omitting it clears the stamp). An untrusted timestamp must never stop a
+   possibly-live recording.
 7. **Heartbeat** — while in a call, a `heartbeat` lifecycle batch every 60 s of
    emission silence. EVERY emitted batch counts as liveness: a tick that flushed
    a roster never also emits a heartbeat, so no two batches share a timestamp and
    `MeetCallTracker`'s monotonic guard never starves the kind-gated grace-resume
    path (same rule as the extension's "heartbeats skipped when any batch shipped
    within 60 s").
+8. **Liveness-belief bound** — tick: `SlackHuddleTracker.livenessBeliefMaxAgeSeconds`
+   (4 h) past the last genuine self event, heartbeats STOP; the call is not ended
+   and no lifecycle is emitted. Rationale: rule 7's heartbeat is manufactured from
+   belief and refreshes `MeetCallTracker.lastSignalAt`, so an undelivered
+   self-leave would suppress that 5-min watchdog forever and leave a recording
+   running indefinitely. Going quiet instead lets the watchdog stop the recording
+   through its normal path (user-visible notification + Resume + grace window),
+   so a false trigger costs one click rather than a lost meeting. A fresh self
+   event revives the belief and heartbeats resume. The constant is generous
+   against a ~45-min average meeting because Slack's self-event cadence during a
+   long huddle is UNVERIFIED (Human Touchpoint below); confirming a periodic
+   refresh would allow tightening it by an order of magnitude.
 
 All emissions are `MeetWireBatch`es (`meetingCode: "slack:<callID>"`,
 `events: []`, `schemaVersion: 2`) through ONE seam: the `MeetBatchIngesting`
@@ -216,7 +238,16 @@ Live huddle with ≥ 2 participants: verify (a) `user_huddle_changed` arrives fo
 participants over Socket Mode with bot `users:read`; (b) `huddle_state_call_id`
 present and shared; (c) display names inline vs needing `users.info`; (d) event
 latency vs join time; (e) auto-record offer fires and auto-stop lands after
-leaving. Amend this spec with findings (C12's field-amendment precedent).
+leaving; **(f) SELF-EVENT CADENCE during a long huddle — does Slack re-emit a self
+`user_huddle_changed` (refreshing `huddle_state_expiration_ts`) periodically, or
+only at join?** Amend this spec with findings (C12's field-amendment precedent).
+
+(f) is load-bearing for rules 6 and 8: both the expiration advisory and the 4 h
+liveness-belief bound are sized for the pessimistic answer ("only at join").
+A confirmed periodic refresh would let rule 8's constant tighten by an order of
+magnitude, and would make a passed expiry meaningfully informative rather than
+merely advisory. Until (f) is answered, treat both constants as deliberately
+conservative rather than tuned.
 
 ## Out of scope
 

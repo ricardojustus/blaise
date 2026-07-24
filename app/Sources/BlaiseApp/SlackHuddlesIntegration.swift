@@ -91,6 +91,14 @@ final class SlackHuddlesModel {
     /// disconnect landed cannot resurrect the connection (Google epoch-guard
     /// lesson).
     private var connectEpoch = 0
+    /// Bumped by EVERY enable/disable/disconnect. `setEnabled` and `disconnect`
+    /// run unstructured Tasks that suspend (socket teardown, actor hops), so a
+    /// rapid toggle can interleave them: without this guard a stale disable task
+    /// resumes after a re-enable and clears the tracker's identity (socket live,
+    /// tracker deaf to every event), or a stale enable task resumes after a
+    /// disable and starts a socket the user has switched off. Same epoch shape
+    /// as `connectEpoch`; captured before the first await, re-checked after each.
+    private var lifecycleEpoch = 0
 
     init(
         settings: SettingsStore,
@@ -137,14 +145,21 @@ final class SlackHuddlesModel {
 
     func setEnabled(_ value: Bool) {
         enabled = value
+        lifecycleEpoch &+= 1
+        let epoch = lifecycleEpoch
         Task {
             if value {
                 // Re-push the member id: a prior disable cleared the tracker's
                 // identity, and an identity-less tracker ignores every event.
                 await tracker.setSelfUserID(memberID)
+                guard epoch == lifecycleEpoch else { return }
                 startSocket()
             } else {
                 await stopSocket()
+                // A newer toggle superseded this one while the socket tore
+                // down — clearing the tracker now would blind the re-enabled
+                // integration with no error surface.
+                guard epoch == lifecycleEpoch else { return }
                 // Clear tracker state (current call, roster, heartbeat clock).
                 // Without this, a disable mid-huddle leaves the call stuck
                 // forever: no events can ever arrive to end it, so it would
@@ -152,6 +167,7 @@ final class SlackHuddlesModel {
                 // defeating auto-stop and re-posting start notifications.
                 await tracker.setSelfUserID("")
             }
+            guard epoch == lifecycleEpoch else { return }
             await saveSettings()
         }
     }
@@ -233,6 +249,9 @@ final class SlackHuddlesModel {
         // Abort any in-flight connect first — a late validation success must
         // not write fresh tokens and silently undo the disconnect.
         cancelConnect()
+        // Supersede any in-flight setEnabled task: its post-await half must not
+        // start a socket or clear the tracker after the disconnect lands.
+        lifecycleEpoch &+= 1
         await stopSocket()
         // Same phantom-call hygiene as setEnabled(false): a disconnect
         // mid-huddle must not leave the tracker heartbeating a call that no
@@ -265,6 +284,13 @@ final class SlackHuddlesModel {
     // MARK: - Socket lifecycle
 
     private func startSocket() {
+        // The integration being ON is a precondition, not an assumption of the
+        // caller: `startSocket` is reached from `startIfEnabled`, `connect`, and
+        // a suspended `setEnabled` task. Only the first two check `enabled`, so
+        // without this guard a stale enable-task could open a socket after the
+        // user switched the integration off — a connection running while the UI
+        // says it is disabled.
+        guard enabled else { return }
         guard SlackSocketPolicy.connectAllowed() else {
             logger.notice(
                 "slack socket disabled: BLAISE_DATA_ROOT override active (set BLAISE_SLACK_SOCKET=1 to opt in)")

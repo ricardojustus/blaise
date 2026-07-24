@@ -164,6 +164,33 @@ struct SlackHuddleTrackerTests {
         #expect(rec.all.last?.lifecycle?.reason == "left")
     }
 
+    @Test("liveness belief is bounded: stale belief stops heartbeats without ending the call")
+    func livenessBeliefBound() async {
+        let rec = BatchRecorder()
+        let tracker = makeTracker(rec)
+        await tracker.handle(selfEvent(callID: "R1", inHuddle: true, ts: "1000.1"), at: t(0))
+        let bound = SlackHuddleTracker.livenessBeliefMaxAgeSeconds
+
+        // Just inside the bound: still manufacturing heartbeats.
+        await tracker.tick(now: t(bound - 60))
+        #expect(rec.all.last?.lifecycle?.kind == .heartbeat)
+        let beforeStale = rec.all.count
+
+        // Past the bound with no genuine self event: heartbeats STOP, and the
+        // call is deliberately NOT ended — going quiet hands the decision to
+        // MeetCallTracker's watchdog, which stops with a Resume affordance.
+        await tracker.tick(now: t(bound + 1))
+        await tracker.tick(now: t(bound + 120))
+        #expect(rec.all.count == beforeStale, "stale belief ⇒ no manufactured heartbeats")
+        #expect(rec.all.compactMap(\.lifecycle).allSatisfy { $0.kind != .callEnded })
+
+        // A genuine self event revives the belief and heartbeats resume.
+        await tracker.handle(
+            selfEvent(callID: "R1", inHuddle: true, ts: "1000.2"), at: t(bound + 130))
+        await tracker.tick(now: t(bound + 200))
+        #expect(rec.all.count > beforeStale, "fresh self event ⇒ heartbeats resume")
+    }
+
     @Test("heartbeat emitted on cadence while in a call")
     func heartbeat() async {
         let rec = BatchRecorder()
