@@ -529,6 +529,13 @@ public final class BlaiseDatabase: Sendable {
                 t.column("created_at", .datetime).notNull()
                 t.column("applied_at", .datetime)
             }
+            // The mint-time snapshot of the rows that shaped a notes artifact
+            // (the payload's hash-stable re-materialization source; live rows
+            // are user-mutable). Nullable JSON, the v17 precedent. No FTS
+            // impact — the triggers re-index `markdown` only.
+            try db.alter(table: "meeting_notes") { t in
+                t.add(column: "user_corrections", .text) // nullable; JSON [NotesCorrectionSnapshot]
+            }
         }
         return migrator
     }

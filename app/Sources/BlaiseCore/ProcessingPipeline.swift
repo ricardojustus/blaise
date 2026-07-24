@@ -729,9 +729,13 @@ public actor ProcessingPipeline {
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: notes.structured, labelMap: labelMap, language: notes.language).notes
+            // G17: every re-mint re-weaves current annotations and refreshes
+            // the payload snapshot (an unrelated rename must not drop them).
+            let correctionRows = await self.correctionRows(meetingID: meetingID)
+            notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: title,
-                userName: user.name)
+                userName: user.name, annotations: correctionRows)
             try Data(notes.markdown.utf8).write(
                 to: self.database.paths.notesURL(meetingID), options: .atomic)
             let payload = EvidencePayloadBuilder.build(
@@ -842,9 +846,12 @@ public actor ProcessingPipeline {
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: finalSegments)
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: notes.structured, labelMap: labelMap, language: notes.language).notes
+            // G17: re-weave annotations + refresh the payload snapshot.
+            let correctionRows = await self.correctionRows(meetingID: meetingID)
+            notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: finalMeeting.title,
-                userName: user.name)
+                userName: user.name, annotations: correctionRows)
             try Data(notes.markdown.utf8).write(
                 to: self.database.paths.notesURL(meetingID), options: .atomic)
             let payload = EvidencePayloadBuilder.build(
@@ -930,9 +937,12 @@ public actor ProcessingPipeline {
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: edited, labelMap: labelMap, language: notes.language).notes
+            // G17: re-weave annotations + refresh the payload snapshot.
+            let correctionRows = await self.correctionRows(meetingID: meetingID)
+            notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: meeting.title,
-                userName: user.name)
+                userName: user.name, annotations: correctionRows)
             try Data(notes.markdown.utf8).write(
                 to: self.database.paths.notesURL(meetingID), options: .atomic)
 
@@ -962,6 +972,186 @@ public actor ProcessingPipeline {
             }
             await self.handoffKicker.kick()
             return count
+        }
+    }
+
+    // MARK: - G17: span-anchored corrections and margin notes
+
+    /// The meeting's durable correction rows (display order). Failure-soft:
+    /// a read error behaves as "no rows" (presence-gated everywhere).
+    func correctionRows(meetingID: MeetingID) async -> [MeetingCorrection] {
+        (try? await database.pool.read { db in
+            try MeetingCorrectionStore.all(db, meetingID: meetingID)
+        }) ?? []
+    }
+
+    /// G17: records a correction/note row. The row is durable BEFORE any
+    /// re-run is attempted — a failed rewrite leaves it `pending` for the
+    /// next run. Returns the inserted row (the UI threads it into the
+    /// follow-up action: `rewriteNotes`, full `regenerate`, or — for
+    /// annotations — `remintNotesArtifacts`).
+    @discardableResult
+    public func addCorrection(
+        meetingID: MeetingID, kind: MeetingCorrection.Kind,
+        section: MeetingCorrection.Section, quotedText: String, occurrence: Int,
+        userText: String
+    ) async throws -> MeetingCorrection {
+        let row = MeetingCorrection(
+            meetingID: meetingID, kind: kind, section: section,
+            quotedText: quotedText.trimmingCharacters(in: .whitespacesAndNewlines),
+            occurrence: occurrence,
+            userText: userText.trimmingCharacters(in: .whitespacesAndNewlines),
+            createdAt: now())
+        try await database.pool.write { db in
+            try MeetingCorrectionStore.insert(db, row)
+        }
+        if kind == .annotation {
+            _ = try await remintNotesArtifacts(meetingID: meetingID)
+        }
+        return row
+    }
+
+    /// G17 §UX-3: edit of an existing row. An annotation edit re-mints (its
+    /// rendered aside must move now); an understanding edit returns the row
+    /// to `pending` (the notes change on the next rewrite).
+    public func updateCorrection(
+        meetingID: MeetingID, id: String, quotedText: String, occurrence: Int,
+        userText: String
+    ) async throws {
+        let rows = await correctionRows(meetingID: meetingID)
+        guard let row = rows.first(where: { $0.id == id }) else { return }
+        try await database.pool.write { db in
+            try MeetingCorrectionStore.update(
+                db, id: id, quotedText: quotedText, occurrence: occurrence,
+                userText: userText,
+                status: row.kind == .understanding ? .pending : row.status)
+        }
+        if row.kind == .annotation {
+            _ = try await remintNotesArtifacts(meetingID: meetingID)
+        }
+    }
+
+    /// G17 §UX-3: deletion IS the undo. An annotation delete re-mints (the
+    /// aside must leave notes.md + payload now); an understanding delete is
+    /// row-only — the notes change on the user's next rewrite/regenerate.
+    public func deleteCorrection(meetingID: MeetingID, id: String) async throws {
+        let rows = await correctionRows(meetingID: meetingID)
+        guard let row = rows.first(where: { $0.id == id }) else { return }
+        try await database.pool.write { db in
+            try MeetingCorrectionStore.delete(db, id: id)
+        }
+        if row.kind == .annotation {
+            _ = try await remintNotesArtifacts(meetingID: meetingID)
+        }
+    }
+
+    /// G17: user-origin notes-only re-run for a READY meeting — the
+    /// "Re-write the notes" action. Reuses the persisted transcript (the D17
+    /// resume machinery) with the meeting's correction rows injected at
+    /// request build. Returns nil (refusal, not an error) when the meeting
+    /// is not `ready` — a live run or a pending meeting already produces
+    /// notes and consumes the rows itself.
+    ///
+    /// Failure is no-regress: the meeting stays `ready` with its previous
+    /// notes; `notesOnlyStages`' catch writes the notes-pending marker
+    /// (regeneration-class → status untouched), so the existing self-heal
+    /// triggers (launch / key save / network restore) retry the rewrite with
+    /// the corrections still included.
+    @discardableResult
+    public func rewriteNotes(meetingID: MeetingID) async throws -> PipelineRunRecord? {
+        try await chain.run { try await self.rewriteNotesBody(meetingID: meetingID) }
+    }
+
+    private func rewriteNotesBody(meetingID: MeetingID) async throws -> PipelineRunRecord? {
+        guard let meeting = try await MeetingRepository(database: database).fetch(meetingID),
+            meeting.status == .ready,
+            let dominantLanguage = meeting.dominantLanguage,
+            let asrProvenance = meeting.asrProvenance
+        else { return nil }
+        let segments = try await TranscriptRepository(database: database)
+            .segments(meetingID: meetingID)
+        guard !segments.isEmpty else {
+            throw PipelineError(
+                stage: .notes, message: "ready meeting has no persisted transcript to re-write from")
+        }
+        emit(.runStarted(meetingID, regeneration: true))
+        let context = RunContext(meetingID: meetingID, regeneration: true)
+        // Status-silent cancel: a cancelled rewrite keeps `ready` + the
+        // previous notes (the G10 §1 notes-resume precedent).
+        let cancelToken = installCancelToken(meetingID: meetingID, statusSilent: true)
+        defer { removeCancelToken(meetingID: meetingID, token: cancelToken) }
+        context.cancelToken = cancelToken
+        context.notesPurpose = .regeneration
+        let userLoad = vocabularyProvider()
+        reportGlossaryLoad(userLoad, meetingID: meetingID)
+        return try await notesOnlyStages(
+            meeting: meeting, segments: segments, dominantLanguage: dominantLanguage,
+            asrProvenance: asrProvenance, context: context, vocabulary: userLoad.vocabulary)
+    }
+
+    /// G17: the deterministic notes re-mint (render with current annotations
+    /// → snapshot → payload → upsert + enqueue in one transaction → kick) —
+    /// the `correctNameInNotes` shape, shared by the annotation add / edit /
+    /// delete paths. No engine call. Returns false (refusal) for a non-ready
+    /// or notes-pending meeting: the row is durable and the next content run
+    /// weaves it instead.
+    @discardableResult
+    public func remintNotesArtifacts(meetingID: MeetingID) async throws -> Bool {
+        try await chain.run {
+            guard let meeting = try await MeetingRepository(database: self.database)
+                .fetch(meetingID), meeting.status == .ready,
+                !NotesPendingClass.isPending(meeting.lastProcessingError),
+                var notes = try await NotesRepository(database: self.database)
+                    .fetch(meetingID: meetingID)
+            else { return false }
+
+            let user = await self.userIdentity()
+            let segments = try await TranscriptRepository(database: self.database)
+                .segments(meetingID: meetingID)
+            let correctionRows = await self.correctionRows(meetingID: meetingID)
+            // G13: neutralize S-labels as the LAST write to notes.structured
+            // before the render (unchanged content otherwise).
+            let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
+            notes.structured = SLabelNeutralizer.neutralize(
+                notes: notes.structured, labelMap: labelMap, language: notes.language).notes
+            notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
+            notes.markdown = try NotesRenderer.render(
+                notes.structured, language: notes.language, meetingTitle: meeting.title,
+                userName: user.name, annotations: correctionRows)
+            try Data(notes.markdown.utf8).write(
+                to: self.database.paths.notesURL(meetingID), options: .atomic)
+
+            // Re-anchor annotations against the (unchanged) structured notes
+            // so a freshly added/edited note records its resolved state.
+            // Computed OUTSIDE the write closure (`notes` is a captured var —
+            // Sendable-capture rule).
+            let timestamp = self.now()
+            let reanchorUpdates = CorrectionAnchoring.reanchor(
+                annotations: correctionRows, against: notes.structured)
+            let finalMeeting = try await self.database.pool.write { db -> Meeting in
+                guard var m = try Meeting.fetchOne(db, key: meetingID) else {
+                    throw BlaiseDatabaseError.meetingNotFound(meetingID)
+                }
+                m.updatedAt = timestamp
+                try m.update(db)
+                try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
+                return try Meeting.fetchOne(db, key: meetingID) ?? m
+            }
+            let payload = EvidencePayloadBuilder.build(
+                meeting: finalMeeting, segments: segments, notes: notes, user: user)
+            let relativePath = self.database.paths.relativeHandoffPayloadPath(
+                meetingID: meetingID, versionHash: payload.versionHash)
+            try ImmutablePayloadWriter.write(
+                payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
+            let rootURL = self.database.rootURL
+            try await self.database.pool.write { [notes] db in
+                try notes.upsert(db)
+                _ = try HandoffRepository.enqueue(
+                    db, rootURL: rootURL, meetingID: meetingID,
+                    versionHash: payload.versionHash, payloadPath: relativePath)
+            }
+            await self.handoffKicker.kick()
+            return true
         }
     }
 
@@ -1202,7 +1392,11 @@ public actor ProcessingPipeline {
             // on the notes-only resume (same vocabulary, attendees, segments), so
             // the resume request stays byte-equal to this stage-9 request.
             groundedPersonHints: GroundedPersonHints.groundedPersonHints(
-                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments))
+                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments),
+            // G17: EVERY synthesis path injects the meeting's durable
+            // correction rows — a full Regenerate can never erase user truth.
+            corrections: await correctionRows(meetingID: meetingID)
+                .map(NotesCorrection.init(row:)))
         let notesOutcome = try await stage(.notes, context, meetingID) {
             try await self.generateNotesWithFallback(notesRequest, context: context)
         }
@@ -2421,9 +2615,14 @@ public actor ProcessingPipeline {
             if let promotedStructuredTitle {
                 renderStructured.title = promotedStructuredTitle
             }
+            // G17: weave the meeting's margin notes into the markdown and
+            // snapshot ALL rows onto the notes row (the payload's hash-stable
+            // source). Presence-gated: no rows → byte-identical markdown and
+            // a NULL snapshot column.
+            let correctionRows = await self.correctionRows(meetingID: meetingID)
             let markdown = try NotesRenderer.render(
                 renderStructured, language: dominantLanguage, meetingTitle: renderTitle,
-                userName: user.name)
+                userName: user.name, annotations: correctionRows)
             // G14: the digest is persisted on the same notes row so stage 13's
             // build() picks it up (presence-gated). `memoryDigest` is the
             // ALREADY-neutralized clean digest string (or nil: toggle off, or a
@@ -2442,7 +2641,8 @@ public actor ProcessingPipeline {
                 generatedAt: self.now(),
                 provenance: provenance,
                 memoryDigest: memoryDigest,
-                scopedAliasBindings: context.resolvedScopedAliasBindings ?? [])
+                scopedAliasBindings: context.resolvedScopedAliasBindings ?? [],
+                userCorrections: correctionRows.map(NotesCorrectionSnapshot.init(row:)))
             try await NotesRepository(database: self.database).upsert(notes)
             try Data(markdown.utf8).write(to: paths.notesURL(meetingID), options: .atomic)
         }
@@ -2473,6 +2673,25 @@ public actor ProcessingPipeline {
                 notes: finalNotes)
             context.record.versionHash = payload.versionHash
             context.record.payloadPath = relativePath
+        }
+
+        // G17 post-finalize bookkeeping: consumed understanding rows flip to
+        // `applied`; annotations re-anchor against the persisted notes
+        // (matched → applied + occurrence refresh, orphaned → stale). Runs on
+        // every path that mints notes. Failure-soft and idempotent: a crash
+        // between finalize and this write leaves rows `pending`, and the next
+        // synthesis run simply consumes them again.
+        try? await database.pool.write { db in
+            let rows = try MeetingCorrectionStore.all(db, meetingID: meetingID)
+            guard !rows.isEmpty else { return }
+            try MeetingCorrectionStore.markApplied(
+                db,
+                ids: rows.filter { $0.kind == .understanding && $0.status == .pending }.map(\.id),
+                at: self.now())
+            guard let structured = try MeetingNotes.fetchOne(db, key: meetingID)?.structured
+            else { return }
+            try MeetingCorrectionStore.applyReanchor(
+                db, updates: CorrectionAnchoring.reanchor(annotations: rows, against: structured))
         }
     }
 
@@ -2664,7 +2883,11 @@ public actor ProcessingPipeline {
             // vocabulary, attendees, persisted stage-9 segments) — pinned
             // byte-equal by `resumeRebuildsTheSamePromptInputsAsStageNine`.
             groundedPersonHints: GroundedPersonHints.groundedPersonHints(
-                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments))
+                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments),
+            // G17: the resume and the user rewrite inject the same durable
+            // rows as the full run (request parity holds — same loader).
+            corrections: await correctionRows(meetingID: meetingID)
+                .map(NotesCorrection.init(row:)))
 
         do {
             let outcome = try await stage(.notes, context, meetingID) {

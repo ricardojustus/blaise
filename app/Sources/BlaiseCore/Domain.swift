@@ -431,6 +431,13 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
     /// byte-identically). NOT in the payload (the builder reads explicit fields
     /// only — `EvidencePayloadBuilder`), so `versionHash` is unaffected (AC7).
     public var scopedAliasBindings: [AliasPair]
+    /// G17: the snapshot of the correction/note rows that shaped THIS minted
+    /// artifact (the payload's re-materialization source — live
+    /// `meeting_correction` rows are user-mutable and not hash-stable). Its
+    /// OWN nullable JSON column (`user_corrections`), presence-preserving
+    /// like `scopedAliasBindings`: a null/absent column (pre-G17 row, or a
+    /// meeting with no corrections) → empty, and the payload omits the field.
+    public var userCorrections: [NotesCorrectionSnapshot]
 
     public init(
         meetingID: MeetingID,
@@ -440,7 +447,8 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         generatedAt: Date,
         provenance: NotesProvenance,
         memoryDigest: String? = nil,
-        scopedAliasBindings: [AliasPair] = []
+        scopedAliasBindings: [AliasPair] = [],
+        userCorrections: [NotesCorrectionSnapshot] = []
     ) {
         self.meetingID = meetingID
         self.markdown = markdown
@@ -450,6 +458,7 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         self.provenance = provenance
         self.memoryDigest = memoryDigest
         self.scopedAliasBindings = scopedAliasBindings
+        self.userCorrections = userCorrections
     }
 
     enum CodingKeys: String, CodingKey {
@@ -458,6 +467,7 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         case generatedAt = "generated_at"
         case memoryDigest = "memory_digest"
         case scopedAliasBindings = "scoped_alias_bindings"
+        case userCorrections = "user_corrections"
     }
 
     public init(from decoder: Decoder) throws {
@@ -472,6 +482,8 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         // A null/absent column (legacy / pre-md-v3 / digest-off row) → empty set.
         self.scopedAliasBindings =
             try container.decodeIfPresent([AliasPair].self, forKey: .scopedAliasBindings) ?? []
+        self.userCorrections =
+            try container.decodeIfPresent([NotesCorrectionSnapshot].self, forKey: .userCorrections) ?? []
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -499,6 +511,12 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         try container.encode(
             scopedAliasBindings.isEmpty ? nil : scopedAliasBindings,
             forKey: .scopedAliasBindings)
+        // G17 `user_corrections`: same discipline — empty writes SQL NULL (a
+        // no-corrections mint actively CLEARS a previously-stored snapshot,
+        // e.g. after the last row was deleted and the notes re-minted).
+        try container.encode(
+            userCorrections.isEmpty ? nil : userCorrections,
+            forKey: .userCorrections)
     }
 }
 

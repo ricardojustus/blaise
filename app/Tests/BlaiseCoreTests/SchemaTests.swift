@@ -163,7 +163,7 @@ import Testing
         // memory_digest column + the cloud_spend_receipt CHECK-rebuild) + v15
         // (F1: processing_queue substrate) + v16 (F2: notes_fts) + v17 (T3.1:
         // scoped_alias_bindings column) = 17.
-        #expect(health.schemaVersion == 17)
+        #expect(health.schemaVersion == 18)
         #expect(health.journalMode == "wal")
     }
 }

@@ -29,8 +29,15 @@ public enum NotesRenderer {
     ///     identity) → the neutral "My action items" / "Minhas ações" (G3).
     /// - Throws: `EngineError.invalidStructuredNotes` if `summary` is
     ///   empty/whitespace (refusal, not rendering — anti-hallucination).
+    ///
+    /// G17 `annotations`: the meeting's user margin notes, woven in
+    /// deterministically — an anchored note renders as a blockquote aside by
+    /// its matched block; an unanchored note lands under a final "Your notes"
+    /// heading with its original anchor quote (never silently dropped). HARD
+    /// presence gate: no annotation rows → byte-identical pre-G17 output.
     public static func render(
-        _ s: NotesStructured, language: String, meetingTitle: String, userName: String = ""
+        _ s: NotesStructured, language: String, meetingTitle: String, userName: String = "",
+        annotations: [MeetingCorrection] = []
     ) throws -> String {
         let strings = LocalizedStrings.match(language, userName: userName)
 
@@ -47,24 +54,111 @@ public enum NotesRenderer {
         }
 
         let detailedNotes = s.detailedNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let weave = AnnotationWeave.plan(annotations: annotations, structured: s)
 
         var blocks: [String] = []
         blocks.append("# \(titleLine)")
         blocks.append("## \(strings.summary)")
         blocks.append(demoteHeadings(in: summary))
+        blocks.append(contentsOf: weave.summaryAsides.map { aside($0, strings: strings) })
         blocks.append("## \(strings.detailedNotes)")
-        blocks.append(detailedNotes.isEmpty ? strings.noneMarker : demoteHeadings(in: detailedNotes))
+        if weave.detailedAsides.isEmpty {
+            blocks.append(detailedNotes.isEmpty ? strings.noneMarker : demoteHeadings(in: detailedNotes))
+        } else {
+            // Per-paragraph render so each aside lands under its anchor. The
+            // paragraph split mirrors `CorrectionAnchoring.blocks`; demoting
+            // per paragraph is equivalent except for a fenced code block that
+            // spans a blank line, which this path may re-close per paragraph
+            // — accepted: it activates only when a note anchors in this
+            // section, and anchoring itself is paragraph-granular.
+            let paragraphs = CorrectionAnchoring.blocks(of: s, section: .detailedNotes)
+            for (index, paragraph) in paragraphs.enumerated() {
+                blocks.append(demoteHeadings(in: paragraph))
+                for text in weave.detailedAsides[index] ?? [] {
+                    blocks.append(aside(text, strings: strings))
+                }
+            }
+            if paragraphs.isEmpty {
+                blocks.append(strings.noneMarker)
+            }
+        }
         blocks.append("## \(strings.decisions)")
         blocks.append(renderList(s.decisions.map { "- \(normalizeListText($0))" }, emptyMarker: strings.noneMarker))
+        blocks.append(contentsOf: weave.decisionAsides.map { aside($0.text, on: $0.quote, strings: strings) })
         blocks.append("## \(strings.actionItems)")
         blocks.append(renderList(
             s.actionItems.filter { !normalizeListText($0.text).isEmpty }.map(renderActionItem),
             emptyMarker: strings.noneMarker))
+        blocks.append(contentsOf: weave.actionAsides.map { aside($0.text, on: $0.quote, strings: strings) })
         blocks.append("## \(strings.userActionItems)")
         blocks.append(renderList(
             s.userActionItems.filter { !normalizeListText($0.text).isEmpty }.map(renderActionItem),
             emptyMarker: strings.userNoneMarker))
+        if !weave.unanchored.isEmpty {
+            blocks.append("## \(strings.yourNotes)")
+            blocks.append(weave.unanchored.map { note in
+                "- \(flattenToTitleLine(note.text)) *(\(strings.wasOn) \u{201C}\(anchorQuote(note.quote))\u{201D})*"
+            }.joined(separator: "\n"))
+        }
         return blocks.joined(separator: "\n\n") + "\n"
+    }
+
+    // MARK: - G17 annotation weaving
+
+    /// Where each annotation lands: an aside under its anchor, or the tail
+    /// "Your notes" list. Pure and order-preserving (row order = display
+    /// order within each bucket).
+    struct AnnotationWeave {
+        var summaryAsides: [String] = []
+        var detailedAsides: [Int: [String]] = [:]
+        var decisionAsides: [(quote: String, text: String)] = []
+        var actionAsides: [(quote: String, text: String)] = []
+        var unanchored: [(quote: String, text: String)] = []
+
+        static func plan(annotations: [MeetingCorrection], structured: NotesStructured) -> AnnotationWeave {
+            var weave = AnnotationWeave()
+            for row in annotations where row.kind == .annotation {
+                let blocks = CorrectionAnchoring.blocks(of: structured, section: row.section)
+                guard
+                    let hit = CorrectionAnchoring.resolve(
+                        quote: row.quotedText, occurrence: row.occurrence, in: blocks)
+                else {
+                    weave.unanchored.append((row.quotedText, row.userText))
+                    continue
+                }
+                switch row.section {
+                case .summary:
+                    weave.summaryAsides.append(row.userText)
+                case .detailedNotes:
+                    weave.detailedAsides[hit.blockIndex, default: []].append(row.userText)
+                case .decision:
+                    weave.decisionAsides.append((blocks[hit.blockIndex], row.userText))
+                case .actionItem:
+                    weave.actionAsides.append((blocks[hit.blockIndex], row.userText))
+                }
+            }
+            return weave
+        }
+    }
+
+    /// A note aside: one blockquote paragraph. The note body flattens to one
+    /// line (a multi-line note must not escape the blockquote).
+    private static func aside(_ text: String, strings: LocalizedStrings) -> String {
+        "> **\(strings.yourNote):** \(flattenToTitleLine(text))"
+    }
+
+    /// A list-adjacent aside names its anchor (the aside sits after the list,
+    /// so adjacency alone cannot associate it).
+    private static func aside(_ text: String, on quote: String, strings: LocalizedStrings) -> String {
+        "> **\(strings.yourNote)** (\(strings.wasOn) \u{201C}\(anchorQuote(quote))\u{201D}): \(flattenToTitleLine(text))"
+    }
+
+    /// Anchor quotes render flattened and bounded (a full paragraph quote
+    /// would swallow the document).
+    private static func anchorQuote(_ quote: String) -> String {
+        let flat = flattenToTitleLine(quote)
+        guard flat.count > 60 else { return flat }
+        return flat.prefix(59).trimmingCharacters(in: .whitespaces) + "…"
     }
 
     // MARK: - Localization (BCP-47 primary-subtag match)
@@ -78,6 +172,11 @@ public enum NotesRenderer {
         /// anti-hallucination pattern: an empty section is stated, not invented.
         let noneMarker: String
         let userNoneMarker: String
+        /// G17: the anchored-aside tag, the unanchored tail heading, and the
+        /// anchor-quote intro ("on" / "sobre").
+        let yourNote: String
+        let yourNotes: String
+        let wasOn: String
 
         /// G3 name-driven: `userName` empty → neutral "My action items" /
         /// "Minhas ações"; otherwise `<name>'s action items` (EN) / "Ações de
@@ -91,7 +190,10 @@ public enum NotesRenderer {
                 actionItems: "Action items",
                 userActionItems: name.isEmpty ? "My action items" : "\(name)'s action items",
                 noneMarker: "None noted.",
-                userNoneMarker: name.isEmpty ? "No action items for me." : "No action items for \(name)."
+                userNoneMarker: name.isEmpty ? "No action items for me." : "No action items for \(name).",
+                yourNote: "Your note",
+                yourNotes: "Your notes",
+                wasOn: "on"
             )
         }
 
@@ -104,7 +206,10 @@ public enum NotesRenderer {
                 actionItems: "Itens de ação",
                 userActionItems: name.isEmpty ? "Minhas ações" : "Ações de \(name)",
                 noneMarker: "Nada registrado.",
-                userNoneMarker: name.isEmpty ? "Nenhuma ação para mim." : "Nenhuma ação para \(name)."
+                userNoneMarker: name.isEmpty ? "Nenhuma ação para mim." : "Nenhuma ação para \(name).",
+                yourNote: "Sua nota",
+                yourNotes: "Suas notas",
+                wasOn: "sobre"
             )
         }
 

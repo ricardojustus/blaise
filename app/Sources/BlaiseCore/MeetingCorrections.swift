@@ -234,6 +234,34 @@ public enum CorrectionAnchoring {
     }
 }
 
+/// G17: the SNAPSHOT of the correction rows that shaped a minted notes
+/// artifact, stored on `meeting_notes.user_corrections` (nullable JSON) at
+/// every mint. The payload emits THIS snapshot, never the live
+/// `meeting_correction` rows — live rows are user-mutable (edit/delete is
+/// the undo path) and therefore not a hash-stable re-materialization source.
+public struct NotesCorrectionSnapshot: Codable, Sendable, Equatable {
+    public var kind: MeetingCorrection.Kind
+    public var section: MeetingCorrection.Section
+    public var quotedText: String
+    public var userText: String
+    public var createdAt: Date
+
+    public init(row: MeetingCorrection) {
+        self.kind = row.kind
+        self.section = row.section
+        self.quotedText = row.quotedText
+        self.userText = row.userText
+        self.createdAt = row.createdAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, section
+        case quotedText = "quoted_text"
+        case userText = "user_text"
+        case createdAt = "created_at"
+    }
+}
+
 /// The request-level value injected into notes synthesis (`NotesRequest.
 /// corrections`): the durable row minus its lifecycle bookkeeping.
 public struct NotesCorrection: Codable, Sendable, Equatable {

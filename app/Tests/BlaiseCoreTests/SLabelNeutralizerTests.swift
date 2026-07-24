@@ -344,12 +344,14 @@ enum SLabelFixture {
         ).sorted()
 
         // The forward mint seams: title rename, speaker rename, notes-correction,
-        // finalize, AND the G14 digest-only resume (build only — it does not
-        // re-render the notes markdown). Pinning the counts is load-bearing: a
-        // NEW unguarded forward flow shifts a count and fails here.
-        #expect(renderSites.count == 4, "expected 4 forward render sites, found \(renderSites.count)")
-        #expect(buildSites.count == 5, "expected 5 forward build sites, found \(buildSites.count)")
-        #expect(neutralizeSites.count == 8, "expected 8 neutralize-family calls, found \(neutralizeSites.count)")
+        // finalize, the G14 digest-only resume (build only — it does not
+        // re-render the notes markdown), AND the G17 annotation re-mint
+        // (`remintNotesArtifacts`: neutralize → render → build, verified in
+        // the pairing walk below). Pinning the counts is load-bearing: a NEW
+        // unguarded forward flow shifts a count and fails here.
+        #expect(renderSites.count == 5, "expected 5 forward render sites, found \(renderSites.count)")
+        #expect(buildSites.count == 6, "expected 6 forward build sites, found \(buildSites.count)")
+        #expect(neutralizeSites.count == 9, "expected 9 neutralize-family calls, found \(neutralizeSites.count)")
 
         // Mint-window discipline: pair the neutralize-family sites to the render
         // and build sites in line order; each render and each build must follow

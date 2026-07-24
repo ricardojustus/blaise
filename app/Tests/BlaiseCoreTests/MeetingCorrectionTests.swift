@@ -80,6 +80,188 @@ private func makeRow(
     }
 }
 
+@Suite struct CorrectionPromptTests {
+    @Test("presence gate: no corrections -> no block, byte-identical user message")
+    func presenceGate() throws {
+        #expect(NotesPromptBuilder.correctionsBlock([]) == nil)
+        let request = NotesRequest(
+            meeting: makeMeeting(), transcript: [], dominantLanguage: "en",
+            vocabulary: [], user: UserIdentity(name: "Sam", aliases: [], email: "s@x.co"))
+        var withEmpty = request
+        withEmpty.corrections = []
+        #expect(
+            NotesPromptBuilder.userMessage(for: request)
+                == NotesPromptBuilder.userMessage(for: withEmpty))
+    }
+
+    @Test("understanding corrections render authoritative numbered entries; notes render as margin context")
+    func blockShape() throws {
+        let block = try #require(NotesPromptBuilder.correctionsBlock([
+            NotesCorrection(
+                kind: .understanding, section: .detailedNotes,
+                quotedText: "committed to migrating", userText: "Evaluation only, no date."),
+            NotesCorrection(
+                kind: .annotation, section: .summary,
+                quotedText: "under evaluation", userText: "Ask Ricardo about Yeti gain."),
+        ]))
+        #expect(block.contains("USER CORRECTIONS (authoritative"))
+        #expect(block.contains("1. In the detailed notes, an earlier draft said: \"committed to migrating\". The user corrects: Evaluation only, no date."))
+        #expect(block.contains("USER NOTES"))
+        #expect(block.contains("- (on \"under evaluation\") Ask Ricardo about Yeti gain."))
+        // The block lands in the user message between metadata and transcript.
+        var request = NotesRequest(
+            meeting: makeMeeting(), transcript: [], dominantLanguage: "en",
+            vocabulary: [], user: UserIdentity(name: "Sam", aliases: [], email: "s@x.co"))
+        request.corrections = [
+            NotesCorrection(
+                kind: .understanding, section: .summary, quotedText: "q", userText: "t")
+        ]
+        let message = NotesPromptBuilder.userMessage(for: request)
+        let metadataRange = try #require(message.range(of: "MEETING:"))
+        let blockRange = try #require(message.range(of: "USER CORRECTIONS"))
+        let transcriptRange = try #require(message.range(of: "TRANSCRIPT:"))
+        #expect(metadataRange.lowerBound < blockRange.lowerBound)
+        #expect(blockRange.lowerBound < transcriptRange.lowerBound)
+    }
+}
+
+@Suite struct AnnotationRenderingTests {
+    private let structured = NotesStructured(
+        title: "Sync",
+        summary: "FluidAudio v2 is under evaluation.",
+        detailedNotes: "First paragraph here.\n\nSecond paragraph about the ceiling.",
+        decisions: ["Room mode ships behind a setting"],
+        actionItems: [ActionItem(owner: "Ricardo", text: "Evaluate FluidAudio v2")],
+        userActionItems: [])
+
+    private func annotation(
+        section: MeetingCorrection.Section, quote: String, text: String
+    ) -> MeetingCorrection {
+        MeetingCorrection(
+            meetingID: "01TESTMEETING0000000000000", kind: .annotation, section: section,
+            quotedText: quote, userText: text, createdAt: msDate())
+    }
+
+    @Test("no annotations -> byte-identical to the pre-G17 render")
+    func byteIdentityGate() throws {
+        let before = try NotesRenderer.render(
+            structured, language: "en", meetingTitle: "Sync", userName: "Sam")
+        let after = try NotesRenderer.render(
+            structured, language: "en", meetingTitle: "Sync", userName: "Sam", annotations: [])
+        #expect(before == after)
+        // An understanding row alone weaves nothing either (asides are
+        // annotation-only; corrections act through re-synthesis).
+        let understanding = MeetingCorrection(
+            meetingID: "01TESTMEETING0000000000000", kind: .understanding, section: .summary,
+            quotedText: "under evaluation", userText: "fix", createdAt: msDate())
+        let withUnderstanding = try NotesRenderer.render(
+            structured, language: "en", meetingTitle: "Sync", userName: "Sam",
+            annotations: [understanding])
+        #expect(before == withUnderstanding)
+    }
+
+    @Test("anchored notes render as asides by their block; section lists get quoted asides")
+    func anchoredAsides() throws {
+        let markdown = try NotesRenderer.render(
+            structured, language: "en", meetingTitle: "Sync", userName: "Sam",
+            annotations: [
+                annotation(section: .detailedNotes, quote: "second paragraph", text: "Check threshold too."),
+                annotation(section: .actionItem, quote: "Evaluate FluidAudio", text: "By next sprint?"),
+            ])
+        // The detailed-notes aside sits directly under its paragraph.
+        #expect(markdown.contains(
+            "Second paragraph about the ceiling.\n\n> **Your note:** Check threshold too."))
+        // The list aside names its anchor.
+        #expect(markdown.contains(
+            "> **Your note** (on \u{201C}Evaluate FluidAudio v2\u{201D}): By next sprint?"))
+        // No tail section: everything anchored.
+        #expect(!markdown.contains("## Your notes"))
+    }
+
+    @Test("unanchored notes land under the tail heading with their original quote — never dropped")
+    func unanchoredTail() throws {
+        let markdown = try NotesRenderer.render(
+            structured, language: "en", meetingTitle: "Sync", userName: "Sam",
+            annotations: [
+                annotation(
+                    section: .detailedNotes, quote: "a paragraph the re-write removed",
+                    text: "Important reminder.")
+            ])
+        #expect(markdown.contains("## Your notes"))
+        #expect(markdown.contains(
+            "- Important reminder. *(on \u{201C}a paragraph the re-write removed\u{201D})*"))
+    }
+
+    @Test("Portuguese localization for asides and tail")
+    func portuguese() throws {
+        let markdown = try NotesRenderer.render(
+            structured, language: "pt-BR", meetingTitle: "Sync", userName: "Sam",
+            annotations: [
+                annotation(section: .summary, quote: "under evaluation", text: "Confirmar com Ricardo."),
+                annotation(section: .summary, quote: "gone from notes", text: "Nota solta."),
+            ])
+        #expect(markdown.contains("> **Sua nota:** Confirmar com Ricardo."))
+        #expect(markdown.contains("## Suas notas"))
+        #expect(markdown.contains("*(sobre \u{201C}gone from notes\u{201D})*"))
+    }
+}
+
+@Suite struct CorrectionPayloadTests {
+    @Test("payload presence gate: empty snapshot -> byte-identical pre-G17 payload; snapshot emits user_corrections")
+    func presenceGatedPayload() throws {
+        let meeting = makeMeeting(status: .ready)
+        let user = UserIdentity(name: "Sam", aliases: [], email: "s@x.co")
+        let bare = makeNotes(meetingID: meeting.id)
+        let before = EvidencePayloadBuilder.build(
+            meeting: meeting, segments: [], notes: bare, user: user)
+
+        var withEmpty = bare
+        withEmpty.userCorrections = []
+        let gated = EvidencePayloadBuilder.build(
+            meeting: meeting, segments: [], notes: withEmpty, user: user)
+        #expect(gated.versionHash == before.versionHash)
+
+        var withSnapshot = bare
+        let row = MeetingCorrection(
+            meetingID: meeting.id, kind: .understanding, section: .summary,
+            quotedText: "old claim", userText: "the truth", createdAt: msDate())
+        withSnapshot.userCorrections = [NotesCorrectionSnapshot(row: row)]
+        let minted = EvidencePayloadBuilder.build(
+            meeting: meeting, segments: [], notes: withSnapshot, user: user)
+        #expect(minted.versionHash != before.versionHash)
+        let json = String(decoding: minted.bytes, as: UTF8.self)
+        #expect(json.contains("\"user_corrections\""))
+        #expect(json.contains("\"quoted_text\":\"old claim\""))
+        #expect(json.contains("\"kind\":\"understanding\""))
+    }
+
+    @Test("meeting_notes round-trips the snapshot; empty stores NULL (legacy rows decode empty)")
+    func snapshotColumnRoundTrip() async throws {
+        let db = try makeDatabase()
+        let meeting = makeMeeting()
+        try await MeetingRepository(database: db).create(meeting)
+        var notes = makeNotes(meetingID: meeting.id)
+        let row = MeetingCorrection(
+            meetingID: meeting.id, kind: .annotation, section: .decision,
+            quotedText: "ships behind a setting", userText: "Default ON for me.",
+            createdAt: msDate())
+        notes.userCorrections = [NotesCorrectionSnapshot(row: row)]
+        try await NotesRepository(database: db).upsert(notes)
+        let fetched = try await NotesRepository(database: db).fetch(meetingID: meeting.id)
+        #expect(fetched?.userCorrections.count == 1)
+        #expect(fetched?.userCorrections.first?.quotedText == "ships behind a setting")
+
+        notes.userCorrections = []
+        try await NotesRepository(database: db).upsert(notes)
+        let cleared = try await db.pool.read { conn in
+            try String.fetchOne(
+                conn, sql: "SELECT user_corrections FROM meeting_notes WHERE meeting_id = ?",
+                arguments: [meeting.id])
+        }
+        #expect(cleared == nil)
+    }
+}
+
 @Suite struct CorrectionAnchoringTests {
     private let structured = NotesStructured(
         title: "Sync",
