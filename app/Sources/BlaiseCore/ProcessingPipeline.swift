@@ -956,7 +956,28 @@ public actor ProcessingPipeline {
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: edited, labelMap: labelMap, language: notes.language).notes
             // G17: re-weave annotations + refresh the payload snapshot.
-            let correctionRows = await self.correctionRows(meetingID: meetingID)
+            // FIX M: the name correction applies to the ANCHORS too. A note
+            // hung on "Caco fechou o contrato" is about that sentence, not
+            // about the spelling of the name in it — leaving the quote behind
+            // orphans the note into "Your notes" on a fix the user made one
+            // click earlier. Every fold-equal mention in the quote is rewritten
+            // (the `memoryDigest` precedent above); a quote that then no longer
+            // matches the prose — the position-scoped case, where only one of
+            // several mentions moved — is caught honestly by the re-anchor pass
+            // below.
+            var correctionRows: [MeetingCorrection] = []
+            var quoteRewrites: [String: String] = [:]
+            for var row in await self.correctionRows(meetingID: meetingID) {
+                if row.kind == .annotation {
+                    let rewritten = NameSubstitution.applyTextCorrection(
+                        text: row.quotedText, original: original, replacement: clean).text
+                    if rewritten != row.quotedText {
+                        row.quotedText = rewritten
+                        quoteRewrites[row.id] = rewritten
+                    }
+                }
+                correctionRows.append(row)
+            }
             notes.userCorrections = correctionRows.map(NotesCorrectionSnapshot.init(row:))
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: meeting.title,
@@ -989,8 +1010,12 @@ public actor ProcessingPipeline {
             let reanchorUpdates = CorrectionAnchoring.reanchor(
                 annotations: correctionRows, against: notes.structured)
             let rootURL = self.database.rootURL
-            try await self.database.pool.write { [notes] db in
+            try await self.database.pool.write { [notes, quoteRewrites] db in
                 try notes.upsert(db)
+                // FIX M before FIX F's re-anchor: the rewritten quotes are what
+                // the re-anchor result was computed against, so both land in
+                // one transaction with the mint they describe.
+                try MeetingCorrectionStore.applyQuoteRewrites(db, rewrites: quoteRewrites)
                 try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
                 _ = try HandoffRepository.enqueue(
                     db, rootURL: rootURL, meetingID: meetingID,

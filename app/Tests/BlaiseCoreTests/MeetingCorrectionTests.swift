@@ -516,13 +516,19 @@ private func makeRow(
     }
 }
 
-/// The live status of one row, straight from the store.
+/// One row, straight from the store.
+private func liveRow(
+    _ database: BlaiseDatabase, _ meetingID: MeetingID, _ id: String
+) async throws -> MeetingCorrection? {
+    try await database.pool.read { db in
+        try MeetingCorrectionStore.all(db, meetingID: meetingID).first { $0.id == id }
+    }
+}
+
 private func liveStatus(
     _ database: BlaiseDatabase, _ meetingID: MeetingID, _ id: String
 ) async throws -> MeetingCorrection.Status? {
-    try await database.pool.read { db in
-        try MeetingCorrectionStore.all(db, meetingID: meetingID).first { $0.id == id }?.status
-    }
+    try await liveRow(database, meetingID, id)?.status
 }
 
 // FIX I: the G17 rewrite refuses to touch the transcript (AC1), but a rewrite
@@ -613,8 +619,8 @@ private func liveStatus(
 // or dissolved an anchor leaves a wrong status/occurrence behind until the
 // next synthesis, and the management popover disagrees with the pane.
 @Suite struct CorrectionRemintReanchorTests {
-    @Test("a name correction over the anchored prose flips the live annotation row to stale")
-    func correctNameInNotesReanchorsLiveRows() async throws {
+    @Test("FIX M: a name correction rewrites the anchor quote, so the note stays attached")
+    func correctNameInNotesCarriesTheAnchorQuote() async throws {
         let harness = try await makePipelineHarness()
         harness.notesPrimary.state.withLock { $0.summary = "Caco fechou o contrato" }
         let meeting = try await harness.importTestMeeting()
@@ -627,16 +633,52 @@ private func liveStatus(
             quotedText: "Caco fechou o contrato", occurrence: 0,
             userText: "Valor do contrato ainda pendente.")
         #expect(!added.remintRefused, "a ready meeting re-mints on the spot")
-        let row = added.row
-        #expect(try await liveStatus(harness.database, meeting.id, row.id) == .applied)
+        #expect(try await liveStatus(harness.database, meeting.id, added.row.id) == .applied)
 
-        // The correction rewrites the very prose the note quotes.
-        let count = try await harness.pipeline.correctNameInNotes(
-            meetingID: meeting.id, original: "Caco", replacement: "Sammy",
-            allOccurrences: false)
-        #expect(count == 1)
-        // Pre-FIX F this stayed `applied` — a note pointing at text that no
-        // longer exists, with no stale badge and no way to re-pin it.
-        #expect(try await liveStatus(harness.database, meeting.id, row.id) == .stale)
+        #expect(
+            try await harness.pipeline.correctNameInNotes(
+                meetingID: meeting.id, original: "Caco", replacement: "Sammy",
+                allOccurrences: false) == 1)
+
+        // The quote followed the correction, so the note is still attached —
+        // it did NOT fall into "Your notes" over a spelling fix the user made
+        // one click earlier.
+        let stored = try #require(try await liveRow(harness.database, meeting.id, added.row.id))
+        #expect(stored.quotedText == "Sammy fechou o contrato")
+        #expect(stored.status == .applied)
+        let notes = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+        // The mock meeting synthesizes in Portuguese.
+        #expect(notes.markdown.contains("> **Sua nota:** Valor do contrato ainda pendente."))
+        #expect(!notes.markdown.contains("## Suas notas"), "no orphan tail")
+    }
+
+    @Test("a position-scoped correction that strands the quote still flips the live row to stale")
+    func correctNameInNotesReanchorsLiveRows() async throws {
+        let harness = try await makePipelineHarness()
+        // TWO mentions; the user fixes only the first (position-scoped).
+        harness.notesPrimary.state.withLock {
+            $0.summary = "Caco fechou o contrato. Caco assinou hoje."
+        }
+        let meeting = try await harness.importTestMeeting()
+        try await harness.pipeline.process(meetingID: meeting.id)
+
+        let added = try await harness.pipeline.addCorrection(
+            meetingID: meeting.id, kind: .annotation, section: .summary,
+            quotedText: "Caco fechou o contrato. Caco assinou hoje.", occurrence: 0,
+            userText: "Valor do contrato ainda pendente.")
+        #expect(try await liveStatus(harness.database, meeting.id, added.row.id) == .applied)
+
+        #expect(
+            try await harness.pipeline.correctNameInNotes(
+                meetingID: meeting.id, original: "Caco", replacement: "Sammy",
+                allOccurrences: false) == 1)
+
+        // FIX M rewrote BOTH mentions in the quote (the memoryDigest rule)
+        // while the prose kept its second "Caco", so the anchor genuinely no
+        // longer matches. Pre-FIX F the row stayed `applied` — a note pointing
+        // at text that does not exist, with no stale badge and no way to
+        // re-pin it.
+        #expect(try await liveStatus(harness.database, meeting.id, added.row.id) == .stale)
     }
 }

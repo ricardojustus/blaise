@@ -135,6 +135,18 @@ public enum MeetingCorrectionStore {
             arguments: StatementArguments([now] + ids))
     }
 
+    /// FIX M: rewrites anchor quotes in place, keyed by row id. A
+    /// deterministic name correction applies to the ANCHORS as well as the
+    /// prose — a note hung on a sentence is about the sentence, not its
+    /// spelling. Sorted for a deterministic statement order.
+    public static func applyQuoteRewrites(_ db: Database, rewrites: [String: String]) throws {
+        for (id, quote) in rewrites.sorted(by: { $0.key < $1.key }) {
+            try db.execute(
+                sql: "UPDATE meeting_correction SET quoted_text = ? WHERE id = ?",
+                arguments: [quote, id])
+        }
+    }
+
     /// Applies a re-anchoring pass result (annotation rows only).
     public static func applyReanchor(
         _ db: Database, updates: [CorrectionAnchoring.Update]
