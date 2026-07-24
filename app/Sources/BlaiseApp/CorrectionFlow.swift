@@ -180,7 +180,8 @@ struct CorrectionPopover: View {
     }
 }
 
-/// "Add a note": free, instant, ships now.
+/// "Add a note": free — no engine call. It ships with the re-mint the save
+/// triggers, or with the next content run when that re-mint cannot happen.
 struct AddNotePopover: View {
     var target: CorrectionTarget
     var onCancel: () -> Void
@@ -226,9 +227,9 @@ struct AddNotePopover: View {
     }
 }
 
-/// The provenance-line management popover: every correction/note row with
-/// its status, edit-free v1 management (delete = undo), and a re-write
-/// trigger when pending understanding rows exist.
+/// The provenance-line management popover (G17 §UX-3): every correction/note
+/// row with its status, inline edit of the row's text, delete (which IS the
+/// undo), and a re-write trigger when pending understanding rows exist.
 struct CorrectionsListView: View {
     var rows: [MeetingCorrection]
     var busy: Bool

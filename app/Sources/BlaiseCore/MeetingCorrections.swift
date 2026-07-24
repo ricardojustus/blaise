@@ -20,7 +20,7 @@ public struct MeetingCorrection: Codable, Sendable, Equatable, FetchableRecord, 
 
     /// Which notes section the quote was taken from. Matches the
     /// `NotesStructured` field the block came from.
-    public enum Section: String, Codable, Sendable, CaseIterable {
+    public enum Section: String, Codable, Sendable {
         case summary
         case detailedNotes = "detailed_notes"
         case decision
@@ -103,8 +103,9 @@ public enum MeetingCorrectionStore {
     }
 
     /// Edit of an existing row (correction management, note pinning). The
-    /// row returns to `pending` for understanding corrections (the edit is
-    /// not yet reflected in notes); annotations pass their status explicitly.
+    /// status is the caller's decision — `ProcessingPipeline.updateCorrection`
+    /// returns understanding rows to `pending` (the edit is not yet reflected
+    /// in the notes) and leaves an annotation's status alone.
     public static func update(
         _ db: Database, id: String,
         quotedText: String, occurrence: Int, userText: String, status: MeetingCorrection.Status
@@ -190,8 +191,8 @@ public struct CorrectionWriteResult: Sendable, Equatable {
 /// A leading `#` is deliberately NOT stripped: inline after our
 /// "**Your note:** " prefix it is inert, and stripping it would silently eat
 /// the body of a note that is legitimately just "### TODO".
-public enum CorrectionSanitize {
-    public static func flatten(_ raw: String) -> String {
+enum CorrectionSanitize {
+    static func flatten(_ raw: String) -> String {
         raw
             .replacingOccurrences(of: "\r\n", with: " ")
             .components(separatedBy: .newlines)

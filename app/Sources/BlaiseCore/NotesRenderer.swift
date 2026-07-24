@@ -30,11 +30,13 @@ public enum NotesRenderer {
     /// - Throws: `EngineError.invalidStructuredNotes` if `summary` is
     ///   empty/whitespace (refusal, not rendering — anti-hallucination).
     ///
-    /// G17 `annotations`: the meeting's user margin notes, woven in
-    /// deterministically — an anchored note renders as a blockquote aside by
-    /// its matched block; an unanchored note lands under a final "Your notes"
-    /// heading with its original anchor quote (never silently dropped). HARD
-    /// presence gate: no annotation rows → byte-identical pre-G17 output.
+    /// G17 `annotations`: the meeting's correction rows. Only `.annotation`
+    /// rows weave (callers pass the whole set; understanding corrections act
+    /// through re-synthesis and render nothing). An anchored note becomes a
+    /// blockquote aside by its matched block; an unanchored one lands under a
+    /// final "Your notes" heading with its original anchor quote, never
+    /// silently dropped. HARD presence gate: no annotation rows →
+    /// byte-identical pre-G17 output.
     public static func render(
         _ s: NotesStructured, language: String, meetingTitle: String, userName: String = "",
         annotations: [MeetingCorrection] = []
