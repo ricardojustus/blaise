@@ -842,6 +842,33 @@ private struct NotesPane: View {
         }
     }
 
+    /// PIN PICKER (§AC4): re-anchor a stale note onto the block the user
+    /// picked. The block's CURRENT text becomes the quote (that is what the
+    /// note is now about) with the FIX E occurrence, so a paragraph repeated
+    /// verbatim still anchors distinctly. `updateCorrection` re-mints for
+    /// annotations, so notes.md + the payload follow without a second call.
+    private func pinNote(_ row: MeetingCorrection, toBlockAt index: Int, in blocks: [String]) {
+        // The menu is disabled while a run/rewrite is in flight (FIX C's
+        // discipline); a queued interaction could still land here.
+        guard correctionsEnabled, blocks.indices.contains(index) else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        let quote = blocks[index]
+        let occurrence = matchOccurrence(index, in: blocks)
+        Task {
+            do {
+                try await pipeline.updateCorrection(
+                    meetingID: meetingID, id: row.id, quotedText: quote,
+                    occurrence: occurrence, userText: row.userText)
+                uiState.lastActionError = nil
+            } catch {
+                uiState.lastActionError = "Could not pin the note: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
     private func rewriteNow() {
         // FIX C: never launch a second rewrite over an in-flight one.
         guard !correctionBusy else { return }
@@ -1149,7 +1176,19 @@ private struct NotesPane: View {
             NoteSection(title: portuguese ? "Suas notas" : "Your notes", kind: .detailed) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(unanchored, id: \.id) { note in
-                        AnnotationAside(note: note, showQuote: true, stale: true, portuguese: portuguese)
+                        // PIN PICKER: the note's own section supplies the
+                        // targets. Blank blocks are dropped — they can never
+                        // fold-match a non-empty quote, so they are unpinnable
+                        // AND their absence cannot shift the occurrence
+                        // computed here (the FIX E argument).
+                        let targets = CorrectionAnchoring
+                            .blocks(of: structured, section: note.section)
+                            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                        AnnotationAside(
+                            note: note, showQuote: true, stale: true,
+                            pinBlocks: targets, pinDisabled: !correctionsEnabled,
+                            onPin: { pinNote(note, toBlockAt: $0, in: targets) },
+                            portuguese: portuguese)
                     }
                 }
             }
@@ -1172,6 +1211,12 @@ private struct AnnotationAside: View {
     /// The note no longer resolves to a block: a red "lost its paragraph"
     /// badge, the same language as the management popover's stale status.
     var stale = false
+    /// PIN PICKER (§AC4): the blocks of the note's section offered as new
+    /// anchors, with `onPin` taking the chosen index. Empty (the default) =
+    /// no picker — every non-stale placement is already where it belongs.
+    var pinBlocks: [String] = []
+    var pinDisabled = false
+    var onPin: ((Int) -> Void)?
     var portuguese: Bool
 
     var body: some View {
@@ -1196,6 +1241,23 @@ private struct AnnotationAside: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.red)
                 }
+                // PIN PICKER (§AC4): the way BACK from stale. A re-synthesis
+                // can rewrite the paragraph a note was hung on; without this
+                // the note is stranded in the tail forever (nothing else in
+                // the app calls `updateCorrection`). Deliberately a plain
+                // menu of the section's paragraphs — no drag, no re-anchor
+                // guessing.
+                if stale, !pinBlocks.isEmpty, let onPin {
+                    Menu(portuguese ? "Fixar em um parágrafo…" : "Pin next to a paragraph…") {
+                        ForEach(Array(pinBlocks.enumerated()), id: \.offset) { index, block in
+                            Button(Self.blockTitle(block)) { onPin(index) }
+                        }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .font(.system(size: 11))
+                    .fixedSize()
+                    .disabled(pinDisabled)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -1208,6 +1270,16 @@ private struct AnnotationAside: View {
                 .strokeBorder(Color.yellow.opacity(0.28), lineWidth: 1))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(portuguese ? "Sua nota" : "Your note"): \(note.userText)")
+    }
+
+    /// A pin-menu entry: one calm line. A paragraph's opening is enough to
+    /// recognize it — the full text is right there in the pane above.
+    private static func blockTitle(_ text: String) -> String {
+        let flat = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return flat.count > 60 ? flat.prefix(59) + "…" : flat
     }
 }
 
