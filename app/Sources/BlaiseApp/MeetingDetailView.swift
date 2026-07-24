@@ -298,6 +298,14 @@ private struct NotesPane: View {
     var searchTerms: [String] = []
     /// Monotonic request token so repeated clicks on the same result re-scroll.
     var searchRequest = 0
+
+    // G17: correction/note flow state. `correctionRows` mirrors the durable
+    // table (loaded on appear, refreshed after every mutation);
+    // `correctionBusy` is the in-flight rewrite indicator.
+    @State private var correctionTarget: CorrectionTarget?
+    @State private var correctionRows: [MeetingCorrection] = []
+    @State private var showCorrectionsList = false
+    @State private var correctionBusy = false
     var userActionBoxRequest = 0
     /// Fluido: the header's one-shot settle entrance (armed per selection).
     @Binding var heroArmed: Bool
@@ -416,6 +424,31 @@ private struct NotesPane: View {
                     .changeEffect(
                         .shine(duration: 1.1), value: shineTick,
                         isEnabled: Design.direction == .fluido && !reduceMotion)
+                    // G17: one popover for both actions, anchored to the notes
+                    // column; the target carries the section + block text.
+                    .popover(item: $correctionTarget) { target in
+                        if target.action == .correct {
+                            CorrectionPopover(
+                                target: target,
+                                onCancel: { correctionTarget = nil },
+                                onSave: { submission in
+                                    correctionTarget = nil
+                                    submitCorrection(submission)
+                                })
+                        } else {
+                            AddNotePopover(
+                                target: target,
+                                onCancel: { correctionTarget = nil },
+                                onSave: { text in
+                                    correctionTarget = nil
+                                    submitNote(target: target, text: text)
+                                })
+                        }
+                    }
+                    .task(id: meeting.id) { await loadCorrections() }
+                    .onChange(of: notes.generatedAt) { _, _ in
+                        Task { await loadCorrections() }
+                    }
                 } else if meeting.status == .processing || meeting.status == .recording {
                     Text("Notes will appear here when processing finishes.")
                         .foregroundStyle(.secondary)
@@ -589,8 +622,35 @@ private struct NotesPane: View {
                         .frame(width: 360)
                 }
             }
+            // G17: corrections + notes counted SEPARATELY (UX review #6) —
+            // one chip opens the management popover (delete = undo).
+            if correctionsEnabled, !correctionRows.isEmpty || correctionBusy {
+                Button {
+                    showCorrectionsList.toggle()
+                } label: {
+                    Label(correctionChipTitle, systemImage: correctionBusy ? "arrow.clockwise" : "pencil.and.list.clipboard")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+                .popover(isPresented: $showCorrectionsList) {
+                    CorrectionsListView(
+                        rows: correctionRows, busy: correctionBusy,
+                        onDelete: { deleteCorrectionRow($0) },
+                        onRewrite: { rewriteNow() })
+                }
+            }
         }
         .transientScrollIndicators()
+    }
+
+    private var correctionChipTitle: String {
+        if correctionBusy { return "Re-writing notes…" }
+        let corrections = correctionRows.filter { $0.kind == .understanding }.count
+        let notesCount = correctionRows.count - corrections
+        var parts: [String] = []
+        if corrections > 0 { parts.append("\(corrections) correction\(corrections == 1 ? "" : "s")") }
+        if notesCount > 0 { parts.append("\(notesCount) note\(notesCount == 1 ? "" : "s")") }
+        return parts.joined(separator: " · ")
     }
 
     private var timeAndDuration: String {
@@ -600,6 +660,111 @@ private struct NotesPane: View {
             line += " · \(max(1, Int(ended.timeIntervalSince(meeting.startedAt) / 60))) min"
         }
         return line
+    }
+
+    // MARK: - G17 correction/note actions
+
+    /// Corrections require final notes on a ready meeting (the same gate as
+    /// the correct-name flow).
+    private var correctionsEnabled: Bool {
+        notes != nil && meeting.status == .ready
+    }
+
+    private func loadCorrections() async {
+        let database = appEnv.database
+        let meetingID = meeting.id
+        let rows: [MeetingCorrection] =
+            (try? await database.pool.read { db in
+                try MeetingCorrectionStore.all(db, meetingID: meetingID)
+            }) ?? []
+        correctionRows = rows
+    }
+
+    /// Understanding correction: the row is durable first; then the default
+    /// notes-only rewrite (or the escape-hatch full regenerate) runs. The
+    /// rewrite awaits completion so the busy chip is honest.
+    private func submitCorrection(_ submission: CorrectionSubmission) {
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        correctionBusy = true
+        Task {
+            defer { correctionBusy = false }
+            do {
+                _ = try await pipeline.addCorrection(
+                    meetingID: meetingID, kind: .understanding,
+                    section: submission.section, quotedText: submission.quotedText,
+                    occurrence: 0, userText: submission.userText)
+                await loadCorrections()
+                if submission.fullReprocess {
+                    // The escape hatch is today's full Regenerate — the queue
+                    // path (origin .user) with all its guards; corrections
+                    // ride along at request build.
+                    _ = await appEnv.processingQueue.enqueue(meetingID, origin: .user)
+                } else {
+                    _ = try await pipeline.rewriteNotes(meetingID: meetingID)
+                }
+                uiState.lastActionError = nil
+            } catch {
+                uiState.lastActionError =
+                    "Could not apply the correction: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// Margin note: deterministic, instant, no engine call.
+    private func submitNote(target: CorrectionTarget, text: String) {
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        Task {
+            do {
+                _ = try await pipeline.addCorrection(
+                    meetingID: meetingID, kind: .annotation,
+                    section: target.section, quotedText: target.blockText,
+                    occurrence: 0, userText: text)
+                uiState.lastActionError = nil
+            } catch {
+                uiState.lastActionError = "Could not add the note: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// Deletion is the undo (G17 §UX-3).
+    private func deleteCorrectionRow(_ row: MeetingCorrection) {
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        Task {
+            do {
+                try await pipeline.deleteCorrection(meetingID: meetingID, id: row.id)
+                uiState.lastActionError = nil
+            } catch {
+                uiState.lastActionError =
+                    "Could not delete the correction: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    private func rewriteNow() {
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        correctionBusy = true
+        Task {
+            defer { correctionBusy = false }
+            do {
+                _ = try await pipeline.rewriteNotes(meetingID: meetingID)
+                uiState.lastActionError = nil
+            } catch {
+                uiState.lastActionError =
+                    "Could not re-write the notes: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
     }
 
     /// Marks/unmarks one user item done (`action_item_state`, local-only).
@@ -685,7 +850,9 @@ private struct NotesPane: View {
         NoteSection(title: portuguese ? "Resumo" : "Summary", kind: .summary) {
             MarkdownBlocksView(
                 markdown: structured.summary, searchTerms: searchTerms,
-                anchorPrefix: "notes-summary")
+                anchorPrefix: "notes-summary",
+                correctionSection: correctionsEnabled ? .summary : nil,
+                onCorrectionAction: { correctionTarget = $0 })
         }
 
         // Drop blank user action items (empty text) before the box renders.
@@ -763,16 +930,22 @@ private struct NotesPane: View {
             NoteSection(title: portuguese ? "Decisões" : "Decisions", kind: .decisions) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(structured.decisions.enumerated()), id: \.offset) { index, decision in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "checkmark.seal.fill")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Design.support)
-                                .accessibilityHidden(true)
-                            SearchHighlightedText(
-                                source: AttributedString(decision), terms: searchTerms)
-                                .font(Design.readingFont(14))
-                                .lineSpacing(Design.readingLineSpacing - 2)
-                                .textSelection(.enabled)
+                        CorrectableBlock(
+                            section: .decision, blockText: decision,
+                            enabled: correctionsEnabled,
+                            onAction: { correctionTarget = $0 }
+                        ) {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Design.support)
+                                    .accessibilityHidden(true)
+                                SearchHighlightedText(
+                                    source: AttributedString(decision), terms: searchTerms)
+                                    .font(Design.readingFont(14))
+                                    .lineSpacing(Design.readingLineSpacing - 2)
+                                    .textSelection(.enabled)
+                            }
                         }
                         .id("notes-decision-\(index)")
                     }
@@ -789,16 +962,22 @@ private struct NotesPane: View {
             NoteSection(title: portuguese ? "Itens de Ação" : "Action Items", kind: .actions) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(actionItems.enumerated()), id: \.offset) { index, item in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text("•").foregroundStyle(Design.support)
-                            SearchHighlightedText(
-                                source: AttributedString(
-                                    item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                        ? item.text : "\(item.owner): \(item.text)"),
-                                terms: searchTerms)
-                            .font(Design.readingFont(14))
+                        CorrectableBlock(
+                            section: .actionItem, blockText: item.text,
+                            enabled: correctionsEnabled,
+                            onAction: { correctionTarget = $0 }
+                        ) {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text("•").foregroundStyle(Design.support)
+                                SearchHighlightedText(
+                                    source: AttributedString(
+                                        item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                            ? item.text : "\(item.owner): \(item.text)"),
+                                    terms: searchTerms)
+                                .font(Design.readingFont(14))
+                            }
+                            .textSelection(.enabled)
                         }
-                        .textSelection(.enabled)
                         .id("notes-action-\(index)")
                     }
                 }
@@ -810,7 +989,9 @@ private struct NotesPane: View {
             NoteSection(title: portuguese ? "Notas Detalhadas" : "Detailed Notes", kind: .detailed) {
                 MarkdownBlocksView(
                     markdown: detailed, searchTerms: searchTerms,
-                    anchorPrefix: "notes-detailed")
+                    anchorPrefix: "notes-detailed",
+                    correctionSection: correctionsEnabled ? .detailedNotes : nil,
+                    onCorrectionAction: { correctionTarget = $0 })
             }
         }
     }
@@ -1045,6 +1226,12 @@ struct MarkdownBlocksView: View {
     let markdown: String
     var searchTerms: [String] = []
     var anchorPrefix: String?
+    /// G17: when set, each block gets the hover/right-click correction
+    /// affordance anchored with this section + the block's plain text. The
+    /// anchoring fold strips markdown tokens, so plain rendered text matches
+    /// the styled structured source.
+    var correctionSection: MeetingCorrection.Section?
+    var onCorrectionAction: ((CorrectionTarget) -> Void)?
 
     var body: some View {
         let blocks = MarkdownBlocks.parse(markdown)
@@ -1058,8 +1245,24 @@ struct MarkdownBlocksView: View {
     @ViewBuilder
     private func anchoredBlock(_ block: MarkdownBlock) -> some View {
         if let anchorPrefix {
-            blockView(block)
+            correctableBlock(block)
                 .id("\(anchorPrefix)-\(block.id)")
+        } else {
+            correctableBlock(block)
+        }
+    }
+
+    @ViewBuilder
+    private func correctableBlock(_ block: MarkdownBlock) -> some View {
+        if let correctionSection, let onCorrectionAction {
+            CorrectableBlock(
+                section: correctionSection,
+                blockText: String(block.text.characters),
+                enabled: true,
+                onAction: onCorrectionAction
+            ) {
+                blockView(block)
+            }
         } else {
             blockView(block)
         }

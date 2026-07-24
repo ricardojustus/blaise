@@ -162,15 +162,23 @@ public enum CorrectionAnchoring {
         }
     }
 
-    /// Case- and whitespace-insensitive fold. Deliberately NOT the
-    /// name-store's `canonicalMode` (which strips by word semantics): a quote
-    /// is prose, and prose matching only needs case + whitespace tolerance.
+    /// Case-, whitespace- and markdown-token-insensitive fold. The UI quotes
+    /// PLAIN rendered text (AttributedString markdown parsing strips `**`/`_`
+    /// etc.) while the structured source carries raw markdown — stripping
+    /// inline tokens on BOTH sides lets a plain quote match styled source.
+    /// Deliberately NOT the name-store's `canonicalMode` (word semantics):
+    /// prose matching needs only case + whitespace + syntax tolerance.
     public static func fold(_ s: String) -> String {
-        s.lowercased()
+        let stripped = String(s.unicodeScalars.filter { !Self.markdownTokens.contains($0) })
+        return stripped.lowercased()
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
     }
+
+    /// Inline markdown syntax scalars ignored by the fold (emphasis, code,
+    /// links, headings, blockquotes).
+    private static let markdownTokens = Set("*_`~[]()>#".unicodeScalars)
 
     /// The anchorable blocks of each section, in render order. Detailed notes
     /// split on blank lines (the same paragraph granularity the UI presents);
