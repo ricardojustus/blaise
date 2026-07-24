@@ -701,10 +701,14 @@ private struct NotesPane: View {
                     // path (origin .user) with all its guards; corrections
                     // ride along at request build.
                     _ = await appEnv.processingQueue.enqueue(meetingID, origin: .user)
+                    uiState.lastActionError = nil
                 } else {
-                    _ = try await pipeline.rewriteNotes(meetingID: meetingID)
+                    let record = try await pipeline.rewriteNotes(meetingID: meetingID)
+                    // A parked or refused rewrite is NOT silent (the demo-run
+                    // finding): the correction is saved either way, but the
+                    // user must know the notes didn't change yet.
+                    uiState.lastActionError = Self.rewriteFeedback(record)
                 }
-                uiState.lastActionError = nil
             } catch {
                 uiState.lastActionError =
                     "Could not apply the correction: \(error.localizedDescription)"
@@ -757,14 +761,28 @@ private struct NotesPane: View {
         Task {
             defer { correctionBusy = false }
             do {
-                _ = try await pipeline.rewriteNotes(meetingID: meetingID)
-                uiState.lastActionError = nil
+                let record = try await pipeline.rewriteNotes(meetingID: meetingID)
+                uiState.lastActionError = Self.rewriteFeedback(record)
             } catch {
                 uiState.lastActionError =
                     "Could not re-write the notes: \(error.localizedDescription)"
             }
             await loadCorrections()
         }
+    }
+
+    /// The honest post-rewrite banner: nil on success; explicit copy when the
+    /// rewrite was parked (notes-pending, e.g. no engine configured) or
+    /// refused (meeting not ready). The correction row is durable in both
+    /// cases and rides the next successful run.
+    static func rewriteFeedback(_ record: PipelineRunRecord?) -> String? {
+        guard let record else {
+            return "Correction saved — but the notes could not be re-written now (the meeting is not ready). It applies on the next Regenerate."
+        }
+        if let pending = record.notesPending {
+            return "Correction saved. The re-write is waiting on the notes engine (\(pending)) and will run automatically — or use \u{201C}Re-write notes now\u{201D} once the engine is available."
+        }
+        return nil
     }
 
     /// Marks/unmarks one user item done (`action_item_state`, local-only).

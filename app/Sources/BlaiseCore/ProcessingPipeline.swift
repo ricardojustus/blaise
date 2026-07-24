@@ -1086,7 +1086,8 @@ public actor ProcessingPipeline {
         reportGlossaryLoad(userLoad, meetingID: meetingID)
         return try await notesOnlyStages(
             meeting: meeting, segments: segments, dominantLanguage: dominantLanguage,
-            asrProvenance: asrProvenance, context: context, vocabulary: userLoad.vocabulary)
+            asrProvenance: asrProvenance, context: context, vocabulary: userLoad.vocabulary,
+            applyNameProposals: false)
     }
 
     /// G17: the deterministic notes re-mint (render with current annotations
@@ -1176,6 +1177,12 @@ public actor ProcessingPipeline {
         /// had persisted notes before this run, `.generation` for a meeting's
         /// first-ever notes produced via the pending path.
         var notesPurpose: CloudSpendPurpose?
+        /// G17 (review #2): the understanding rows the request ACTUALLY
+        /// carried — id + content, captured at request build. Post-finalize
+        /// bookkeeping flips a row to `applied` only when its CURRENT content
+        /// still equals the captured content: a row inserted OR edited while
+        /// the model ran stays `pending` for the next run.
+        var consumedCorrections: [(id: String, quoted: String, text: String)] = []
         /// G14: an explicit cloud-spend purpose for this run's digest call.
         /// nil = `.digest` (the default for a first-time generation). The
         /// digest-only resume / regeneration sets `.regeneration`.
@@ -1382,6 +1389,10 @@ public actor ProcessingPipeline {
         // ceiling/budget/config conditions arrive as THROWN triggers so the
         // one-hop fallback can fire (lightweight engines only — D17; a
         // heavyweight-only fallback resolves to notes-pending instead).
+        let correctionRowsForRequest = await correctionRows(meetingID: meetingID)
+        context.consumedCorrections = correctionRowsForRequest
+            .filter { $0.kind == .understanding && $0.status == .pending }
+            .map { ($0.id, $0.quotedText, $0.userText) }
         let notesRequest = NotesRequest(
             meeting: meeting,
             transcript: segments,
@@ -1395,8 +1406,7 @@ public actor ProcessingPipeline {
                 vocabulary: vocabulary, attendees: meeting.attendees, segments: segments),
             // G17: EVERY synthesis path injects the meeting's durable
             // correction rows — a full Regenerate can never erase user truth.
-            corrections: await correctionRows(meetingID: meetingID)
-                .map(NotesCorrection.init(row:)))
+            corrections: correctionRowsForRequest.map(NotesCorrection.init(row:)))
         let notesOutcome = try await stage(.notes, context, meetingID) {
             try await self.generateNotesWithFallback(notesRequest, context: context)
         }
@@ -2675,19 +2685,25 @@ public actor ProcessingPipeline {
             context.record.payloadPath = relativePath
         }
 
-        // G17 post-finalize bookkeeping: consumed understanding rows flip to
-        // `applied`; annotations re-anchor against the persisted notes
-        // (matched → applied + occurrence refresh, orphaned → stale). Runs on
-        // every path that mints notes. Failure-soft and idempotent: a crash
-        // between finalize and this write leaves rows `pending`, and the next
-        // synthesis run simply consumes them again.
+        // G17 post-finalize bookkeeping: EXACTLY the understanding rows the
+        // request carried flip to `applied` (review #2: a row inserted or
+        // edited while the model ran stays `pending` for the next run);
+        // annotations re-anchor against the persisted notes (matched →
+        // applied + occurrence refresh, orphaned → stale). Runs on every path
+        // that mints notes. Failure-soft and idempotent: a crash between
+        // finalize and this write leaves rows `pending`, and the next
+        // synthesis run simply consumes them again (corrections are
+        // idempotent instructions; `applied` is bookkeeping, not correctness).
+        let consumed = context.consumedCorrections
         try? await database.pool.write { db in
             let rows = try MeetingCorrectionStore.all(db, meetingID: meetingID)
             guard !rows.isEmpty else { return }
-            try MeetingCorrectionStore.markApplied(
-                db,
-                ids: rows.filter { $0.kind == .understanding && $0.status == .pending }.map(\.id),
-                at: self.now())
+            let appliedIDs = rows.filter { row in
+                consumed.contains {
+                    $0.id == row.id && $0.quoted == row.quotedText && $0.text == row.userText
+                }
+            }.map(\.id)
+            try MeetingCorrectionStore.markApplied(db, ids: appliedIDs, at: self.now())
             guard let structured = try MeetingNotes.fetchOne(db, key: meetingID)?.structured
             else { return }
             try MeetingCorrectionStore.applyReanchor(
@@ -2861,12 +2877,21 @@ public actor ProcessingPipeline {
             asrProvenance: asrProvenance, context: context, vocabulary: vocabulary)
     }
 
+    /// `applyNameProposals`: the D17 pending-resume applies the response's
+    /// speaker-name proposals to the persisted transcript (that run never had
+    /// them). The G17 user rewrite passes FALSE — a notes rewrite must leave
+    /// the transcript byte-identical (spec AC1; review #3).
     private func notesOnlyStages(
         meeting: Meeting, segments: [TranscriptSegment], dominantLanguage: String,
-        asrProvenance: ASRProvenance, context: RunContext, vocabulary: PipelineVocabulary
+        asrProvenance: ASRProvenance, context: RunContext, vocabulary: PipelineVocabulary,
+        applyNameProposals: Bool = true
     ) async throws -> PipelineRunRecord {
         let meetingID = meeting.id
         let user = await userIdentity()
+        let correctionRowsForRequest = await correctionRows(meetingID: meetingID)
+        context.consumedCorrections = correctionRowsForRequest
+            .filter { $0.kind == .understanding && $0.status == .pending }
+            .map { ($0.id, $0.quotedText, $0.userText) }
         // Same prompt inputs as the pending run's stage 9: the persisted
         // segments ARE that run's stage-9 transcript (a pending run applies
         // no LLM names — there were no proposals), and the prompt reads only
@@ -2886,8 +2911,7 @@ public actor ProcessingPipeline {
                 vocabulary: vocabulary, attendees: meeting.attendees, segments: segments),
             // G17: the resume and the user rewrite inject the same durable
             // rows as the full run (request parity holds — same loader).
-            corrections: await correctionRows(meetingID: meetingID)
-                .map(NotesCorrection.init(row:)))
+            corrections: correctionRowsForRequest.map(NotesCorrection.init(row:)))
 
         do {
             let outcome = try await stage(.notes, context, meetingID) {
@@ -2907,44 +2931,51 @@ public actor ProcessingPipeline {
 
             // applyLLMNames over the persisted transcript; re-persist only
             // when a proposal actually named someone (same validation set as
-            // the full run's stage 10).
-            let captured = meeting.captured || hasMicTrack(meetingID)
-            let storedEvents = try await MeetEventsRepository(database: database)
-                .activeSpeakerEvents(meetingID: meetingID, excludingSelf: captured)
+            // the full run's stage 10). SKIPPED for the G17 user rewrite
+            // (`applyNameProposals == false`): a notes rewrite must leave the
+            // transcript byte-identical — proposals from the rewrite response
+            // are dropped (the transcript's names are already final).
             var finalSegments = segments
-            try await stage(.applyLLMNames, context, meetingID) {
-                finalSegments = self.applyProposals(
-                    notesResult.speakerNameMapping, to: segments, meeting: meeting,
-                    eventNames: Set(storedEvents.map(\.displayName)), user: user,
-                    vocabulary: vocabulary)
-                context.record.namedSegmentCount =
-                    finalSegments.filter { $0.speakerName != nil }.count
-            }
-            // G2 §1/§3: apply the store + rule-3 polish to speaker NAMES before
-            // user renames (a misheard label is outranked by a store row).
-            let labelContext = await nameSubstitutionContext(
-                meeting: meeting, segments: finalSegments, vocabulary: vocabulary)
-            finalSegments = applyStoreToSpeakerLabels(finalSegments, context: labelContext)
-
-            // G2 §4: apply durable speaker-rename rows (artifact-present direct
-            // apply; the resume never re-diarizes, so labels are stable).
-            let renames = (try? await database.pool.read { db in
-                try SpeakerRenameStore.all(db, meetingID: meetingID)
-            }) ?? []
-            finalSegments = SpeakerRenameStore.applyRenames(renames, to: finalSegments)
-            context.record.finalSegmentCount = finalSegments.count
-            if finalSegments != segments {
-                try await stage(.persistTranscript, context, meetingID) {
-                    let stored = try await self.database.persistTranscript(
-                        meetingID: meetingID,
-                        segments: finalSegments,
-                        asrProvenance: asrProvenance,
-                        dominantLanguage: dominantLanguage,
-                        updatedAt: self.now())
-                    try self.exportTranscriptJSON(
-                        meetingID: meetingID, segments: stored,
-                        provenance: asrProvenance, dominantLanguage: dominantLanguage)
+            if applyNameProposals {
+                let captured = meeting.captured || hasMicTrack(meetingID)
+                let storedEvents = try await MeetEventsRepository(database: database)
+                    .activeSpeakerEvents(meetingID: meetingID, excludingSelf: captured)
+                try await stage(.applyLLMNames, context, meetingID) {
+                    finalSegments = self.applyProposals(
+                        notesResult.speakerNameMapping, to: segments, meeting: meeting,
+                        eventNames: Set(storedEvents.map(\.displayName)), user: user,
+                        vocabulary: vocabulary)
+                    context.record.namedSegmentCount =
+                        finalSegments.filter { $0.speakerName != nil }.count
                 }
+                // G2 §1/§3: apply the store + rule-3 polish to speaker NAMES before
+                // user renames (a misheard label is outranked by a store row).
+                let labelContext = await nameSubstitutionContext(
+                    meeting: meeting, segments: finalSegments, vocabulary: vocabulary)
+                finalSegments = applyStoreToSpeakerLabels(finalSegments, context: labelContext)
+
+                // G2 §4: apply durable speaker-rename rows (artifact-present direct
+                // apply; the resume never re-diarizes, so labels are stable).
+                let renames = (try? await database.pool.read { db in
+                    try SpeakerRenameStore.all(db, meetingID: meetingID)
+                }) ?? []
+                finalSegments = SpeakerRenameStore.applyRenames(renames, to: finalSegments)
+                context.record.finalSegmentCount = finalSegments.count
+                if finalSegments != segments {
+                    try await stage(.persistTranscript, context, meetingID) {
+                        let stored = try await self.database.persistTranscript(
+                            meetingID: meetingID,
+                            segments: finalSegments,
+                            asrProvenance: asrProvenance,
+                            dominantLanguage: dominantLanguage,
+                            updatedAt: self.now())
+                        try self.exportTranscriptJSON(
+                            meetingID: meetingID, segments: stored,
+                            provenance: asrProvenance, dominantLanguage: dominantLanguage)
+                    }
+                }
+            } else {
+                context.record.finalSegmentCount = finalSegments.count
             }
 
             // G2 §3: name-substitution pass (pending-resume path) over the
