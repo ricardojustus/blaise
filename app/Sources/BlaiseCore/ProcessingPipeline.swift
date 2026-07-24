@@ -745,9 +745,19 @@ public actor ProcessingPipeline {
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
+            // FIX F: the re-mint re-WEAVES annotations, so the live rows must
+            // also be re-ANCHORED here — a rename that shifted or dropped an
+            // anchor would otherwise leave stale status/occurrence in
+            // `meeting_correction` until the next synthesis, diverging the
+            // management list from what notes.md actually shows. Computed
+            // OUTSIDE the write closure (`notes` is a captured var — the
+            // Sendable-capture rule; see `remintNotesArtifacts`).
+            let reanchorUpdates = CorrectionAnchoring.reanchor(
+                annotations: correctionRows, against: notes.structured)
             let rootURL = self.database.rootURL
             try await self.database.pool.write { [notes] db in
                 try notes.upsert(db)
+                try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
                 _ = try HandoffRepository.enqueue(
                     db, rootURL: rootURL, meetingID: meetingID,
                     versionHash: payload.versionHash, payloadPath: relativePath)
@@ -861,9 +871,17 @@ public actor ProcessingPipeline {
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
+            // FIX F: a speaker rename rewrites notes.structured (layer-1
+            // substitution + S-label neutralization), so an anchor quoting the
+            // old surface may move or vanish — re-anchor the live rows in the
+            // same transaction as the re-woven mint. Computed outside the
+            // write closure (`notes` is a captured var).
+            let reanchorUpdates = CorrectionAnchoring.reanchor(
+                annotations: correctionRows, against: notes.structured)
             let rootURL = self.database.rootURL
             try await self.database.pool.write { [notes] db in
                 try notes.upsert(db)
+                try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
                 _ = try HandoffRepository.enqueue(
                     db, rootURL: rootURL, meetingID: meetingID,
                     versionHash: payload.versionHash, payloadPath: relativePath)
@@ -963,9 +981,17 @@ public actor ProcessingPipeline {
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
+            // FIX F: the name replacement edits the very prose anchors quote,
+            // so an anchor containing the old surface stops matching — re-anchor
+            // the live rows here rather than leaving them wrong until the next
+            // synthesis. Computed outside the write closure (`notes` is a
+            // captured var).
+            let reanchorUpdates = CorrectionAnchoring.reanchor(
+                annotations: correctionRows, against: notes.structured)
             let rootURL = self.database.rootURL
             try await self.database.pool.write { [notes] db in
                 try notes.upsert(db)
+                try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
                 _ = try HandoffRepository.enqueue(
                     db, rootURL: rootURL, meetingID: meetingID,
                     versionHash: payload.versionHash, payloadPath: relativePath)

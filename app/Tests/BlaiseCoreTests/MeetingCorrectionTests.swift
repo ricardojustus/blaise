@@ -388,3 +388,44 @@ private func makeRow(
                 .blockIndex == 1)
     }
 }
+
+/// The live status of one row, straight from the store.
+private func liveStatus(
+    _ database: BlaiseDatabase, _ meetingID: MeetingID, _ id: String
+) async throws -> MeetingCorrection.Status? {
+    try await database.pool.read { db in
+        try MeetingCorrectionStore.all(db, meetingID: meetingID).first { $0.id == id }?.status
+    }
+}
+
+// FIX F: the legacy re-mint paths (rename meeting / rename speaker / correct
+// name in notes) re-WEAVE annotations into the markdown, so they must also
+// re-ANCHOR the live `meeting_correction` rows — otherwise an edit that moved
+// or dissolved an anchor leaves a wrong status/occurrence behind until the
+// next synthesis, and the management popover disagrees with the pane.
+@Suite struct CorrectionRemintReanchorTests {
+    @Test("a name correction over the anchored prose flips the live annotation row to stale")
+    func correctNameInNotesReanchorsLiveRows() async throws {
+        let harness = try await makePipelineHarness()
+        harness.notesPrimary.state.withLock { $0.summary = "Caco fechou o contrato" }
+        let meeting = try await harness.importTestMeeting()
+        try await harness.pipeline.process(meetingID: meeting.id)
+
+        // Anchored on the summary as synthesized. The add path re-mints and
+        // re-anchors, so the row starts out `applied`.
+        let row = try await harness.pipeline.addCorrection(
+            meetingID: meeting.id, kind: .annotation, section: .summary,
+            quotedText: "Caco fechou o contrato", occurrence: 0,
+            userText: "Valor do contrato ainda pendente.")
+        #expect(try await liveStatus(harness.database, meeting.id, row.id) == .applied)
+
+        // The correction rewrites the very prose the note quotes.
+        let count = try await harness.pipeline.correctNameInNotes(
+            meetingID: meeting.id, original: "Caco", replacement: "Sammy",
+            allOccurrences: false)
+        #expect(count == 1)
+        // Pre-FIX F this stayed `applied` — a note pointing at text that no
+        // longer exists, with no stale badge and no way to re-pin it.
+        #expect(try await liveStatus(harness.database, meeting.id, row.id) == .stale)
+    }
+}
