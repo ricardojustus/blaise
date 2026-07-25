@@ -145,7 +145,7 @@ Driven per `user_huddle_changed` event plus a periodic evaluation tick:
    a redundant heartbeat, and no two batches ever share a timestamp (which the
    downstream monotonic guard would otherwise reject).
 8. **Liveness-belief bound** (tick): 4 hours past the last genuine self event,
-   ALL manufactured liveness STOPS — heartbeats AND roster flushes (rule 3
+   ALL manufactured liveness STOPS — heartbeats AND roster flushes (rule 2
    emits are liveness downstream exactly as a heartbeat is). The call is not
    ended — going quiet lets the recording watchdog reclaim the session through
    its normal path (a notification WITH Resume when a resume window is

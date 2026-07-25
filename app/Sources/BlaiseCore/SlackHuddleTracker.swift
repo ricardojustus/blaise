@@ -405,9 +405,9 @@ public actor SlackHuddleTracker {
         // downstream so a suppressed flush retracts nobody. A self event that
         // TEARS THE CALL DOWN instead (leave, or a join to a different call)
         // discards the buffer: `endCurrentCall` emits an empty roster. That is
-        // deliberate — downstream the meeting was stopped hours earlier by the
-        // watchdog, so a participant first seen during the stale window is not
-        // an attendee of the recording that exists.
+        // deliberate — by then the watchdog has stopped the downstream recording,
+        // or is minutes from doing so, and a participant first seen during a
+        // dead-signal window is not an attendee of the recording that exists.
         guard !beliefIsStale(at: at) else {
             rosterDirty = true
             owesRevivalHeartbeat = true
@@ -415,7 +415,15 @@ public actor SlackHuddleTracker {
         }
         let elapsed = lastRosterFlushAt.map { at.timeIntervalSince($0) } ?? .infinity
         if elapsed >= Self.rosterCoalesceSeconds {
-            await flushRoster(at: at)
+            // This is the SECOND door onto the revival path: a co-participant
+            // event arriving after the reviving self event but before the next
+            // tick flushes immediately (the coalescing window elapsed hours
+            // ago). It must settle the revival debt for the same reason the
+            // tick's flush does — otherwise it consumes the 60 s heartbeat slot
+            // with a kind-less batch and the grace-resume is delayed anyway.
+            let reviving = owesRevivalHeartbeat
+            await flushRoster(at: at, withHeartbeat: reviving)
+            if reviving { owesRevivalHeartbeat = false }
         } else {
             rosterDirty = true  // the tick flushes it once the window elapses
         }

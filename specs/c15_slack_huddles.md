@@ -161,7 +161,7 @@ Transitions (all driven by `user_huddle_changed`):
    within 60 s").
 8. **Liveness-belief bound** — tick: `SlackHuddleTracker.livenessBeliefMaxAgeSeconds`
    (4 h) past the last genuine self event, ALL manufactured liveness stops —
-   heartbeats AND roster flushes (rule 3), since downstream rearms its watchdog
+   heartbeats AND roster flushes (rule 2), since downstream rearms its watchdog
    from ANY code-carrying batch, so gating only the heartbeat leaves the bound
    inert whenever co-participants remain in the huddle. The call is not ended
    and no lifecycle is emitted. Rationale: rule 7's heartbeat is manufactured from
