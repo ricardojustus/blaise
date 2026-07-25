@@ -524,9 +524,10 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         scheduleRetry(after: effective)
     }
 
-    /// F-2: a retry backoff is scheduled DIRECTLY at the ladder's delay — never
-    /// through `enqueueRebuild`, whose ceiling is a DEBOUNCE bound, not a
-    /// backoff bound.
+    /// The single (re)scheduling primitive; the debounce ceiling is the
+    /// caller's, never applied here. F-2: a retry backoff is scheduled DIRECTLY
+    /// at the ladder's delay — never through `enqueueRebuild`, whose ceiling is
+    /// a DEBOUNCE bound, not a backoff bound.
     private func scheduleRetry(after delay: TimeInterval) {
         pendingRebuild?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.performPendingRebuild() }
@@ -1099,8 +1100,12 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
 ///
 /// Deadline blocks are never cancelled: an alarm whose deadline elapses after
 /// its period ended (successful rebuild, stop, next recording) finds
-/// `downSince` nil — or, if a NEW period has since armed, an elapsed time
-/// necessarily below the threshold — and does nothing. The same zero stale
+/// `downSince` nil and does nothing. A block that outlives its period into a
+/// newly-armed one can pass the elapsed guard ONLY when the new period is
+/// itself genuinely past the threshold at that instant (`now` is sampled at
+/// execution, not deadline) — so a raise is never premature or spurious, only
+/// possibly issued by an older block than the one the period scheduled, which
+/// the `reported` latch collapses to a single event. The same zero stale
 /// fires a cancel-based version would have, without a cross-queue cancel race.
 ///
 /// `reset` is also a FENCE (R3-F1): EVERY event invocation runs on this queue
@@ -1181,10 +1186,12 @@ final class CaptureDownAlarm: @unchecked Sendable {
     /// `CaptureSession.captureDownAlarmSeconds` for why this must be visible;
     /// the recording is NOT stopped — the retry ladder is still working and a
     /// transient failure recovers.
-    /// A block whose period already ended finds `downSince` nil; one that
-    /// outlived its period into a NEWLY armed one finds an elapsed time below
-    /// the threshold (the new clock started after this block was scheduled),
-    /// so a fired alarm can only ever be the period that armed it.
+    /// A block whose period already ended finds `downSince` nil. One that
+    /// outlived its period into a NEWLY armed one passes the elapsed guard only
+    /// if that period is itself past the threshold when the block EXECUTES —
+    /// never premature, and `reported` collapses old-block/own-block races to
+    /// one event. Rests on `arm`'s `now` being a fresh `systemUptime` sample
+    /// from the same monotonic clock this block reads.
     ///
     /// The check and the emission both run on the alarm queue (R3-F1): an
     /// event invoked on the caller's thread would be outside the fence. The
