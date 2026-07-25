@@ -151,6 +151,9 @@ final class AppEnvironment {
     let levelMeter = LevelMeterHolder()
     let googleCalendar: GoogleCalendarModel
     let calendarSuggestions: CalendarSuggestionProvider
+    // C15: native Slack Huddles roster/lifecycle (Socket Mode → ingestor).
+    let slackHuddles: SlackHuddlesModel
+    let slackHuddleTracker: SlackHuddleTracker
     // C14: recording automation.
     let tracker: MeetCallTracker
     let scheduler: PreMeetingScheduler
@@ -289,6 +292,14 @@ final class AppEnvironment {
         self.googleCalendar = googleCalendar
         let calendar = CalendarSuggestionProvider(google: googleCalendar, settings: settings)
         self.calendarSuggestions = calendar
+        // C15: the Slack huddle state machine emits MeetWireBatches into the
+        // SAME ingestor as the Meet extension (roster/lifecycle persistence +
+        // the automation signal forward come free). The member id is pushed in
+        // by the model after settings load.
+        let slackHuddleTracker = SlackHuddleTracker(selfUserID: "", emitter: ingestor)
+        self.slackHuddleTracker = slackHuddleTracker
+        self.slackHuddles = SlackHuddlesModel(
+            settings: settings, secrets: secrets, tracker: slackHuddleTracker)
         let notifier = self.notificationAdapter
         let schedulerRef = Mutex<PreMeetingScheduler?>(nil)
         let tracker = MeetCallTracker(
@@ -601,6 +612,12 @@ final class AppEnvironment {
             Task { try? await settings.set(HandoffStatusHolder.EpisodeState.settingsKey, to: state) }
         }
         await tracker.startEvaluationTimer()
+        // C15: load Slack settings, arm the huddle evaluation tick, and open
+        // the Socket Mode connection if the integration is enabled + connected
+        // (the model gates on the BLAISE_SLACK_SOCKET dev-instance policy).
+        await slackHuddles.load()
+        await slackHuddleTracker.startTicking()
+        slackHuddles.startIfEnabled()
 
         if CommandLine.arguments.contains("--seed-demo") {
             await runSeedCommand()
@@ -841,6 +858,17 @@ final class AppEnvironment {
             logger.error("start recording failed: \(error)")
             captureStatus.lastActionError = "Could not start recording: \(error)"
         }
+    }
+
+    /// Manual "Slack" start from the menu bar. When the huddle tracker knows a
+    /// live call (Slack connected + self in a huddle), the recording binds to
+    /// its meeting code, so the roster stream and auto-stop attach exactly as
+    /// on the notification path. Disconnected or no huddle → a plain
+    /// slack-source recording (nil code; the ingestor never attaches batches
+    /// to nil-code sessions, by design).
+    func startSlackRecording() async {
+        let code = await slackHuddleTracker.currentMeetingCode()
+        await startRecording(source: .slack, meetingCode: code)
     }
 
     func startRecording(suggestion: MeetingSuggestion) async {

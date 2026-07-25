@@ -56,6 +56,7 @@ struct AutomationTab: View {
 
     var body: some View {
         @Bindable var google = appEnv.googleCalendar
+        @Bindable var slack = appEnv.slackHuddles
         Form {
             Section("Meeting automation") {
                 Toggle("Meeting automation (notifications, auto-stop)", isOn: $enabled)
@@ -319,6 +320,66 @@ struct AutomationTab: View {
                     }
                 }
             }
+            Section("Slack Huddles") {
+                Toggle(
+                    "Slack Huddles",
+                    isOn: Binding(get: { slack.enabled }, set: { slack.setEnabled($0) }))
+                Text(
+                    "While you're in a Slack huddle, Blaise learns the participants and call lifecycle over Slack's own API — presence only, never messages or audio — and feeds them into the same speaker-naming and auto-record flow as Meet."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                // Credentials are frozen while a connect is validating.
+                SecureField("App-level token (xapp-…)", text: $slack.appToken)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(slack.connecting)
+                SecureField("Bot token (xoxb-…)", text: $slack.botToken)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(slack.connecting)
+                TextField("Your Slack member ID (U…)", text: $slack.memberID)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(slack.connecting)
+                HStack {
+                    Button(slack.connected ? "Reconnect" : "Connect") {
+                        Task { await slack.connect() }
+                    }
+                    .disabled(slack.connecting)
+                    if slack.connecting {
+                        Button("Cancel") { slack.cancelConnect() }
+                    }
+                    if slack.connected {
+                        Button("Disconnect") { Task { await slack.disconnect() } }
+                    }
+                    if slack.connecting {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                LabeledContent("Status") {
+                    Label(
+                        slack.statusTitle,
+                        systemImage: slack.connected ? "checkmark.circle" : "circle.dashed"
+                    )
+                    .foregroundStyle(slack.connected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(.secondary))
+                }
+                if let workspace = slack.workspaceName {
+                    LabeledContent("Workspace") { Text(workspace) }
+                }
+                if let error = slack.lastError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+                if let error = slack.settingsError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+                Text(
+                    "Setup: create a personal Slack app from the manifest in docs/slack_huddles_contract.md, install it to your workspace, then paste its app-level and bot tokens and your member ID."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
             if appEnv.captureStatus.notificationHealth.needsAttention && !deniedBannerDismissed {
                 Section {
                     QuietBanner(
@@ -339,6 +400,7 @@ struct AutomationTab: View {
             await appEnv.refreshAutomationSurfaceStatus()
             await appEnv.googleCalendar.load()
             await appEnv.googleCalendar.listCalendars()
+            await appEnv.slackHuddles.load()
             await appEnv.calendarSuggestions.load()
             enabled = await AutomationSettings.enabled(from: appEnv.settings)
             confirmParticipants = await AutomationSettings.confirmParticipants(from: appEnv.settings)

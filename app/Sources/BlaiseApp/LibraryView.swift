@@ -577,6 +577,7 @@ private struct UpcomingMeetingRowView: View {
         switch row.source {
         case .meet: return "video"
         case .zoom, .teams: return "person.2.wave.2"
+        case .slack: return "bubble.left.and.bubble.right"
         case .inPerson: return "person.2"
         case .imported: return "waveform"
         }

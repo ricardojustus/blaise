@@ -8,7 +8,16 @@ public typealias HandoffID = String
 // MARK: - Meeting
 
 public enum MeetingSource: String, Codable, Sendable, CaseIterable {
-    case meet, zoom, teams, inPerson, imported
+    case meet, zoom, teams, inPerson, imported, slack
+
+    /// C15: derive the source from a correlation `meetingCode`. Slack huddle
+    /// batches carry `slack:<callID>` (see `SlackHuddle.meetingCode`); every
+    /// other code today is a Meet code. The tracker's `startCorrelated` uses
+    /// this so an auto/notification start records under the right source
+    /// instead of a hardcoded `.meet`.
+    public init(forMeetingCode meetingCode: String) {
+        self = meetingCode.hasPrefix(SlackHuddle.meetingCodePrefix) ? .slack : .meet
+    }
 }
 
 /// `status` describes the last full processing run. `failed` = it did not

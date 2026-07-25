@@ -947,9 +947,12 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
         }
         nextStartViaNotification = true
         do {
+            // C15: the correlated recording inherits its source from the code
+            // (`slack:…` → `.slack`, else `.meet`) — no longer hardcoded, so a
+            // Slack-huddle Record action files under the right source.
             _ = try await controller.start(
-                source: .meet, title: title, meetingCode: code, attendees: attendees,
-                anchor: anchor)
+                source: MeetingSource(forMeetingCode: code), title: title, meetingCode: code,
+                attendees: attendees, anchor: anchor)
         } catch {
             nextStartViaNotification = false
             emit(.actionFailed(message: "Could not start recording for \(code): \(error)"))
