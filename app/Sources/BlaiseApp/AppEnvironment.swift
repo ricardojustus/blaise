@@ -29,6 +29,11 @@ final class AppUIState {
     /// specific tab (and scroll to a segment).
     var detailRequest: DetailRequest?
     var importSourceURL: URL?
+    /// G15 §2/§3: the meeting whose participant-confirmation sheet the main
+    /// window should present — set when a recording stops while Blaise is
+    /// frontmost, and when the confirm notification is clicked (which can land
+    /// before the meeting has parked, so it cannot rely on the detail banner).
+    var participantConfirmMeeting: Meeting?
     /// F1 Inc2: set by the "Reprocess All Meetings…" menu item; presents the
     /// cost-cap confirmation sheet.
     var reprocessAllRequested = false
@@ -416,6 +421,11 @@ final class AppEnvironment {
                 case .stopped(let id, let alarm, let kicked):
                     if kicked {
                         self.captureStatus.processingMeetingID = id
+                        // G15 §2: the recording is over and its processing run
+                        // has been dispatched — ask who was there NOW, while the
+                        // user is still at the computer. Off the event loop: the
+                        // ask reads the DB and the preference.
+                        Task { await self.raiseParticipantAskAtStop(meetingID: id) }
                     }
                     self.captureStatus.apply(.captureStopped(alarm: alarm))
                     if let alarm {
@@ -538,10 +548,15 @@ final class AppEnvironment {
                     NSApp.activate(ignoringOtherApps: true)
                 }
             case .participantConfirm(let meetingID):
-                // G15: open Blaise and select the meeting so its pending banner
-                // (which hosts the confirm sheet) is front and center.
+                // G15: open Blaise, select the meeting, and raise the confirm
+                // sheet itself. The notification is posted at the recording stop
+                // (§2), when the meeting has no pending banner yet — routing to
+                // the banner alone would be a dead end.
+                let meeting = try? await MeetingRepository(database: self.database)
+                    .fetch(meetingID)
                 await MainActor.run {
                     self.uiState.selectedMeetingID = meetingID
+                    self.uiState.participantConfirmMeeting = meeting
                     self.uiState.openMainWindowRequest += 1
                     NSApp.activate(ignoringOtherApps: true)
                 }
@@ -946,6 +961,8 @@ final class AppEnvironment {
             if result.status == .processing {
                 captureStatus.processingMeetingID = meetingID
                 captureStatus.apply(.meetingEnded)
+                // G15 §2: End & process is a stop like any other — same ask.
+                Task { await self.raiseParticipantAskAtStop(meetingID: meetingID) }
             }
         } catch {
             logger.error("end paused recording failed: \(error)")
@@ -1066,6 +1083,26 @@ final class AppEnvironment {
     }
 
     // MARK: - G15 participant confirmation (sheet backing)
+
+    /// G15 §2 (ask-at-stop): a recording just stopped and its run was
+    /// dispatched. When the preference is ON and Blaise still has no attendees
+    /// for that meeting, raise the confirmation NOW — the sheet if Blaise is
+    /// frontmost (the user pressed Stop, they are right here), otherwise the
+    /// `participantConfirm` notification. Processing continues either way;
+    /// answering before the run reaches its notes stage means it never parks.
+    /// The pipeline records the ask, so a later park does not notify twice.
+    func raiseParticipantAskAtStop(meetingID: MeetingID) async {
+        guard let meeting = await pipeline.participantAskAtStop(meetingID: meetingID) else {
+            return
+        }
+        if NSApp.isActive {
+            uiState.participantConfirmMeeting = meeting
+            uiState.openMainWindowRequest += 1
+        } else {
+            await notificationAdapter.postParticipantConfirmation(
+                meetingID: meeting.id, title: meeting.title)
+        }
+    }
 
     /// Confirm-sheet pre-fill names (§3), in the spec's order: calendar
     /// suggestions for the meeting's time window (attendees of the event the

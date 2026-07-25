@@ -147,6 +147,15 @@ public struct MeetingListItem: Identifiable, Equatable, Sendable {
 
     public var id: MeetingID { meeting.id }
 
+    /// G15 §2: this meeting is parked on the participant-confirmation gate and
+    /// is waiting for the user. The library row renders its own badge from this
+    /// (not only the shared notes-pending glyph), so a chosen wait is visible
+    /// from the LIST alone — the detail banner is the action path, not the
+    /// place the state has to be discovered.
+    public var awaitsParticipantConfirmation: Bool {
+        NotesPendingClass.isAwaitingParticipantConfirmation(meeting.lastProcessingError)
+    }
+
     public init(meeting: Meeting, summary: String?, actionItemCount: Int, userActionItemCount: Int) {
         self.meeting = meeting
         self.summary = summary

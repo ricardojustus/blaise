@@ -724,6 +724,22 @@ struct MeetingRowView: View {
                         }
                         .accessibilityLabel("Notes ready")
                 }
+                // G15 §2: the standing "this meeting is waiting for you" badge —
+                // same capsule language as Ready / the action count, so the list
+                // says which meeting needs the user without opening anything.
+                if item.awaitsParticipantConfirmation {
+                    HStack(spacing: 3) {
+                        Image(systemName: "questionmark.circle")
+                            .font(.system(size: 8, weight: .semibold))
+                        Text("Confirm participants")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Theme.accent.opacity(0.16), in: Capsule())
+                    .foregroundStyle(Theme.accent)
+                    .accessibilityLabel("Waiting for you to confirm participants")
+                }
                 if item.userActionItemCount > 0 {
                     HStack(spacing: 3) {
                         Image(systemName: "checklist")

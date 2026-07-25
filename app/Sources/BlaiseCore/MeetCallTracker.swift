@@ -27,12 +27,27 @@ public enum AutomationSettings {
     /// retention are never blocked. OFF is byte-identical to the pre-G15 flow.
     public static let confirmParticipantsKey = "automation.confirmParticipants"
 
+    /// G15: the auto-skip sub-toggle of the gate above — opt-in, default OFF.
+    /// When ON, a meeting still unanswered `confirmParticipantsAutoSkipSeconds`
+    /// after its recording stopped proceeds without attendees instead of parking
+    /// (or re-parking) on the gate. OFF keeps the park-until-answered semantics.
+    public static let confirmParticipantsAutoSkipKey = "automation.confirmParticipantsAutoSkip"
+
+    /// Operator-pinned window (25/07/2026): five minutes, measured from the
+    /// recording stop — which IS the ask time, because the confirmation is
+    /// raised at stop. Read only when the sub-toggle above is ON.
+    public static let confirmParticipantsAutoSkipSeconds: TimeInterval = 300
+
     public static func clampResumeWindow(_ value: Int) -> Int {
         value <= 0 ? 0 : min(600, max(60, value))
     }
 
     public static func confirmParticipants(from settings: SettingsStore) async -> Bool {
         (try? await settings.get(confirmParticipantsKey, as: Bool.self)) ?? nil ?? false
+    }
+
+    public static func confirmParticipantsAutoSkip(from settings: SettingsStore) async -> Bool {
+        (try? await settings.get(confirmParticipantsAutoSkipKey, as: Bool.self)) ?? nil ?? false
     }
 
     public static func resumeWindowSeconds(from settings: SettingsStore) async -> Int {

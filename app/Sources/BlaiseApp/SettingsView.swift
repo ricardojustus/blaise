@@ -44,6 +44,7 @@ struct AutomationTab: View {
     @Environment(AppEnvironment.self) private var appEnv
     @State private var enabled = true
     @State private var confirmParticipants = false
+    @State private var confirmParticipantsAutoSkip = false
     @State private var resumeWindowMinutes = AutomationSettings.defaultResumeWindowSeconds / 60
     @State private var silenceAutoPauseEnabled = SilenceAutoPauseSettings.defaultEnabled
     @State private var silenceThresholdMinutes = Int(SilenceAutoPauseSettings.defaultThresholdSeconds / 60)
@@ -84,7 +85,26 @@ struct AutomationTab: View {
                     }
                 }
                 Text(
-                    "When a meeting's participants couldn't be learned from your calendar or the Meet roster, Blaise still transcribes and keeps the audio, but holds the notes until you confirm the names (or skip). Off by default."
+                    "When a meeting's participants couldn't be learned from your calendar or the Meet roster, Blaise still transcribes and keeps the audio, but holds the notes until you confirm the names (or skip). Blaise asks as soon as the recording stops, and the meeting stays marked in the list until you answer. Off by default."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                // G15: the auto-skip sub-toggle (opt-in, default OFF).
+                Toggle(
+                    "Write the notes anyway if I haven't answered in 5 minutes",
+                    isOn: $confirmParticipantsAutoSkip
+                )
+                .disabled(!confirmParticipants)
+                .onChange(of: confirmParticipantsAutoSkip) { _, newValue in
+                    guard loaded else { return }
+                    Task {
+                        try? await appEnv.settings.set(
+                            AutomationSettings.confirmParticipantsAutoSkipKey, to: newValue)
+                    }
+                }
+                Text(
+                    "Five minutes after the recording stops, an unanswered meeting gets its notes without the names instead of waiting. Off by default: the meeting waits for you, however long that takes."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -317,6 +337,8 @@ struct AutomationTab: View {
             await appEnv.calendarSuggestions.load()
             enabled = await AutomationSettings.enabled(from: appEnv.settings)
             confirmParticipants = await AutomationSettings.confirmParticipants(from: appEnv.settings)
+            confirmParticipantsAutoSkip =
+                await AutomationSettings.confirmParticipantsAutoSkip(from: appEnv.settings)
             resumeWindowMinutes =
                 await AutomationSettings.resumeWindowSeconds(from: appEnv.settings) / 60
             silenceAutoPauseEnabled = await SilenceAutoPauseSettings.enabled(from: appEnv.settings)
