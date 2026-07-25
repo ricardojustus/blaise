@@ -178,9 +178,9 @@ struct CaptureRateResolutionTests {
 }
 
 /// B4: route-change resilience — the deterministic, headless-testable parts
-/// (rate-move gate, gap-fill sizing, debounce-ceiling math, capture-down
-/// predicate, and the capture-down alarm's own scheduling, which owns no HAL
-/// object). The REST of the wiring (debounced rebuild firing, retry ladder
+/// (rate-move gate, gap-fill sizing, debounce-ceiling math, and the
+/// capture-down alarm's own scheduling, which owns no HAL object). The REST
+/// of the wiring (debounced rebuild firing, retry ladder
 /// timing, silence actually landing in the CAFs) needs live HAL devices and
 /// has NO automated coverage — the gated capture integration test does not
 /// exercise route changes; wiring-level discrimination there rests on the
@@ -225,9 +225,6 @@ struct RouteChangeResilienceTests {
         #expect(building.wait(timeout: .now() + 2) == .success)
 
         #expect(recorder.waitForEvent(timeout: 2))
-        #expect(recorder.recorded == [.captureDown(active: true)])
-        // Once per down-period: the retry path's belt call adds no second event.
-        alarm.raiseIfOverdue(now: ProcessInfo.processInfo.systemUptime)
         #expect(recorder.recorded == [.captureDown(active: true)])
         // A raised warning is the one a successful rebuild clears — and the
         // clear lands AFTER the raise, never inverting it, because both ride
@@ -313,32 +310,6 @@ struct RouteChangeResilienceTests {
         #expect(sink.recorder.recorded == [.captureDown(active: true)])
     }
 
-    /// R3-F1: the retry path's belt raise arrives on the processing queue. It
-    /// must emit on the ALARM queue — an event invoked inline on the caller's
-    /// thread is outside the fence entirely.
-    @Test("capture-down alarm: the belt raise emits inside the fence, never inline")
-    func resetFencesBeltRaise() {
-        // Long threshold: only the belt call can raise here, never the timer.
-        let alarm = CaptureDownAlarm(threshold: 5)
-        let sink = PinningSink(hold: 1)
-        alarm.reset(onEvent: { sink.handle($0) })
-        alarm.arm(now: 0)
-
-        // The belt call, as the retry path makes it from the processing queue.
-        // An inline emission would run the sink on THIS thread and would not
-        // return until the pinned sink finished.
-        alarm.raiseIfOverdue(now: 10)
-        #expect(sink.releasedAtUptime == nil)
-
-        #expect(sink.waitUntilPinned())
-        #expect(sink.recorder.waitForEvent(timeout: 2))
-        alarm.reset(onEvent: nil)
-        let resetReturnedAt = ProcessInfo.processInfo.systemUptime
-        #expect(sink.releasedAtUptime.map { $0 <= resetReturnedAt } ?? false)
-        #expect(!sink.recorder.waitForEvent(timeout: 0.3))
-        #expect(sink.recorder.recorded == [.captureDown(active: true)])
-    }
-
     /// R3-F1: once reset has installed the NEXT recording's sink, nothing from
     /// the previous generation may emit — not late through the old sink (the
     /// indicator state machine is shared across recordings, so a stale
@@ -390,20 +361,6 @@ struct RouteChangeResilienceTests {
         // retries must NOT pass through it (F-2; scheduleRetry exists so the
         // 4 s/8 s rungs run at full length). This pins the hazard.
         #expect(f(8, 100, 100, 3) == 3)
-    }
-
-    @Test("shouldRaiseCaptureDown: raises exactly at the threshold, once")
-    func captureDownPredicate() {
-        let f = CaptureSession.shouldRaiseCaptureDown
-        // No down-period, nothing to raise.
-        #expect(!f(nil, 100, false, 8))
-        // Below the threshold: quiet (sub-threshold blips produce no UI).
-        #expect(!f(100, 107.999, false, 8))
-        // At/past the threshold: raise.
-        #expect(f(100, 108, false, 8))
-        #expect(f(100, 500, false, 8))
-        // Already raised: never twice per down-period.
-        #expect(!f(100, 500, true, 8))
     }
 
     @Test("rateChangeRequiresRebuild: only a MOVED readable rate rebuilds (loop-proof)")

@@ -19,9 +19,8 @@ public enum CaptureEngineEvent: Sendable, Equatable {
     /// rebuild for longer than `CaptureSession.captureDownAlarmSeconds`
     /// (true), or a rebuild succeeded and capture resumed (false). Unlike
     /// `writeFailure` this does NOT stop the recording — the retry ladder is
-    /// still working — but while it stands ZERO bytes reach either track, so
-    /// it must be VISIBLE rather than showing a healthy green indicator with
-    /// a running timer over a dead graph.
+    /// still working. See `CaptureSession.captureDownAlarmSeconds` for why
+    /// this must be visible.
     case captureDown(active: Bool)
     /// A CAF writer error — the one sanctioned automatic stop: continuing to
     /// record into a failing writer loses MORE. The controller stops,

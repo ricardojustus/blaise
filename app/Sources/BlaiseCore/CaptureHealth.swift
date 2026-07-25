@@ -79,10 +79,8 @@ public struct IndicatorStateMachine: Sendable, Equatable {
     public private(set) var state: IndicatorState = .idle
     private var micSilence = false
     /// B4 (audit): the capture graph has been DOWN longer than
-    /// `CaptureSession.captureDownAlarmSeconds` while a rebuild retries. Zero
-    /// bytes reach either track in this state, so it must be visible — a green
-    /// indicator with a running timer over a dead graph is the silent-loss
-    /// failure this warning exists to prevent.
+    /// `CaptureSession.captureDownAlarmSeconds` while a rebuild retries.
+    /// See that constant for why this must be visible.
     private var captureDown = false
     private var startedAt: Date?
     /// Standing grace window (C14): survives interleaved back-to-back
@@ -267,10 +265,8 @@ public struct IndicatorStateMachine: Sendable, Equatable {
         let longSession =
             now.map { $0.timeIntervalSince(startedAt) > CaptureLimits.longSessionWarningSeconds }
             ?? isLongSessionShowing
-        // Capture-down outranks every other warning: while the graph is down
-        // ZERO bytes reach either track, so this is the only state where the
-        // indicator would otherwise show a healthy green recording while
-        // nothing at all is being captured.
+        // Capture-down outranks every other warning. See
+        // CaptureSession.captureDownAlarmSeconds for why this must be visible.
         if captureDown {
             return .warning(
                 startedAt: startedAt, message: "Audio device changed — recording is paused, retrying")

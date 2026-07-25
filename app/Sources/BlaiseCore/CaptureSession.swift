@@ -604,30 +604,12 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 "capture graph rebuild failed (attempt \(self.rebuildAttempt)): \(error) — retrying in \(delay)s")
             // The dead air accumulating during retries is back-filled by the
             // next successful rebuild's gap fill. (The 8 s warning is
-            // timer-armed at teardown on the alarm's OWN queue — F-1/R2-F2;
-            // the on-failure check below is a belt, idempotent within the
-            // down-period.)
-            captureDownAlarm.raiseIfOverdue(now: ProcessInfo.processInfo.systemUptime)
+            // timer-armed at teardown on the alarm's OWN queue — F-1/R2-F2 —
+            // so it fires on schedule even while this path keeps retrying.)
             pendingForced = true
             scheduleRetry(after: delay)
         }
     }
-
-    /// B4 (audit): raise the VISIBLE capture-down warning once the graph has
-    /// been down past `captureDownAlarmSeconds`. The recording is NOT stopped —
-    /// the retry ladder is still working and a transient failure recovers — but
-    /// while the graph is nil `processCopiedBuffers` short-circuits and zero
-    /// bytes reach either track, so a silent green indicator would let the user
-    /// finish a meeting believing it recorded. Honest degradation instead.
-    /// F-4: the raise decision, pure.
-    static func shouldRaiseCaptureDown(
-        downSince: TimeInterval?, now: TimeInterval, alreadyReported: Bool,
-        threshold: TimeInterval
-    ) -> Bool {
-        guard let since = downSince, !alreadyReported else { return false }
-        return now - since >= threshold
-    }
-
 
     /// B4: rebuild only when the aggregate's reported nominal rate MOVED
     /// against the build-time observation. nil current (unreadable now) →
@@ -1203,29 +1185,26 @@ final class CaptureDownAlarm: @unchecked Sendable {
     }
 
     /// Raise the VISIBLE warning if the graph has been down past the
-    /// threshold, once per down-period. The recording is NOT stopped — the
-    /// retry ladder is still working and a transient failure recovers — but
-    /// while the graph is nil zero bytes reach either track, so a silent green
-    /// indicator would let the user finish a meeting believing it recorded.
-    /// `generation` scopes a fired alarm to the period that armed it; nil is
-    /// the retry path's belt call against whatever period is standing.
+    /// threshold, once per down-period. See
+    /// `CaptureSession.captureDownAlarmSeconds` for why this must be visible;
+    /// the recording is NOT stopped — the retry ladder is still working and a
+    /// transient failure recovers.
+    /// `generation` scopes a fired alarm to the period that armed it.
     ///
-    /// The check and the emission both run on the alarm queue — including the
-    /// retry path's belt call, which arrives on `processingQueue` (R3-F1): an
+    /// The check and the emission both run on the alarm queue (R3-F1): an
     /// event invoked on the caller's thread would be outside the fence. The
     /// deadline block re-enters here asynchronously, which a serial queue
     /// permits (never `sync`).
-    func raiseIfOverdue(now: TimeInterval, generation: Int? = nil) {
+    func raiseIfOverdue(now: TimeInterval, generation: Int) {
         queue.async { [weak self] in
             guard let self else { return }
             let raised:
                 (handler: (@Sendable (CaptureEngineEvent) -> Void)?, downSeconds: TimeInterval)? =
                 state.withLock { state in
-                    if let generation, state.generation != generation { return nil }
-                    guard
-                        CaptureSession.shouldRaiseCaptureDown(
-                            downSince: state.downSince, now: now, alreadyReported: state.reported,
-                            threshold: threshold), let since = state.downSince
+                    // At the threshold raises, below it does not; once per
+                    // down-period (`reported`).
+                    guard state.generation == generation, let since = state.downSince,
+                        !state.reported, now - since >= threshold
                     else { return nil }
                     state.reported = true
                     return (state.onEvent, now - since)

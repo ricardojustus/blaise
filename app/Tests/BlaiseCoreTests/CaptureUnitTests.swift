@@ -336,9 +336,7 @@ struct IndicatorStateMachineTests {
         var machine = IndicatorStateMachine()
         let start = msDate()
         machine.apply(.captureStarted(at: start))
-        // While the graph is down ZERO bytes reach either track. The indicator
-        // must NOT keep showing a healthy green recording — that is the silent
-        // loss this warning exists to prevent.
+        // See CaptureSession.captureDownAlarmSeconds for why this must be visible.
         let warned = machine.apply(.captureDown(active: true))
         guard case .warning(let at, let message) = warned else {
             Issue.record("expected warning, got \(warned)")
