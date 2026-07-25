@@ -112,6 +112,10 @@ func seedDeliverable(
 /// Fixed per-attempt temp-name nonce for deterministic argv assertions.
 let testNonce = "00112233aabbccdd"
 
+/// A stand-in destination identity for tests that drive `markDelivered`
+/// directly (G5 v1.5 provenance) and never exercise cleanup.
+let testDestinationIdentity = "local:/dev/null/test-destination"
+
 /// A populated, valid example handoff endpoint — the shape a user enters in
 /// Settings on first run. The compiled `HandoffSettings.shippedDefault` is now
 /// EMPTY (the public app is Settings-configured on first run), so the worker

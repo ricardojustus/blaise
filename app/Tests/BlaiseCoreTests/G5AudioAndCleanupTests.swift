@@ -64,36 +64,30 @@ private func enqueueSecondVersion(_ database: BlaiseDatabase, _ meetingID: Meeti
 /// A transport that runs a side effect INSIDE its first `deliver` — the seam for
 /// "the user flips a Settings toggle while a slow transfer is in flight": the
 /// worker is suspended at that await and the actor is reentrant there, so any
-/// value it cached before the await is stale when the call returns. Delegates to
-/// `inner` when given one (the local destination needs the real write), else
-/// reports success.
+/// value it cached before the await is stale when the call returns. Recording
+/// and outcomes are `inner`'s job: by default the sibling suites' `MockTransport`
+/// (so `calls` reads through to it), or the real folder transport where the
+/// local destination has to actually write.
 private final class FlipDuringDeliveryTransport: HandoffTransporting, @unchecked Sendable {
-    private let inner: (any HandoffTransporting)?
+    private let inner: any HandoffTransporting
     private let duringFirstCall: @Sendable () async -> Void
     private let lock = NSLock()
     private var fired = false
-    private var recorded: [[String]] = []
 
     init(
-        inner: (any HandoffTransporting)? = nil,
+        inner: any HandoffTransporting = MockTransport(),
         duringFirstCall: @escaping @Sendable () async -> Void
     ) {
         self.inner = inner
         self.duringFirstCall = duringFirstCall
     }
 
-    var calls: [[String]] {
-        lock.lock()
-        defer { lock.unlock() }
-        return recorded
-    }
+    var calls: [MockTransport.Call] { (inner as? MockTransport)?.calls ?? [] }
 
-    /// Records the call and reports whether it is the first (all lock work stays
-    /// out of the async context).
-    private func record(_ argv: [String]) -> Bool {
+    /// Latches the first call (lock work stays out of the async context).
+    private func claimFirst() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        recorded.append(argv)
         let first = !fired
         fired = true
         return first
@@ -102,10 +96,8 @@ private final class FlipDuringDeliveryTransport: HandoffTransporting, @unchecked
     func deliver(argv: [String], payload: Data, timeout: TimeInterval) async throws
         -> HandoffTransportOutcome
     {
-        let first = record(argv)
-        if first { await duringFirstCall() }
-        if let inner { return try await inner.deliver(argv: argv, payload: payload, timeout: timeout) }
-        return HandoffTransportOutcome(exitStatus: 0, stderrTail: "", timedOut: false)
+        if claimFirst() { await duringFirstCall() }
+        return try await inner.deliver(argv: argv, payload: payload, timeout: timeout)
     }
 }
 
@@ -330,6 +322,157 @@ private func audioNames(_ dir: URL) -> [String] {
         #expect(
             transport.calls.count == 1,
             "OFF during the transfer ⇒ the JSON is delivered and NO cleanup command is sent")
+    }
+
+    /// R2-C1 (Critical), the attack trace verbatim, LOCAL transport: v1 is
+    /// delivered to folder A; the user switches the destination to folder B; B
+    /// already holds a same-named `<v1hash>.json` written by somebody else; v2
+    /// is delivered to B. Queue membership says "Blaise knows this hash" — and
+    /// it is a lie about THIS destination. Only delivery provenance keyed to the
+    /// currently active destination may authorize a delete.
+    @Test func localDestinationSwitchNeverDeletesAForeignSameHashPayload() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Switch local")
+        let folderA = try g5TempFolder()
+        try await selectLocalDest(database, folderA, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        #expect(jsonNames(folderA.appendingPathComponent(v1.meetingID))
+            == ["\(v1.versionHash).json"], "v1 landed at destination A")
+
+        // The user switches destinations. B is a DIFFERENT store that happens to
+        // hold a file with v1's name — another producer's, not Blaise's.
+        let folderB = try g5TempFolder()
+        try await selectLocalDest(database, folderB, sidecar: false, removeSuperseded: true)
+        let destB = folderB.appendingPathComponent(v1.meetingID, isDirectory: true)
+        try FileManager.default.createDirectory(at: destB, withIntermediateDirectories: true)
+        let foreign = Data("not Blaise's payload".utf8)
+        try foreign.write(to: destB.appendingPathComponent("\(v1.versionHash).json"))
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        let worker = makeWorker(database)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(destB) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
+            "a version delivered to the PREVIOUS destination is no authority to delete here")
+        #expect(
+            try Data(contentsOf: destB.appendingPathComponent("\(v1.versionHash).json")) == foreign,
+            "the foreign file is untouched, byte for byte")
+        // A's copy is equally untouched — cleanup only ever visits the active one.
+        #expect(FileManager.default.fileExists(
+            atPath: folderA.appendingPathComponent(v1.meetingID)
+                .appendingPathComponent("\(v1.versionHash).json").path))
+    }
+
+    /// The SSH half of the same trace: the remote root moves (a destination
+    /// switch on the same machine), so v1's delivery proves nothing about the
+    /// new root and the cleanup command must not be sent at all.
+    @Test func sshDestinationSwitchSendsNoCleanupForTheOldRootsVersions() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Switch ssh")
+        try await SettingsStore(database: database)
+            .set(HandoffDestination.Key.removeSupersededPayloads, to: true)
+        let first = makeWorker(database)
+        await first.kick()
+        await first.waitUntilSettled()
+
+        // Switch the destination: same host list and user, a NEW remote root.
+        let moved = HandoffSettings(
+            user: handoffValidExample.user, identityFile: handoffValidExample.identityFile,
+            hosts: handoffValidExample.hosts, remoteRoot: "/srv/blaise/evidence-inbox/moved")
+        try await seedHandoffConfig(database, moved)
+        // seedHandoffConfig re-seeds the destination-independent toggles to
+        // their no-extra-call state; the cleanup opt-in has to go back ON, or
+        // this test would pass for the wrong reason.
+        try await SettingsStore(database: database)
+            .set(HandoffDestination.Key.removeSupersededPayloads, to: true)
+
+        _ = try await enqueueSecondVersion(database, v1.meetingID)
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            transport.calls.count == 1,
+            "v1 was delivered to the OLD root: no candidate here, so no remote rm command")
+    }
+
+    /// The other half of R2-C1: a version that only ever sat in the queue
+    /// (pending / failed / damaged — never delivered anywhere) is not authority
+    /// either. The pre-fix `any state` query made it one.
+    @Test func aNeverDeliveredHashIsNeverADeletionCandidate() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Pending only")
+        let folder = try g5TempFolder()
+        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: true)
+
+        // A queue row Blaise enqueued and NEVER delivered, and a same-named file
+        // at the destination that is therefore somebody else's.
+        let pendingHash = String(repeating: "cd", count: 32)
+        try await database.pool.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO handoff_queue
+                        (id, meeting_id, payload_path, version_hash, state, attempts,
+                         created_at, created_seq)
+                    VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
+                    """,
+                arguments: [
+                    ULID.generate(), v1.meetingID, "never/written.json", pendingHash, msDate(),
+                    v1.createdSeq + 1000,
+                ])
+        }
+        let worker = makeWorker(database)
+        await worker.start()
+        await worker.waitUntilSettled()
+        let destDir = folder.appendingPathComponent(v1.meetingID)
+        try Data("someone else's".utf8)
+            .write(to: destDir.appendingPathComponent("\(pendingHash).json"))
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(destDir) == ["\(pendingHash).json", "\(v2.versionHash).json"].sorted(),
+            "enqueued ≠ delivered: an undelivered version authorizes nothing")
+    }
+
+    /// R2-C2 (Critical): the destructive toggle must be re-read AFTER the
+    /// deletion-candidate set is acquired — that acquisition is itself an await,
+    /// and the actor is reentrant there. Flipping OFF inside that window must
+    /// win. (With the pre-fix order — re-read, THEN acquire — this flip lands
+    /// after the authorization was captured and both payloads would go.)
+    @Test func cleanupSkippedWhenToggleFlipsOffDuringCandidateAcquisition() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Flip mid-candidates")
+        let folder = try g5TempFolder()
+        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        let destDir = folder.appendingPathComponent(v1.meetingID)
+        #expect(jsonNames(destDir) == ["\(v1.versionHash).json"])
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        let store = SettingsStore(database: database)
+        let worker = HandoffWorker(
+            database: database, prober: MockProber(), nonce: { testNonce },
+            duringCandidateAcquisition: {
+                try? await store.set(HandoffDestination.Key.removeSupersededPayloads, to: false)
+            })
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(destDir) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
+            "OFF during candidate acquisition ⇒ the sweep must not run")
     }
 
     @Test func sshDefaultSkipsCleanupCall() async throws {

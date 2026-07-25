@@ -68,6 +68,12 @@ public enum PipelineEvent: Sendable, Equatable {
     /// "Confirm participants — <title>" notification once off this event, so the
     /// notification fires once per park, never per resume re-park.
     case participantConfirmationNeeded(MeetingID, title: String)
+    /// G15 §2a: the run just started and this meeting still has nobody in its
+    /// attendee list — put the question to the user NOW, while they are still at
+    /// the computer, instead of waiting for the notes stage to park. Raised at
+    /// most ONCE per meeting per session. The app answers it with the sheet when
+    /// Blaise is frontmost and the `participantConfirm` notification otherwise.
+    case participantAskRaised(MeetingID, title: String)
 }
 
 public struct PipelineError: Error, Sendable, CustomStringConvertible {
@@ -244,6 +250,12 @@ public actor ProcessingPipeline {
     private let meetEventsSweeper: any MeetEventsSweeping
     private let tempDirectory: URL
     private let now: @Sendable () -> Date
+    /// G15 R2-H1 pin: a suspension point in the window between the gate's
+    /// pending decision and the participant marker's commit — the window a
+    /// Confirm or Skip can land in. nil in production (one nil check on the
+    /// notes-pending path); a test uses it to answer at exactly that moment
+    /// instead of hoping a concurrent task lands there.
+    private let duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)?
     private let chain = EngineTaskChain()
     private let logger = Logger(subsystem: BlaiseBundle.identifier, category: "pipeline")
     private var eventContinuations: [UUID: AsyncStream<PipelineEvent>.Continuation] = [:]
@@ -256,16 +268,21 @@ public actor ProcessingPipeline {
     /// flight has no token, so its cancel is a no-op.
     private var cancelTokens: [MeetingID: RunCancelHandle] = [:]
 
-    /// G15 §2 ask-at-stop bookkeeping, both consumed by the notes-stage gate.
-    /// `participantStopAsks`: the confirmation was already raised at this
-    /// meeting's recording stop, so the park must not post a second
-    /// notification. `participantStopSkips`: the user answered Skip BEFORE the
-    /// run reached the notes stage, where there is no pending marker yet to
-    /// carry the answer. In-memory by construction — a stop and the run it
-    /// kicks live in one app session; a session that dies before the notes
-    /// stage re-asks (the meeting parks, visibly, on the next run).
+    /// G15 §2 ask bookkeeping, all consumed by the notes-stage gate.
+    /// `participantStopAsks`: the confirmation was already raised for this
+    /// meeting's run, so the park must not post a second notification (and it
+    /// is the single-ask latch — a second evaluation cannot raise it twice).
+    /// `participantStopSkips`: the user answered Skip before there was a
+    /// pending marker to carry the answer. `participantAskTimes`: when the
+    /// question was actually put to the user, which is what the auto-skip
+    /// window is measured from. All in-memory by construction — the ask and the
+    /// run that raised it live in one app session; a session that dies before
+    /// the notes stage re-asks (the meeting parks, visibly, on the next run),
+    /// and a restarted five-minute window fails toward asking, never toward
+    /// silently skipping.
     private var participantStopAsks: Set<MeetingID> = []
     private var participantStopSkips: Set<MeetingID> = []
+    private var participantAskTimes: [MeetingID: Date] = [:]
 
     /// The in-flight run's cancel token plus its CLASS (the status write is
     /// class-aware: process-class cancel writes `cancelled`; regeneration and
@@ -301,7 +318,8 @@ public actor ProcessingPipeline {
         handoffKicker: any HandoffKicking = NoopHandoffKicker(),
         meetEventsSweeper: any MeetEventsSweeping = NoopMeetEventsSweeper(),
         tempDirectory: URL = FileManager.default.temporaryDirectory,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil
     ) {
         self.database = database
         self.registry = registry
@@ -313,6 +331,7 @@ public actor ProcessingPipeline {
         self.meetEventsSweeper = meetEventsSweeper
         self.tempDirectory = tempDirectory
         self.now = now
+        self.duringParticipantParkCommit = duringParticipantParkCommit
     }
 
     /// Convenience overload for a CONSTANT vocabulary stack (tests, regression
@@ -325,7 +344,8 @@ public actor ProcessingPipeline {
         handoffKicker: any HandoffKicking = NoopHandoffKicker(),
         meetEventsSweeper: any MeetEventsSweeping = NoopMeetEventsSweeper(),
         tempDirectory: URL = FileManager.default.temporaryDirectory,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil
     ) {
         self.init(
             database: database, registry: registry, diarizer: diarizer,
@@ -334,7 +354,8 @@ public actor ProcessingPipeline {
                     vocabulary: vocabulary, diagnostics: GlossaryDiagnostics(), loadedAt: now())
             },
             handoffKicker: handoffKicker,
-            meetEventsSweeper: meetEventsSweeper, tempDirectory: tempDirectory, now: now)
+            meetEventsSweeper: meetEventsSweeper, tempDirectory: tempDirectory, now: now,
+            duringParticipantParkCommit: duringParticipantParkCommit)
     }
 
     // MARK: - Progress
@@ -1170,6 +1191,12 @@ public actor ProcessingPipeline {
         // to .processing. Throws (unrecorded) if the meeting is gone.
         let meeting = try await writeRunEntry(meetingID: meetingID, regeneration: regeneration)
         emit(.runStarted(meetingID, regeneration: regeneration))
+        // G15 §2a: ask who was there NOW — the run has just claimed the meeting
+        // and `writeRunEntry` has absorbed any pending Meet/Slack roster, so
+        // this is the earliest moment the question is honest. Nothing waits on
+        // the answer: the stages below run concurrently with the sheet, and an
+        // answer that lands before the notes stage means the meeting never parks.
+        await raiseParticipantAskAtRunEntry(meeting: meeting, regeneration: regeneration)
 
         // G10 §1: install this run's cancel token. statusSilent mirrors the
         // status-write discipline — a regeneration never writes a `cancelled`
@@ -1362,7 +1389,7 @@ public actor ProcessingPipeline {
                 meeting: meeting, hasExistingNotes: hasNotesBeforeStage9)
             {
                 if !NotesPendingClass.isAwaitingParticipantConfirmation(meeting.lastProcessingError),
-                    !self.consumeParticipantStopAsk(meetingID)
+                    !self.participantAskWasRaised(meetingID)
                 {
                     self.emit(.participantConfirmationNeeded(meetingID, title: meeting.title))
                 }
@@ -1442,8 +1469,17 @@ public actor ProcessingPipeline {
         guard let notesResult = producedNotes else {
             if case .pending(let reason) = notesOutcome {
                 context.record.notesPending = reason
-                await writeNotesPending(
+                if reason == NotesPendingClass.awaitingParticipantConfirmation,
+                    let duringParticipantParkCommit
+                {
+                    await duringParticipantParkCommit(meetingID)
+                }
+                let attendeesWritten = await writeNotesPending(
                     meetingID: meetingID, regeneration: context.record.regeneration, reason: reason)
+                if reason == NotesPendingClass.awaitingParticipantConfirmation {
+                    resumeIfParticipantsWereAnsweredLate(
+                        meetingID: meetingID, attendeesWritten: attendeesWritten)
+                }
             }
             await writeTerminalNote(
                 meetingID: meetingID, fallback: nil,
@@ -1948,9 +1984,9 @@ public actor ProcessingPipeline {
     /// meeting parked on the participant marker itself DOES re-gate (AC5).
     ///
     /// Two §2 answers can already stand by the time this runs, because the ask
-    /// is raised at the recording STOP: a Skip answered before this run reached
-    /// the notes stage (consumed here — there is no pending marker to hang it on
-    /// yet), and the auto-skip deadline of the opt-in sub-toggle.
+    /// is raised at RUN ENTRY: a Skip answered before this run reached the notes
+    /// stage (consumed here — there is no pending marker to hang it on yet), and
+    /// the auto-skip deadline of the opt-in sub-toggle.
     private func shouldGateForParticipants(meeting: Meeting, hasExistingNotes: Bool) async -> Bool {
         guard !hasExistingNotes, meeting.attendees.isEmpty else { return false }
         let lpe = meeting.lastProcessingError
@@ -1960,7 +1996,7 @@ public actor ProcessingPipeline {
         guard await AutomationSettings.confirmParticipants(from: settings) else { return false }
         if participantStopSkips.remove(meeting.id) != nil { return false }
         if await AutomationSettings.confirmParticipantsAutoSkip(from: settings),
-            now() >= Self.participantAutoSkipDeadline(meeting: meeting)
+            now() >= participantAutoSkipDeadline(meetingID: meeting.id)
         {
             logger.notice(
                 "participant confirmation auto-skipped (past the \(Int(AutomationSettings.confirmParticipantsAutoSkipSeconds / 60)) min window): \(meeting.id, privacy: .public)"
@@ -1970,38 +2006,55 @@ public actor ProcessingPipeline {
         return true
     }
 
-    /// The auto-skip deadline for a meeting: the recording stop plus the pinned
-    /// window. The stop IS the ask time (§2 raises the confirmation there), and
-    /// `endedAt` is written by the stop itself — so the deadline survives a
-    /// restart without a second timestamp anywhere. `startedAt` covers a row
-    /// with no end (an import).
-    private static func participantAutoSkipDeadline(meeting: Meeting) -> Date {
-        (meeting.endedAt ?? meeting.startedAt)
-            .addingTimeInterval(AutomationSettings.confirmParticipantsAutoSkipSeconds)
+    /// The auto-skip deadline for a meeting: the moment the QUESTION was put to
+    /// the user, plus the pinned window. "Five minutes" is five minutes of the
+    /// user not answering — so it starts when the ask was raised (§2a, at run
+    /// entry) and, for a meeting nobody asked in this session, at the FIRST gate
+    /// evaluation that consults it (stamped here, on demand). It is deliberately
+    /// NOT `endedAt`: an imported recording dated last week has an `endedAt`
+    /// that expired before Blaise ever saw the file, which would silently skip
+    /// the very question the user opted into being asked.
+    private func participantAutoSkipDeadline(meetingID: MeetingID) -> Date {
+        let asked = participantAskTimes[meetingID] ?? now()
+        participantAskTimes[meetingID] = asked
+        return asked.addingTimeInterval(AutomationSettings.confirmParticipantsAutoSkipSeconds)
     }
 
-    /// G15 §2 (ask-at-stop): the meeting whose confirmation the app should raise
-    /// NOW, because its recording just stopped — nil when the preference is off,
-    /// when Blaise already knows the attendees (the gate would not fire), or when
-    /// the row is gone. A non-nil answer RECORDS that the ask was raised, so the
-    /// notes-stage park does not post a second notification for the same stop
-    /// (once per meeting stop, never once per park). In-memory by construction:
-    /// the stop and the run it kicks live in one app session.
-    public func participantAskAtStop(meetingID: MeetingID) async -> Meeting? {
-        guard await AutomationSettings.confirmParticipants(from: settings),
-            let meeting = try? await MeetingRepository(database: database).fetch(meetingID),
-            meeting.attendees.isEmpty
-        else { return nil }
-        participantStopAsks.insert(meetingID)
-        return meeting
+    /// G15 §2a: raise the confirmation for a run that is just starting, if this
+    /// meeting is one nobody can name yet. Evaluated at RUN ENTRY — after
+    /// `writeRunEntry` has absorbed the pending Meet/Slack roster into
+    /// `attendees` — so the question is asked only about a meeting whose roster
+    /// Blaise genuinely does not have. Asking earlier (at the stop event, before
+    /// absorption) is confirmation theater over names Blaise is about to learn,
+    /// and the user's answer to it is then refused (§2b).
+    ///
+    /// Idempotent and park-aware by construction: the `insert` result is the
+    /// single-ask latch, an already-parked meeting is left to its standing park
+    /// surface, and a run over a meeting that already has notes (a regeneration)
+    /// is never asked — those are exactly the states whose answer would be
+    /// refused. Recording the ask also suppresses the notes-stage park's second
+    /// notification (one ask per run, never one per park) and starts the
+    /// auto-skip window.
+    private func raiseParticipantAskAtRunEntry(meeting: Meeting, regeneration: Bool) async {
+        guard !regeneration, meeting.attendees.isEmpty,
+            !NotesPendingClass.isPending(meeting.lastProcessingError),
+            await AutomationSettings.confirmParticipants(from: settings),
+            !(await hasPersistedNotes(meeting.id))
+        else { return }
+        guard participantStopAsks.insert(meeting.id).inserted else { return }
+        participantAskTimes[meeting.id] = now()
+        emit(.participantAskRaised(meeting.id, title: meeting.title))
     }
 
-    /// Whether this park is the one the stop-time ask already covered (and
-    /// spends that ask). True = the app must NOT post the confirm notification:
-    /// the user was asked at the stop, and the park's own list-row state is the
-    /// standing surface from here on.
-    private func consumeParticipantStopAsk(_ meetingID: MeetingID) -> Bool {
-        participantStopAsks.remove(meetingID) != nil
+    /// Whether this meeting's ask was already raised in this session. True = the
+    /// park must NOT post the confirm notification: the user has already been
+    /// asked, and the park's own list-row state is the standing surface from
+    /// here on. Deliberately NON-consuming: the token is also what tells a late
+    /// Skip that there is a live question to answer, and the gate reaches this
+    /// point BEFORE the pending marker exists — spending the token here is what
+    /// made an answer landing in that window refuse (R2-H1).
+    private func participantAskWasRaised(_ meetingID: MeetingID) -> Bool {
+        participantStopAsks.contains(meetingID)
     }
 
     /// Whether the meeting already has a persisted notes row (the gate's
@@ -2102,14 +2155,29 @@ public actor ProcessingPipeline {
         guard let meeting = try await MeetingRepository(database: database).fetch(meetingID)
         else { return false }
         guard NotesPendingClass.isAwaitingParticipantConfirmation(meeting.lastProcessingError) else {
-            // §2 (ask-at-stop): a Skip answered while the run is still in
-            // flight, before there is a marker to hang it on. Record it for
-            // this run's notes-stage gate — nothing is written and no resume is
-            // dispatched (the run is already producing the notes). Only for a
-            // meeting whose stop actually raised the ask, so a stale sheet on
-            // some other meeting stays the no-op L1 made it.
-            guard participantStopAsks.remove(meetingID) != nil else { return false }
+            // §2a: a Skip answered while the run is still in flight, before
+            // there is a marker to hang it on. Record it for this run's
+            // notes-stage gate — nothing is written and no resume is dispatched
+            // (the run is already producing the notes). Only for a meeting whose
+            // run actually raised the ask AND has not yet produced notes: a
+            // sheet left standing over a finished meeting stays the no-op L1
+            // made it.
+            guard participantAskWasRaised(meetingID), !(await hasPersistedNotes(meetingID))
+            else { return false }
             participantStopSkips.insert(meetingID)
+            // The fetch above is a snapshot: the run may have committed its park
+            // while this answer was in flight, and the gate does not consult the
+            // skip set again. If the marker is here NOW, carry the skip through
+            // the parked path instead — `remove` is the single-winner claim
+            // shared with the park's own reconciliation, so exactly one side
+            // dispatches the resume.
+            if let fresh = try? await MeetingRepository(database: database).fetch(meetingID),
+                NotesPendingClass.isAwaitingParticipantConfirmation(fresh.lastProcessingError),
+                participantStopSkips.remove(meetingID) != nil
+            {
+                return try await processNotesOnly(
+                    meetingID: meetingID, confirmingParticipants: true) != nil
+            }
             return true
         }
         let record = try await processNotesOnly(
@@ -3047,7 +3115,7 @@ public actor ProcessingPipeline {
             let reason = NotesPendingClass.awaitingParticipantConfirmation
             context.record.notesPending = reason
             if !NotesPendingClass.isAwaitingParticipantConfirmation(meeting.lastProcessingError),
-                !consumeParticipantStopAsk(meetingID)
+                !participantAskWasRaised(meetingID)
             {
                 emit(.participantConfirmationNeeded(meetingID, title: meeting.title))
             }
@@ -3178,15 +3246,22 @@ public actor ProcessingPipeline {
     /// regeneration-class runs keep their status (C1 no-regress: an
     /// already-ready meeting keeps its previous notes, the marker surfacing
     /// the mixed transcript/notes generation until the resume heals it).
-    private func writeNotesPending(meetingID: MeetingID, regeneration: Bool, reason: String) async {
-        try? await database.pool.write { db in
-            guard var meeting = try Meeting.fetchOne(db, key: meetingID) else { return }
+    /// Returns whether the meeting had attendees AT THE MOMENT the marker
+    /// committed — read inside the same transaction as the marker write, so a
+    /// Confirm racing this write cannot slip between the two: whichever
+    /// transaction commits second observes the other's result (G15 §2a).
+    @discardableResult
+    private func writeNotesPending(
+        meetingID: MeetingID, regeneration: Bool, reason: String
+    ) async -> Bool {
+        let attendeesPresent = (try? await database.pool.write { db -> Bool in
+            guard var meeting = try Meeting.fetchOne(db, key: meetingID) else { return false }
             // G10 §1: a committed `cancelled` is NEVER overwritten — the user's
             // cancel commits the status first and the terminal write must
             // preserve it (read-check in the same write transaction). Only a
             // process-class run reaches this `failed` flip anyway; this guard
             // keeps it from flipping a meeting the user just cancelled.
-            guard meeting.status != .cancelled else { return }
+            guard meeting.status != .cancelled else { return false }
             meeting.lastProcessingError = NotesPendingClass.marker(reason)
             if !regeneration {
                 meeting.status = .failed
@@ -3195,10 +3270,44 @@ public actor ProcessingPipeline {
             // (C1 v6.7 — updatedAt tracks content mutations only; every
             // failed resume retry refreshes this marker).
             try meeting.update(db)
-        }
+            return !meeting.attendees.isEmpty
+        }) ?? false
         logger.notice(
             "notes pending for \(meetingID, privacy: .public): \(reason, privacy: .public) — transcript persisted, no handoff; self-heals on launch/key-save/network"
         )
+        return attendeesPresent
+    }
+
+    /// G15 §2a / AC2c: close the window between the gate's decision and the
+    /// marker commit. An answer that landed in it reported success and
+    /// dispatched nothing — the run was already committed to parking, and the
+    /// answer path had no marker to hang a resume on. The marker exists now,
+    /// which is exactly what the notes-only resume requires, so the answered
+    /// meeting is resumed here instead of sitting on a question the user has
+    /// already answered. `attendeesWritten` comes from the marker's own
+    /// transaction (a late Confirm); the skip set carries a late Skip, and
+    /// `remove` is the single-winner claim it shares with
+    /// `skipParticipantConfirmation` — exactly one side ever dispatches.
+    /// Detached because `processNotesOnly` joins the single-flight chain that
+    /// THIS run still holds.
+    private func resumeIfParticipantsWereAnsweredLate(
+        meetingID: MeetingID, attendeesWritten: Bool
+    ) {
+        let skippedLate = participantStopSkips.remove(meetingID) != nil
+        guard attendeesWritten || skippedLate else { return }
+        logger.notice(
+            "participant answer landed while \(meetingID, privacy: .public) was committing its park — resuming notes instead of waiting"
+        )
+        Task {
+            do {
+                _ = try await self.processNotesOnly(
+                    meetingID: meetingID, confirmingParticipants: true)
+            } catch {
+                self.logger.error(
+                    "late participant answer resume failed for \(meetingID, privacy: .public): \(String(describing: error), privacy: .public) — the park stands; pending self-heal retries"
+                )
+            }
+        }
     }
 
     // MARK: - Digest-only resume (G14 H1 self-heal)

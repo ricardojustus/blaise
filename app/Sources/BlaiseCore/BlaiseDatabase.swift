@@ -509,6 +509,19 @@ public final class BlaiseDatabase: Sendable {
                 t.add(column: "scoped_alias_bindings", .text) // nullable; JSON [AliasPair]
             }
         }
+        // G5 v1.5: delivery PROVENANCE — which destination a row's payload was
+        // actually written to. Destination cleanup's deletion authority is keyed
+        // on it (only hashes proved delivered to the CURRENTLY ACTIVE
+        // destination are candidates), so a destination switch can never
+        // authorize deleting a same-named file this Blaise never wrote THERE.
+        // Additive, nullable (the v14/v17 precedent): rows delivered by an
+        // earlier binary carry NULL and are therefore never deletion
+        // candidates — the failure direction is under-deletion, by design.
+        migrator.registerMigration("v19") { db in
+            try db.alter(table: "handoff_queue") { t in
+                t.add(column: "delivered_endpoint", .text) // nullable; destination identity
+            }
+        }
         return migrator
     }
 

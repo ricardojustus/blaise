@@ -317,15 +317,28 @@ public struct HandoffRepository: Sendable {
         }
     }
 
-    /// Every version hash Blaise has ever enqueued for a meeting, any state
-    /// (delivered, superseded, pending). This is what Blaise KNOWS it wrote to
-    /// a destination — the provenance behind destination cleanup's deletion
-    /// candidates (G5 v1.3).
-    public func versionHashes(meetingID: MeetingID) async throws -> [String] {
+    /// The version hashes of this meeting that Blaise PROVED it delivered to
+    /// `endpoint` — `state = 'delivered'` rows whose recorded delivery
+    /// provenance names that exact destination identity (G5 v1.5). This is the
+    /// deletion authority behind destination cleanup, and it is deliberately
+    /// narrow in three directions at once: a never-delivered row (pending,
+    /// failed, damaged, superseded) proves nothing was ever written anywhere; a
+    /// row delivered to a DIFFERENT destination proves nothing about this one
+    /// (after a destination switch, a same-named file here belongs to somebody
+    /// else); and a row delivered by a pre-v19 binary carries NULL provenance
+    /// and is likewise no authority. Every exclusion fails toward
+    /// under-deletion, never toward deleting a file Blaise did not write here.
+    public func deliveredVersionHashes(
+        meetingID: MeetingID, endpoint: String
+    ) async throws -> [String] {
         try await database.pool.read { db in
             try String.fetchAll(
-                db, sql: "SELECT DISTINCT version_hash FROM handoff_queue WHERE meeting_id = ?",
-                arguments: [meetingID])
+                db,
+                sql: """
+                    SELECT DISTINCT version_hash FROM handoff_queue
+                    WHERE meeting_id = ? AND state = 'delivered' AND delivered_endpoint = ?
+                    """,
+                arguments: [meetingID, endpoint])
         }
     }
 
@@ -424,9 +437,14 @@ public struct HandoffRepository: Sendable {
     /// `.delivered` transition + D12 supersession sweep in ONE write
     /// transaction (impl-audit M-1): no crash or cancellation window can
     /// leave an older undelivered row open behind a delivered newer one.
-    public func markDelivered(_ id: HandoffID) async throws -> (item: HandoffItem, superseded: [HandoffID]) {
+    /// `endpoint` is the destination identity the payload was written to (G5
+    /// v1.5) — recorded in the same transaction, so the proof of delivery and
+    /// the proof of WHERE can never disagree.
+    public func markDelivered(
+        _ id: HandoffID, endpoint: String
+    ) async throws -> (item: HandoffItem, superseded: [HandoffID]) {
         try await database.pool.write { db in
-            let item = try Self.transition(db, id: id, to: .delivered)
+            let item = try Self.transition(db, id: id, to: .delivered, deliveredEndpoint: endpoint)
             let superseded = try Self.supersedeOlder(
                 db, meetingID: item.meetingID, newerSeq: item.createdSeq, newerHash: item.versionHash)
             return (item, superseded)
@@ -463,7 +481,8 @@ public struct HandoffRepository: Sendable {
 
     /// State transition with attempt bookkeeping:
     /// - `.delivering`: increments `attempts`, stamps `lastAttemptAt`;
-    /// - `.delivered`: stamps `deliveredAt` (the only terminal state — no transition leaves it);
+    /// - `.delivered`: stamps `deliveredAt` and the delivery provenance
+    ///   `deliveredEndpoint` (the only terminal state — no transition leaves it);
     /// - `.failed`: records `lastError` (retriable bookkeeping — nothing is ever dropped).
     ///
     /// Returns the re-fetched stored row (same date precision as the DB, like `enqueue`).
@@ -476,7 +495,8 @@ public struct HandoffRepository: Sendable {
 
     /// Transaction-scoped transition body, shared with `markDelivered`.
     static func transition(
-        _ db: Database, id: HandoffID, to state: HandoffState, error: String? = nil
+        _ db: Database, id: HandoffID, to state: HandoffState, error: String? = nil,
+        deliveredEndpoint: String? = nil
     ) throws -> HandoffItem {
         guard var item = try HandoffItem.fetchOne(db, key: id) else {
             throw BlaiseDatabaseError.handoffItemNotFound(id)
@@ -491,6 +511,7 @@ public struct HandoffRepository: Sendable {
             item.lastAttemptAt = Date()
         case .delivered:
             item.deliveredAt = Date()
+            item.deliveredEndpoint = deliveredEndpoint
         case .failed:
             item.lastError = error
         case .pending:

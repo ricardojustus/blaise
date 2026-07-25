@@ -55,9 +55,12 @@ Per meeting, into a per-meeting directory:
   Blaise removes this meeting's KNOWN older `<hash>.json` payload versions from
   the destination meeting dir — an explicit candidate set built from Blaise's
   own delivery records, never a `*.json` pattern — so a correction *replaces*
-  the delivered evidence instead of accumulating beside it. Anything Blaise did
-  not itself enqueue for this meeting is never a candidate: non-payload JSON,
-  the sidecar `.md`, any delivered audio, and `.tmp-*` are all untouched. Removal is failure-isolated (it never fails or
+  the delivered evidence instead of accumulating beside it. A file is a
+  candidate only where Blaise's records show it delivered that version of that
+  meeting to the destination you are using NOW: non-payload JSON, the sidecar
+  `.md`, any delivered audio, `.tmp-*`, a version that was only ever queued and
+  never delivered, and anything sitting at a destination you switched to later
+  are all untouched. Removal is failure-isolated (it never fails or
   retries the JSON delivery; it retries on the meeting's next delivery).
   **Weigh it if anything downstream cites payloads by hash:** an accumulating
   destination is easy to tidy later; a deleted payload is not recoverable.

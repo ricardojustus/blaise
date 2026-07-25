@@ -563,6 +563,10 @@ public struct HandoffItem: Codable, Sendable, Equatable {
     public var lastAttemptAt: Date?
     public var deliveredAt: Date?
     public var lastError: String?
+    /// G5 v1.5: the destination identity this row's payload was DELIVERED to
+    /// (nil until delivered, and on rows delivered by a pre-v19 binary). The
+    /// provenance destination cleanup keys its deletion candidates on.
+    public var deliveredEndpoint: String?
 
     public init(
         id: HandoffID,
@@ -575,7 +579,8 @@ public struct HandoffItem: Codable, Sendable, Equatable {
         createdAt: Date,
         lastAttemptAt: Date? = nil,
         deliveredAt: Date? = nil,
-        lastError: String? = nil
+        lastError: String? = nil,
+        deliveredEndpoint: String? = nil
     ) {
         self.id = id
         self.meetingID = meetingID
@@ -588,6 +593,7 @@ public struct HandoffItem: Codable, Sendable, Equatable {
         self.lastAttemptAt = lastAttemptAt
         self.deliveredAt = deliveredAt
         self.lastError = lastError
+        self.deliveredEndpoint = deliveredEndpoint
     }
 
     enum CodingKeys: String, CodingKey {
@@ -600,6 +606,7 @@ public struct HandoffItem: Codable, Sendable, Equatable {
         case lastAttemptAt = "last_attempt_at"
         case deliveredAt = "delivered_at"
         case lastError = "last_error"
+        case deliveredEndpoint = "delivered_endpoint"
     }
 }
 

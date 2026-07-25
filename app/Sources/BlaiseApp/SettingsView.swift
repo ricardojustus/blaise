@@ -85,29 +85,34 @@ struct AutomationTab: View {
                     }
                 }
                 Text(
-                    "When a meeting's participants couldn't be learned from your calendar or the Meet roster, Blaise still transcribes and keeps the audio, but holds the notes until you confirm the names (or skip). Blaise asks as soon as the recording stops, and the meeting stays marked in the list until you answer. Off by default."
+                    "When a meeting's participants couldn't be learned from your calendar or the Meet roster, Blaise still transcribes and keeps the audio, but holds the notes until you confirm the names (or skip). Blaise asks as soon as processing starts, and the meeting stays marked in the list until you answer. Off by default."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-                // G15: the auto-skip sub-toggle (opt-in, default OFF).
-                Toggle(
-                    "Write the notes anyway if I haven't answered in 5 minutes",
-                    isOn: $confirmParticipantsAutoSkip
-                )
-                .disabled(!confirmParticipants)
-                .onChange(of: confirmParticipantsAutoSkip) { _, newValue in
-                    guard loaded else { return }
-                    Task {
-                        try? await appEnv.settings.set(
-                            AutomationSettings.confirmParticipantsAutoSkipKey, to: newValue)
+                // G15: the auto-skip sub-toggle (opt-in, default OFF). Indented
+                // under its parent — visual subordination is what makes it read
+                // as a sub-toggle rather than a second independent preference.
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(
+                        "Write the notes anyway if I haven't answered in 5 minutes",
+                        isOn: $confirmParticipantsAutoSkip
+                    )
+                    .disabled(!confirmParticipants)
+                    .onChange(of: confirmParticipantsAutoSkip) { _, newValue in
+                        guard loaded else { return }
+                        Task {
+                            try? await appEnv.settings.set(
+                                AutomationSettings.confirmParticipantsAutoSkipKey, to: newValue)
+                        }
                     }
+                    Text(
+                        "Five minutes after Blaise asks, an unanswered meeting gets its notes without the names instead of waiting. Off by default: the meeting waits for you, however long that takes."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
-                Text(
-                    "Five minutes after the recording stops, an unanswered meeting gets its notes without the names instead of waiting. Off by default: the meeting waits for you, however long that takes."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .padding(.leading, 18)
             }
             Section("Notifications & connection") {
                 LabeledContent("Notifications") {

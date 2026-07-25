@@ -421,11 +421,6 @@ final class AppEnvironment {
                 case .stopped(let id, let alarm, let kicked):
                     if kicked {
                         self.captureStatus.processingMeetingID = id
-                        // G15 §2: the recording is over and its processing run
-                        // has been dispatched — ask who was there NOW, while the
-                        // user is still at the computer. Off the event loop: the
-                        // ask reads the DB and the preference.
-                        Task { await self.raiseParticipantAskAtStop(meetingID: id) }
                     }
                     self.captureStatus.apply(.captureStopped(alarm: alarm))
                     if let alarm {
@@ -728,6 +723,10 @@ final class AppEnvironment {
                     // once per park, never per resume re-park).
                     let adapter = self.notificationAdapter
                     Task { await adapter.postParticipantConfirmation(meetingID: id, title: title) }
+                case .participantAskRaised(let id, let title):
+                    // G15 §2a: the run just started and nobody is named yet —
+                    // raise the question now.
+                    Task { await self.raiseParticipantAsk(meetingID: id, title: title) }
                 default:
                     break
                 }
@@ -961,8 +960,6 @@ final class AppEnvironment {
             if result.status == .processing {
                 captureStatus.processingMeetingID = meetingID
                 captureStatus.apply(.meetingEnded)
-                // G15 §2: End & process is a stop like any other — same ask.
-                Task { await self.raiseParticipantAskAtStop(meetingID: meetingID) }
             }
         } catch {
             logger.error("end paused recording failed: \(error)")
@@ -1084,23 +1081,22 @@ final class AppEnvironment {
 
     // MARK: - G15 participant confirmation (sheet backing)
 
-    /// G15 §2 (ask-at-stop): a recording just stopped and its run was
-    /// dispatched. When the preference is ON and Blaise still has no attendees
-    /// for that meeting, raise the confirmation NOW — the sheet if Blaise is
-    /// frontmost (the user pressed Stop, they are right here), otherwise the
+    /// G15 §2a: the pipeline raised the ask at its run entry (the earliest
+    /// point where "Blaise has no attendees" is a true statement — the Meet /
+    /// Slack roster absorbs there). Surface it: the sheet if Blaise is frontmost
+    /// (the user just pressed Stop, they are right here), otherwise the
     /// `participantConfirm` notification. Processing continues either way;
     /// answering before the run reaches its notes stage means it never parks.
     /// The pipeline records the ask, so a later park does not notify twice.
-    func raiseParticipantAskAtStop(meetingID: MeetingID) async {
-        guard let meeting = await pipeline.participantAskAtStop(meetingID: meetingID) else {
-            return
-        }
+    func raiseParticipantAsk(meetingID: MeetingID, title: String) async {
         if NSApp.isActive {
+            let meeting = try? await MeetingRepository(database: database).fetch(meetingID)
+            guard let meeting else { return }
             uiState.participantConfirmMeeting = meeting
             uiState.openMainWindowRequest += 1
         } else {
             await notificationAdapter.postParticipantConfirmation(
-                meetingID: meeting.id, title: meeting.title)
+                meetingID: meetingID, title: title)
         }
     }
 
