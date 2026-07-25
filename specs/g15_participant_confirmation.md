@@ -227,12 +227,11 @@ gate only feeds it better inputs).
   one reconciled transition, so a Confirm or Skip landing while the run commits
   its park still reaches the notes (§2a, AC2c); the auto-skip window is measured
   from the ask rather than from the recording's timestamps (§2c, AC2d); §3
-  states which hints each entry path can show. Artifacts:
-  `audits/pr5-handoff/round-2/`.
+  states which hints each entry path can show.
 - 25/07/2026: the ask moves to the recording stop (§2a), the park becomes a
   visible library-row state (§2b), and a default-OFF auto-skip sub-toggle bounds
   the wait when the user wants it bounded (§1, §2c). Park-until-answered stays
-  the default. Artifacts: `audits/pr5-handoff/round-1/`.
+  the default.
 - 25/07/2026: §2/§3 wording corrected to the shipped behaviour — the gate
   evaluates after transcript and diarization are PRODUCED (the transcript persist
   completes before the pending terminal becomes visible), and a notification
