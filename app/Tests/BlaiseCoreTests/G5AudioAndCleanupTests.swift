@@ -101,6 +101,43 @@ private final class FlipDuringDeliveryTransport: HandoffTransporting, @unchecked
     }
 }
 
+/// Records queue-row states observed INSIDE the candidate-acquisition seam —
+/// the hook is `@Sendable`, so the observation needs a Sendable box.
+private actor StateProbe {
+    private(set) var states: [String] = []
+    func record(_ states: [String]) { self.states = states }
+}
+
+/// Inserts a raw `pending` queue row for `meetingID` — bypassing `enqueue` so
+/// the row's `created_seq` and its `delivered_endpoint` can both be chosen.
+private func insertPendingRow(
+    _ database: BlaiseDatabase, meetingID: MeetingID, versionHash: String, createdSeq: Int64,
+    deliveredEndpoint: String? = nil
+) async throws {
+    try await database.pool.write { db in
+        try db.execute(
+            sql: """
+                INSERT INTO handoff_queue
+                    (id, meeting_id, payload_path, version_hash, state, attempts,
+                     created_at, created_seq, delivered_endpoint)
+                VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                """,
+            arguments: [
+                ULID.generate(), meetingID, "never/written.json", versionHash, msDate(),
+                createdSeq, deliveredEndpoint,
+            ])
+    }
+}
+
+/// The state of one queue row, by version hash (nil ⇒ no such row).
+private func rowState(_ database: BlaiseDatabase, versionHash: String) async throws -> String? {
+    try await database.pool.read { db in
+        try String.fetchOne(
+            db, sql: "SELECT state FROM handoff_queue WHERE version_hash = ?",
+            arguments: [versionHash])
+    }
+}
+
 private func jsonNames(_ dir: URL) -> [String] {
     ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
         .filter { $0.hasSuffix(".json") }.sorted()
@@ -524,6 +561,124 @@ private func audioNames(_ dir: URL) -> [String] {
         #expect(
             jsonNames(destDir) == ["\(pendingHash).json", "\(v2.versionHash).json"].sorted(),
             "enqueued ≠ delivered: an undelivered version authorizes nothing")
+    }
+
+    /// The literal pending-row case (round-3 R2-F1 test-discrimination note):
+    /// a row that is STILL `pending` at the moment the cleanup acquires its
+    /// candidate set — not one the worker already quarantined — authorizes
+    /// nothing. Two pending rows are planted, both with a `created_seq` ABOVE
+    /// v2's so the D12 supersession sweep leaves them alone, and the hook
+    /// inside the acquisition seam records that both were `pending` right
+    /// there:
+    ///
+    /// - the ordinary shape: `pending`, provenance NULL (never delivered);
+    /// - a `pending` row carrying THIS destination's identity — the shape that
+    ///   makes `state = 'delivered'` the ONLY filter standing between it and
+    ///   the candidate set (a NULL provenance is already excluded by the
+    ///   endpoint match, so it cannot show what the state filter is worth).
+    ///
+    /// Both hashes name a file at the destination. Both files survive.
+    @Test func aRowStillPendingDuringCandidateAcquisitionIsNeverADeletionCandidate() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Ainda na fila")
+        let folder = try g5TempFolder()
+        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        let destDir = folder.appendingPathComponent(v1.meetingID)
+        #expect(jsonNames(destDir) == ["\(v1.versionHash).json"])
+
+        // The identity v1's delivery stamped — the same one v2's drain presents.
+        let delivered = try await HandoffRepository(database: database).allItems()
+        let activeIdentity = try #require(delivered.first { $0.id == v1.id }?.deliveredEndpoint)
+
+        // Same-named files at the destination: neither hash was ever delivered,
+        // so each belongs to somebody else.
+        let plainPendingHash = String(repeating: "ef", count: 32)
+        let stampedPendingHash = String(repeating: "9a", count: 32)
+        let foreign = Data("not Blaise's payload".utf8)
+        try foreign.write(to: destDir.appendingPathComponent("\(plainPendingHash).json"))
+        try foreign.write(to: destDir.appendingPathComponent("\(stampedPendingHash).json"))
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        try await insertPendingRow(
+            database, meetingID: v1.meetingID, versionHash: plainPendingHash,
+            createdSeq: v2.createdSeq + 1000)
+        try await insertPendingRow(
+            database, meetingID: v1.meetingID, versionHash: stampedPendingHash,
+            createdSeq: v2.createdSeq + 2000, deliveredEndpoint: activeIdentity)
+
+        let probe = StateProbe()
+        let worker = HandoffWorker(
+            database: database, prober: MockProber(), nonce: { testNonce },
+            duringCandidateAcquisition: {
+                let plain = try? await rowState(database, versionHash: plainPendingHash)
+                let stamped = try? await rowState(database, versionHash: stampedPendingHash)
+                await probe.record([plain, stamped].compactMap { $0 })
+            })
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            await probe.states == ["pending", "pending"],
+            "both rows were still pending WHEN the candidate set was acquired")
+        #expect(
+            jsonNames(destDir) == [
+                "\(plainPendingHash).json", "\(stampedPendingHash).json", "\(v2.versionHash).json",
+            ].sorted(),
+            "a merely pending row, even one carrying this destination's identity, proves nothing was written here")
+        #expect(
+            try Data(contentsOf: destDir.appendingPathComponent("\(plainPendingHash).json"))
+                == foreign)
+        #expect(
+            try Data(contentsOf: destDir.appendingPathComponent("\(stampedPendingHash).json"))
+                == foreign)
+    }
+
+    /// The literal pre-provenance upgrade case (round-3 R2-F1
+    /// test-discrimination note): v19 adds `delivered_endpoint` nullable, so
+    /// every row a pre-v19 binary delivered upgrades into `delivered` with NULL
+    /// provenance. NULL says "delivered — destination unknown", which is no
+    /// proof this destination holds Blaise's file, so its payload stays.
+    @Test func aDeliveredRowWithNullProvenanceIsNeverADeletionCandidate() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Entrega sem proveniência")
+        let folder = try g5TempFolder()
+        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        let destDir = folder.appendingPathComponent(v1.meetingID)
+        #expect(jsonNames(destDir) == ["\(v1.versionHash).json"])
+        let deliveredBytes = try Data(
+            contentsOf: destDir.appendingPathComponent("\(v1.versionHash).json"))
+
+        // Rewrite v1's row into the post-upgrade shape: delivered, provenance
+        // unknown. (The row is otherwise untouched — same hash, same state.)
+        try await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE handoff_queue SET delivered_endpoint = NULL WHERE id = ?",
+                arguments: [v1.id])
+        }
+        #expect(try await rowState(database, versionHash: v1.versionHash) == "delivered")
+        let upgraded = try await HandoffRepository(database: database).allItems()
+        #expect(upgraded.first { $0.id == v1.id }?.deliveredEndpoint == nil)
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        let worker = makeWorker(database)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(destDir) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
+            "NULL provenance names no destination: it authorizes no deletion at this one")
+        #expect(
+            try Data(contentsOf: destDir.appendingPathComponent("\(v1.versionHash).json"))
+                == deliveredBytes,
+            "the pre-provenance payload is untouched, byte for byte")
     }
 
     /// R2-C2 (Critical): the destructive toggle must be re-read AFTER the
