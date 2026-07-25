@@ -81,6 +81,73 @@ import Testing
         #expect(first.runs.contains { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true })
     }
 
+    /// GFM table → ONE `.table` block with the parser's per-column alignments,
+    /// inline formatting surviving inside a cell.
+    @Test func gfmTableBecomesOneTableBlock() throws {
+        let markdown = """
+            Antes da tabela.
+
+            | Módulo | Dono | Status |
+            | --- | :---: | ---: |
+            | Warp core | Vexatron Labs | **entregue** |
+            | Quoll sonar | Quoll Harbor | pendente |
+            """
+        let blocks = MarkdownBlocks.parse(markdown)
+        #expect(blocks.count == 2)
+        #expect(blocks[0].kind == .paragraph)
+        guard case .table(let header, let rows, let alignments) = blocks[1].kind else {
+            Issue.record("expected a .table block, got \(blocks[1].kind)")
+            return
+        }
+        #expect(header.map { String($0.characters) } == ["Módulo", "Dono", "Status"])
+        #expect(rows.map { $0.map { String($0.characters) } } == [
+            ["Warp core", "Vexatron Labs", "entregue"],
+            ["Quoll sonar", "Quoll Harbor", "pendente"],
+        ])
+        #expect(alignments == [.left, .center, .right])
+        // Inline emphasis survives inside a cell.
+        #expect(rows[0][2].runs.contains {
+            $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true
+        })
+    }
+
+    /// Loose LLM formatting (no outer pipes) is still one table.
+    @Test func tableWithoutOuterPipes() {
+        let markdown = """
+            Módulo | Dono
+            --- | ---
+            Warp core | Vexatron Labs
+            """
+        let blocks = MarkdownBlocks.parse(markdown)
+        #expect(blocks.count == 1)
+        guard case .table(let header, let rows, _) = blocks[0].kind else {
+            Issue.record("expected a .table block, got \(blocks[0].kind)")
+            return
+        }
+        #expect(header.map { String($0.characters) } == ["Módulo", "Dono"])
+        #expect(rows.map { $0.map { String($0.characters) } } == [["Warp core", "Vexatron Labs"]])
+    }
+
+    /// Adjacent tables must NOT merge into one block.
+    @Test func adjacentTablesStaySeparateBlocks() {
+        let markdown = """
+            | Módulo | Dono |
+            | --- | --- |
+            | Warp core | Vexatron Labs |
+
+            | Risco | Dono |
+            | --- | --- |
+            | Sonar drift | Quoll Harbor |
+            """
+        let blocks = MarkdownBlocks.parse(markdown)
+        #expect(blocks.count == 2)
+        let headers = blocks.compactMap { block -> [String]? in
+            guard case .table(let header, _, _) = block.kind else { return nil }
+            return header.map { String($0.characters) }
+        }
+        #expect(headers == [["Módulo", "Dono"], ["Risco", "Dono"]])
+    }
+
     @Test func emptyAndPlainInputs() {
         #expect(MarkdownBlocks.parse("").isEmpty)
         let plain = MarkdownBlocks.parse("só um parágrafo")

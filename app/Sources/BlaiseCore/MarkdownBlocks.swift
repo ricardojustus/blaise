@@ -20,6 +20,12 @@ public struct MarkdownBlock: Identifiable, Equatable, Sendable {
         case codeBlock
         case blockQuote
         case thematicBreak
+        /// GFM table: header cells, body rows, one alignment per column
+        /// (straight from the parser's `.table(columns:)` intent).
+        case table(
+            header: [AttributedString],
+            rows: [[AttributedString]],
+            alignments: [PresentationIntent.TableColumn.Alignment])
     }
 
     public let id: Int
@@ -48,18 +54,41 @@ public enum MarkdownBlocks {
         var blocks: [MarkdownBlock] = []
         var currentIntent: PresentationIntent??
         var currentText = AttributedString()
+        var table: TableAccumulator?
+
+        // A table spans many runs (one per cell); the run loop's intent
+        // grouping already isolates each cell, so cells accumulate here until
+        // a run leaves the table (or a DIFFERENT table starts — adjacent
+        // tables carry distinct `.table` component identities).
+        func flushTable() {
+            guard let finished = table else { return }
+            table = nil
+            guard let block = finished.block(id: blocks.count) else { return }
+            blocks.append(block)
+        }
 
         func flush() {
             guard let intent = currentIntent else { return }
+            defer { currentText = AttributedString() }
+            var text = currentText
+            text.presentationIntent = nil
+
+            if let cell = TableCell(intent ?? nil) {
+                if table?.tableID != cell.tableID {
+                    flushTable()
+                    table = TableAccumulator(cell)
+                }
+                table?.append(cell, text: text)
+                return
+            }
+            flushTable()
+
             let trimmedEmpty = String(currentText.characters)
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let kind = classify(intent ?? nil)
             if !trimmedEmpty || kind == .thematicBreak {
-                var text = currentText
-                text.presentationIntent = nil
                 blocks.append(MarkdownBlock(id: blocks.count, kind: kind, text: text))
             }
-            currentText = AttributedString()
         }
 
         for run in attributed.runs {
@@ -71,6 +100,7 @@ public enum MarkdownBlocks {
             currentText += AttributedString(attributed[run.range])
         }
         flush()
+        flushTable()
         return blocks
     }
 
@@ -111,6 +141,89 @@ public enum MarkdownBlocks {
             return .listItem(ordinal: innermostOrdered ? ordinal : nil, depth: max(listDepth, 1))
         }
         return .paragraph
+    }
+}
+
+// MARK: - Table grouping
+
+/// The table coordinates of one cell run, or nil when the run is not a table
+/// cell (the parse loop's table/not-table switch).
+private struct TableCell {
+    let tableID: Int
+    let alignments: [PresentationIntent.TableColumn.Alignment]
+    let rowID: Int
+    let isHeader: Bool
+    let column: Int
+
+    init?(_ intent: PresentationIntent?) {
+        guard let intent else { return nil }
+        var table: (id: Int, alignments: [PresentationIntent.TableColumn.Alignment])?
+        var row: (id: Int, isHeader: Bool)?
+        var column: Int?
+        for component in intent.components {
+            switch component.kind {
+            case .table(let columns):
+                table = (component.identity, columns.map(\.alignment))
+            case .tableHeaderRow:
+                row = (component.identity, true)
+            case .tableRow:
+                row = (component.identity, false)
+            case .tableCell(let columnIndex):
+                column = columnIndex
+            default:
+                break
+            }
+        }
+        guard let table, let row, let column else { return nil }
+        self.tableID = table.id
+        self.alignments = table.alignments
+        self.rowID = row.id
+        self.isHeader = row.isHeader
+        self.column = column
+    }
+}
+
+private struct TableAccumulator {
+    let tableID: Int
+    let alignments: [PresentationIntent.TableColumn.Alignment]
+    private var header: [AttributedString] = []
+    private var rows: [[AttributedString]] = []
+    private var currentRowID: Int?
+
+    init(_ cell: TableCell) {
+        tableID = cell.tableID
+        alignments = cell.alignments
+    }
+
+    mutating func append(_ cell: TableCell, text: AttributedString) {
+        if currentRowID != cell.rowID {
+            currentRowID = cell.rowID
+            if !cell.isHeader { rows.append([]) }
+        }
+        // Column-indexed placement, so an empty cell doesn't shift the row.
+        func place(_ row: inout [AttributedString]) {
+            while row.count <= cell.column { row.append(AttributedString()) }
+            row[cell.column] = text
+        }
+        if cell.isHeader {
+            place(&header)
+        } else if !rows.isEmpty {
+            place(&rows[rows.count - 1])
+        }
+    }
+
+    func block(id: Int) -> MarkdownBlock? {
+        guard !header.isEmpty || !rows.isEmpty else { return nil }
+        // Flat text keeps `MarkdownBlock.text` meaningful for any plain-text
+        // consumer; the view renders from the kind's cells.
+        let flattened = ([header] + rows)
+            .filter { !$0.isEmpty }
+            .map { $0.map { String($0.characters) }.joined(separator: " | ") }
+            .joined(separator: "\n")
+        return MarkdownBlock(
+            id: id,
+            kind: .table(header: header, rows: rows, alignments: alignments),
+            text: AttributedString(flattened))
     }
 }
 

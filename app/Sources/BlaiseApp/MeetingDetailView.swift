@@ -1122,6 +1122,54 @@ struct MarkdownBlocksView: View {
                 .textSelection(.enabled)
         case .thematicBreak:
             Divider()
+        case .table(let header, let rows, let alignments):
+            // Horizontal scroll so a wide table never clips the notes column.
+            ScrollView(.horizontal, showsIndicators: false) {
+                Grid(alignment: .topLeading, horizontalSpacing: 14, verticalSpacing: 6) {
+                    if !header.isEmpty {
+                        GridRow {
+                            ForEach(Array(header.enumerated()), id: \.offset) { column, cell in
+                                tableCell(cell, alignments: alignments, column: column, header: true)
+                            }
+                        }
+                        Divider()
+                    }
+                    ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                        GridRow {
+                            ForEach(Array(row.enumerated()), id: \.offset) { column, cell in
+                                tableCell(cell, alignments: alignments, column: column, header: false)
+                            }
+                        }
+                        if index < rows.count - 1 {
+                            Divider().opacity(0.4)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private func tableCell(
+        _ cell: AttributedString,
+        alignments: [PresentationIntent.TableColumn.Alignment],
+        column: Int,
+        header: Bool
+    ) -> some View {
+        SearchHighlightedText(source: cell, terms: searchTerms)
+            .font(Design.readingFont(14, weight: header ? .semibold : .regular))
+            .foregroundStyle(.primary.opacity(header ? 1 : 0.88))
+            .textSelection(.enabled)
+            .gridColumnAlignment(columnAlignment(alignments, column))
+    }
+
+    private func columnAlignment(
+        _ alignments: [PresentationIntent.TableColumn.Alignment], _ column: Int
+    ) -> HorizontalAlignment {
+        switch alignments.indices.contains(column) ? alignments[column] : .left {
+        case .center: .center
+        case .right: .trailing
+        default: .leading
         }
     }
 }
