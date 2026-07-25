@@ -138,7 +138,8 @@ public struct SlackHuddleEvent: Decodable, Sendable, Equatable {
     /// Whether the user is currently in a huddle (`huddle_state`).
     public var isInHuddle: Bool { user.profile?.huddleState == Self.inHuddleState }
 
-    /// Backstop expiry (`profile.huddle_state_expiration_ts`, epoch seconds).
+    /// Wire-shape fidelity only: parsed from `profile.huddle_state_expiration_ts`
+    /// (epoch seconds), never consulted by production code (C15 spec, "Lingering state").
     public var expirationTs: Int64? { user.profile?.huddleStateExpirationTs }
 
     /// Display-name preference (contract): `display_name`, else `real_name`,

@@ -18,25 +18,6 @@ private final class LifecycleRecorder: MeetBatchIngesting, @unchecked Sendable {
     var count: Int { store.withLock { $0.count } }
 }
 
-/// Structural mirror of the model's private settings record. Decoding this from
-/// the settings store lets a test observe that a lifecycle Task ran to
-/// COMPLETION: persisting settings is the Task's last action, so every step
-/// before it — the tracker identity push/clear, the socket start/stop — has
-/// already happened.
-///
-/// Two traps this shape exists to avoid. (1) Polling `model.enabled` does not
-/// work at all: it is assigned SYNCHRONOUSLY before the Task starts, so the
-/// condition is true immediately and the wait is a no-op. (2) Polling persisted
-/// `enabled` for a value it ALREADY holds is the same no-op one level down —
-/// the poll evaluates its condition before its first sleep, so a settle that
-/// merely re-observes existing state returns without waiting. Waits that need
-/// to observe a TRANSITION key on `memberID` instead, which only the surviving
-/// lifecycle task can write.
-private struct PersistedSlackSettings: Codable {
-    var enabled: Bool
-    var memberID: String
-}
-
 @MainActor
 struct SlackHuddlesModelTests {
     private func makeModel(
@@ -283,8 +264,16 @@ struct SlackHuddlesModelTests {
         // stale disable must not clear the identity the re-enable just pushed.
         model.setEnabled(false)
         model.setEnabled(true)
+        // Waits for a TRANSITION rather than a state: `enabled` already holds
+        // its expected value here, so settling on it would not wait at all.
+        // Only the surviving lifecycle task can persist the new member id, so
+        // seeing it proves that task completed.
         #expect(
-            await settleLifecycle(settings, memberID: "U987ZY6XW"),
+            await waitUntilApp {
+                let persisted = try? await settings.get(
+                    SlackHuddlesModel.settingsKey, as: SlackHuddlesSettings.self)
+                return (persisted ?? nil)?.memberID == "U987ZY6XW"
+            },
             "the surviving lifecycle task never completed")
 
         await tracker.handle(
@@ -301,26 +290,14 @@ struct SlackHuddlesModelTests {
     /// persisted settings — the Task's final action, so every earlier step is
     /// guaranteed done. Never `_ =`-discard the result: a poll that times out
     /// returns false, and in a test whose assertion is "nothing happened" a
-    /// silent timeout reads exactly like success.
+    /// silent timeout reads exactly like success. Polling `model.enabled`
+    /// instead does not work at all: it is assigned SYNCHRONOUSLY before the
+    /// Task starts, so the condition is true immediately and the wait is a no-op.
     private func settleLifecycle(_ settings: SettingsStore, enabled expected: Bool) async -> Bool {
         await waitUntilApp {
             let persisted = try? await settings.get(
-                SlackHuddlesModel.settingsKey, as: PersistedSlackSettings.self)
+                SlackHuddlesModel.settingsKey, as: SlackHuddlesSettings.self)
             return (persisted ?? nil)?.enabled == expected
-        }
-    }
-
-    /// Waits for a TRANSITION rather than a state. Use when the value being
-    /// waited on may already hold the expected result — `settleLifecycle` would
-    /// then return without waiting at all, because the poll evaluates its
-    /// condition before its first sleep. Only the surviving lifecycle task can
-    /// persist the new member id, so seeing it proves that task completed.
-    private func settleLifecycle(_ settings: SettingsStore, memberID expected: String) async -> Bool
-    {
-        await waitUntilApp {
-            let persisted = try? await settings.get(
-                SlackHuddlesModel.settingsKey, as: PersistedSlackSettings.self)
-            return (persisted ?? nil)?.memberID == expected
         }
     }
 

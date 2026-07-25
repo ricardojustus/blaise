@@ -140,23 +140,26 @@ struct SlackHuddleTrackerTests {
         #expect(rec.all[0].roster.allSatisfy { $0.isSelf })  // only self
     }
 
-    @Test("expiration is advisory: a passed expiry never ends the call")
-    func expirationAdvisory() async {
+    @Test("a long-expired huddle_state stamp never ends the call")
+    func expiredStampNeverEndsTheCall() async {
         let rec = BatchRecorder()
         let tracker = makeTracker(rec)
+        // The event carries an expiry that passes almost immediately. The
+        // tracker does not read it at all: the stamp is untrusted JSON against
+        // wall clock with an unverified refresh cadence, and ending a live
+        // recording on it would destroy a meeting's transcript and notes
+        // (hard floor 1). Ends belong to an explicit self leave and to
+        // MeetCallTracker's stale-signal watchdog.
         let expiry = Int64(t(10).timeIntervalSince1970)
         await tracker.handle(
             selfEvent(callID: "R1", inHuddle: true, ts: "1000.1", expiration: expiry), at: t(0))
-        await tracker.tick(now: t(50))  // < expiry + 120 (and < 60 s, no heartbeat) → still live
+        await tracker.tick(now: t(50))  // < 60 s, no heartbeat yet
         #expect(rec.lifecycleKinds == [.callStarted])
-        // > expiry + 120: the stale stamp must NOT end the call — Slack's
-        // refresh cadence for the stamp is unverified, and a false end here
-        // would auto-stop a live recording (hard floor 1). The call stays
-        // alive and heartbeats keep flowing.
+        // Long past the expiry: the call stays alive and heartbeats keep flowing.
         await tracker.tick(now: t(131))
         #expect(rec.all.compactMap(\.lifecycle).allSatisfy { $0.kind != .callEnded })
         #expect(rec.all.last?.lifecycle?.kind == .heartbeat)
-        await tracker.tick(now: t(200))  // stamp cleared → no re-fire either
+        await tracker.tick(now: t(200))  // still no end, however stale the stamp looks
         #expect(rec.all.compactMap(\.lifecycle).allSatisfy { $0.kind != .callEnded })
         // The trusted signal keeps its power: an explicit self leave ends it.
         await tracker.handle(selfEvent(callID: nil, inHuddle: false, ts: "1000.9"), at: t(210))
@@ -221,8 +224,8 @@ struct SlackHuddleTrackerTests {
     /// self event flushes IMMEDIATELY — without waiting for a tick. That flush
     /// must fold the heartbeat too, or it consumes the 60 s heartbeat slot with
     /// a kind-less batch and the grace-resume is delayed exactly as it was
-    /// before the fix. Discriminating: revert the `withHeartbeat` argument at
-    /// the immediate door and this batch carries `lifecycle: nil`.
+    /// before the fix. Discriminating: drop the `reviving` fold inside
+    /// `flushRoster` and this batch carries `lifecycle: nil`.
     ///
     /// (An earlier version of this test drove the no-roster path instead. That
     /// one was NOT discriminating — the ordinary cadence heartbeat fires there

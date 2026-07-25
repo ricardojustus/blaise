@@ -53,10 +53,9 @@ code (`MeetEventsIngestor.ingest(batch:)`). A recorded huddle files under
   restrict app installs need admin approval.
 - **Lingering state.** `huddle_state` can linger after a huddle ends. End
   detection has two legs: an explicit state clear (the trusted signal), and the
-  existing recording watchdog. `huddle_state_expiration_ts` is **advisory only**
-  — it is untrusted JSON compared against wall clock and Slack's refresh cadence
-  for it is unverified, so a passed expiry is logged and cleared, never treated
-  as a leave. Ending a live recording on it would irrecoverably destroy that
+  existing recording watchdog. `huddle_state_expiration_ts` is parsed but
+  never consulted — it is an untrusted timestamp with an unverified refresh
+  cadence, and ending a live recording on it would irrecoverably destroy that
   meeting's transcript and notes.
 - **Belief is bounded.** Between self events "still in a call" is belief, and
   both the heartbeat and the roster flush are manufactured from it. After 4
@@ -134,17 +133,13 @@ Driven per `user_huddle_changed` event plus a periodic evaluation tick:
    otherwise ignored. Blaise only ever tracks huddles you are in.
 5. **Self leaves** (self event, state cleared or a different call id): emit
    `callEnded` (`reason: "left"`); clear state.
-6. **Expiration advisory** (tick): `now > huddle_state_expiration_ts + 120 s`
-   with no refreshing self event → log once and clear the stamp. **No lifecycle
-   is emitted and the call is never ended**: the stamp is untrusted and its
-   refresh cadence unverified, so it must not stop a possibly-live recording.
-7. **Heartbeat** (tick): while in a call, emit a `heartbeat` lifecycle when no
+6. **Heartbeat** (tick): while in a call, emit a `heartbeat` lifecycle when no
    other batch has shipped for 60 s (feeds the recording watchdog's 5-min
    silence timer). Every emitted batch — callStarted, a roster flush, callEnded
    — counts as liveness and resets that 60 s window, so a busy call never emits
    a redundant heartbeat, and no two batches ever share a timestamp (which the
    downstream monotonic guard would otherwise reject).
-8. **Liveness-belief bound** (tick): 4 hours past the last genuine self event,
+7. **Liveness-belief bound** (tick): 4 hours past the last genuine self event,
    ALL manufactured liveness STOPS — heartbeats AND roster flushes (rule 2
    emits are liveness downstream exactly as a heartbeat is). The call is not
    ended — going quiet lets the recording watchdog reclaim the session through

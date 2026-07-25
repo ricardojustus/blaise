@@ -13,7 +13,7 @@ import os
 // tokens live in the Keychain and never leave the machine except as Blaise's
 // own calls to slack.com.
 
-private struct SlackHuddlesSettings: Codable, Equatable, Sendable {
+struct SlackHuddlesSettings: Codable, Equatable, Sendable {
     var enabled: Bool
     var memberID: String
     /// Workspace name from `auth.test`, cached for the status line.
@@ -491,8 +491,7 @@ actor SlackSocketClient {
         guard let urlError = error as? URLError else { return false }
         switch urlError.code {
         case .notConnectedToInternet, .networkConnectionLost, .timedOut,
-            .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
-            .dataNotAllowed, .internationalRoamingOff:
+            .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed:
             return true
         default:
             return false

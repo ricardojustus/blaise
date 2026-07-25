@@ -1,6 +1,6 @@
 # C15 Spec — Slack Huddles integration (native, Socket Mode)
 
-CHANGELOG: v1.2 (2026-07-24) — pre-merge review amendments (five rounds, two independent adversarial lenses; record held privately by the maintainer). End detection loses the expiration leg: `huddle_state_expiration_ts` is now ADVISORY (logged and cleared, never `callEnded`) because the stamp is untrusted JSON against wall clock with an unverified refresh cadence, and a false stop irrecoverably destroys a meeting's transcript and notes. Replacing it, a **liveness-belief bound** (rule 8): 4 h with no genuine self event stops ALL manufactured liveness — heartbeats and roster flushes alike, since downstream rearms its watchdog from any code-carrying batch — without ending the call, handing the end to the recording watchdog's normal path. Touchpoint gains sub-question (f) (self-event cadence during a long huddle), which sizes both constants and would allow tightening the bound by an order of magnitude if Slack refreshes periodically.  v1.1 (2026-07-14) — adversarial-review amendments after implementation (all fixed + tested, suite green): (1) **prompt socket teardown** — `URLSessionWebSocketTask.receive()` does NOT observe Swift task cancellation, so the pump wraps every receive in `withTaskCancellationHandler` that cancels the channel; without it, a Disconnect left the socket live and a late frame could still trigger an auto-record offer after the user wiped their tokens (Critical; the original test doubles used `Task.sleep`, which honors cancellation, and masked this — the suite now includes a genuinely non-cooperative channel stub); (2) **token rotation** — `connect()`'s success path stops the running socket (awaited) before starting with fresh tokens; (3) **connection-state feedback** — `run()` reports hello/session-end to the model; ≥3 consecutive hello-less sessions surface a persistent failure into `lastError` (mirrors the extension's 3×401 badge rule) and the status line shows Connecting/Reconnecting; (4) **liveness collision** — EVERY emitted batch counts as heartbeat liveness (a tick that flushed a roster never also emits a heartbeat), closing a same-millisecond collision with `MeetCallTracker`'s monotonic guard that could delay grace-resume by up to 60 s; (5) Keychain read failure at load is surfaced in Settings (was write-only state); (6) the tracker tick loop exits on actor dealloc; (7) frames are ACKed via a lenient envelope-id pre-parse even when the strict frame decode fails (unacked envelopes are redelivered forever). Implementation deviations adopted into the spec: unified 5 s evaluation tick (roster coalescing + heartbeat + expiration backstop — one timer seam); the expiration backstop takes the latest self event's expiry verbatim (a refresh omitting it clears the backstop — heartbeats/watchdog carry liveness; safer than a stale expiry force-ending a live huddle); stale foreign-ring entries (> 60 s) never seed a late self-join's roster; **migration v18** (below) — v1 baked a frozen `CHECK(source IN (…))` into `meeting`, so adding a `MeetingSource` case requires the standard SQLite table rebuild.  v1 (2026-07-14) — initial spec.
+CHANGELOG: v1.3 (2026-07-25) — operator-accepted minimality trim, back-propagated: the expiration advisory (former rule 6) is REMOVED — `huddle_state_expiration_ts` is parsed but never consulted; end detection rests on the explicit state clear and the tracker watchdog; the liveness-belief bound (now rule 7; heartbeat now rule 6) hands the end to that watchdog rather than ending the call itself. Touchpoint (f) remains load-bearing for the liveness bound alone.  v1.2 (2026-07-24) — pre-merge review amendments (five rounds, two independent adversarial lenses; record held privately by the maintainer). End detection loses the expiration leg: `huddle_state_expiration_ts` is now ADVISORY (logged and cleared, never `callEnded`) because the stamp is untrusted JSON against wall clock with an unverified refresh cadence, and a false stop irrecoverably destroys a meeting's transcript and notes. Replacing it, a **liveness-belief bound** (rule 8): 4 h with no genuine self event stops ALL manufactured liveness — heartbeats and roster flushes alike, since downstream rearms its watchdog from any code-carrying batch — without ending the call, handing the end to the recording watchdog's normal path. Touchpoint gains sub-question (f) (self-event cadence during a long huddle), which sizes both constants and would allow tightening the bound by an order of magnitude if Slack refreshes periodically.  v1.1 (2026-07-14) — adversarial-review amendments after implementation (all fixed + tested, suite green): (1) **prompt socket teardown** — `URLSessionWebSocketTask.receive()` does NOT observe Swift task cancellation, so the pump wraps every receive in `withTaskCancellationHandler` that cancels the channel; without it, a Disconnect left the socket live and a late frame could still trigger an auto-record offer after the user wiped their tokens (Critical; the original test doubles used `Task.sleep`, which honors cancellation, and masked this — the suite now includes a genuinely non-cooperative channel stub); (2) **token rotation** — `connect()`'s success path stops the running socket (awaited) before starting with fresh tokens; (3) **connection-state feedback** — `run()` reports hello/session-end to the model; ≥3 consecutive hello-less sessions surface a persistent failure into `lastError` (mirrors the extension's 3×401 badge rule) and the status line shows Connecting/Reconnecting; (4) **liveness collision** — EVERY emitted batch counts as heartbeat liveness (a tick that flushed a roster never also emits a heartbeat), closing a same-millisecond collision with `MeetCallTracker`'s monotonic guard that could delay grace-resume by up to 60 s; (5) Keychain read failure at load is surfaced in Settings (was write-only state); (6) the tracker tick loop exits on actor dealloc; (7) frames are ACKed via a lenient envelope-id pre-parse even when the strict frame decode fails (unacked envelopes are redelivered forever). Implementation deviations adopted into the spec: unified 5 s evaluation tick (roster coalescing + heartbeat + expiration backstop — one timer seam); the expiration backstop takes the latest self event's expiry verbatim (a refresh omitting it clears the backstop — heartbeats/watchdog carry liveness; safer than a stale expiry force-ending a live huddle); stale foreign-ring entries (> 60 s) never seed a late self-join's roster; **migration v18** (below) — v1 baked a frozen `CHECK(source IN (…))` into `meeting`, so adding a `MeetingSource` case requires the standard SQLite table rebuild.  v1 (2026-07-14) — initial spec.
 
 ## Goal
 
@@ -34,10 +34,10 @@ call id is a co-participant. Join/leave timing = event arrival times.
   admin approval — stated in the docs, not worked around.
 - `huddle_state` can linger after a huddle ends. End detection has two legs: an
   explicit state clear (the trusted signal) and the existing tracker watchdog.
-  `huddle_state_expiration_ts` is ADVISORY — untrusted JSON compared against wall
-  clock, with an unverified refresh cadence, so a passed expiry is logged and
-  cleared and never ends a call (hard floor 1: a false stop irrecoverably
-  destroys that meeting's transcript and notes).
+  `huddle_state_expiration_ts` is parsed but never consulted — an untrusted
+  timestamp with an unverified refresh cadence must never end a call (hard
+  floor 1: a false stop irrecoverably destroys that meeting's transcript and
+  notes).
 - Between self events, "in a call" is BELIEF and the heartbeat is manufactured
   from it. Every heartbeat refreshes the downstream watchdog's signal clock, so
   an undelivered self-leave would suppress that watchdog indefinitely — hence
@@ -124,7 +124,7 @@ caller's last resort (cached per user id; nil name beats wrong name).
 State: `selfUserID`, `currentCallID?`, `participants: [userID: (name, joinedAt)]`,
 `seenEventKeys` (dedupe: `user.id + ":" + event_ts`, FIFO-capped 4096), foreign
 ring, roster/heartbeat clocks. One unified 5 s evaluation tick drives roster
-coalescing, heartbeat, the expiration advisory, the liveness-belief bound, and ring pruning; tests drive
+coalescing, heartbeat, the liveness-belief bound, and ring pruning; tests drive
 `tick(now:)` with an injected clock (`MeetCallTracker` pattern).
 
 Transitions (all driven by `user_huddle_changed`):
@@ -148,23 +148,18 @@ Transitions (all driven by `user_huddle_changed`):
    call are ignored. Blaise only ever observes huddles the user is in.
 5. **Self leaves** — self event with state cleared or different call id: emit
    `callEnded`, reason `"left"`.
-6. **Expiration advisory** — tick: `now > huddle_state_expiration_ts + 120 s` with
-   no refreshing self event → log once, clear the stamp. **No lifecycle emitted;
-   the call is never ended.** The latest self event's expiry is taken verbatim (a
-   refresh omitting it clears the stamp). An untrusted timestamp must never stop a
-   possibly-live recording.
-7. **Heartbeat** — while in a call, a `heartbeat` lifecycle batch every 60 s of
+6. **Heartbeat** — while in a call, a `heartbeat` lifecycle batch every 60 s of
    emission silence. EVERY emitted batch counts as liveness: a tick that flushed
    a roster never also emits a heartbeat, so no two batches share a timestamp and
    `MeetCallTracker`'s monotonic guard never starves the kind-gated grace-resume
    path (same rule as the extension's "heartbeats skipped when any batch shipped
    within 60 s").
-8. **Liveness-belief bound** — tick: `SlackHuddleTracker.livenessBeliefMaxAgeSeconds`
+7. **Liveness-belief bound** — tick: `SlackHuddleTracker.livenessBeliefMaxAgeSeconds`
    (4 h) past the last genuine self event, ALL manufactured liveness stops —
    heartbeats AND roster flushes (rule 2), since downstream rearms its watchdog
    from ANY code-carrying batch, so gating only the heartbeat leaves the bound
    inert whenever co-participants remain in the huddle. The call is not ended
-   and no lifecycle is emitted. Rationale: rule 7's heartbeat is manufactured from
+   and no lifecycle is emitted. Rationale: rule 6's heartbeat is manufactured from
    belief and refreshes `MeetCallTracker.lastSignalAt`, so an undelivered
    self-leave would suppress that 5-min watchdog forever and leave a recording
    running indefinitely. Going quiet instead lets the watchdog stop the recording
@@ -222,7 +217,7 @@ correlation, pending storage, roster absorption, post-commit signal forward to
 
 Decode fixtures (hello / disconnect / envelope variants incl. missing call id and
 empty names); every tracker transition above (redelivery dedupe, ring flush +
-stale-ring guard, the expiration advisory, the liveness-belief bound (heartbeats AND roster flushes stop; a co-participant event emits nothing; revival flushes the buffered roster), heartbeat cadence + roster-suppression +
+stale-ring guard, a long-expired stamp never ends the call, the liveness-belief bound (heartbeats AND roster flushes stop; a co-participant event emits nothing; revival flushes the buffered roster), heartbeat cadence + roster-suppression +
 no-same-tick-collision, rejoin semantics, unconfigured-self no-op); socket client
 (connections.open non-ok, ack-before-process, ack-despite-undecodable-frame,
 disconnect→reconnect, backoff caps, status reporting, **prompt teardown against a
@@ -253,11 +248,11 @@ leaving; **(f) SELF-EVENT CADENCE during a long huddle — does Slack re-emit a 
 `user_huddle_changed` (refreshing `huddle_state_expiration_ts`) periodically, or
 only at join?** Amend this spec with findings (C12's field-amendment precedent).
 
-(f) is load-bearing for rules 6 and 8: both the expiration advisory and the 4 h
-liveness-belief bound are sized for the pessimistic answer ("only at join").
-A confirmed periodic refresh would let rule 8's constant tighten by an order of
-magnitude, and would make a passed expiry meaningfully informative rather than
-merely advisory. Until (f) is answered, treat both constants as deliberately
+(f) is load-bearing for rule 7: the 4 h liveness-belief bound is sized for the
+pessimistic answer ("only at join").
+A confirmed periodic refresh would let rule 7's constant tighten by an order of
+magnitude, and would make a passed expiry informative (today it is simply
+unused). Until (f) is answered, treat that constant as deliberately
 conservative rather than tuned.
 
 ## Out of scope
