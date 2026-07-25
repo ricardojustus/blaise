@@ -453,13 +453,12 @@ private func audioNames(_ dir: URL) -> [String] {
             "v1 was delivered to the OLD root: no candidate here, so no remote rm command")
     }
 
-    /// R3-C1 (Critical), local half — Codex's same-path replacement, literally:
-    /// deliver to a folder/volume at `<path>`, lose it, put a DIFFERENT store at
-    /// the same `<path>`, and re-pick it in Settings. Every visible part of the
-    /// configuration is identical, so a path-keyed identity handed the
-    /// replacement the old store's deletion authority. The re-pick bumps the
-    /// destination epoch, so v1's delivered row belongs to the previous
-    /// instance and the same-named file here — somebody else's — survives.
+    /// Same-path replacement: deliver to a folder/volume at `<path>`, lose it,
+    /// put a DIFFERENT store at the same `<path>`, and re-pick it in Settings.
+    /// Every visible part of the configuration is identical, so the identity
+    /// matches and v1's delivered row IS a candidate here. The BYTES are what
+    /// saves the same-named file: it is somebody else's, it does not hash to
+    /// the name it wears, and it survives untouched.
     @MainActor @Test func localSamePathReplacementNeverDeletesTheNewResourcesFile() async throws {
         let database = try makeDatabase()
         let v1 = try await seedDeliverable(database, title: "Replaced at the same path")
@@ -475,16 +474,13 @@ private func audioNames(_ dir: URL) -> [String] {
             == ["\(v1.versionHash).json"], "v1 landed at the original store")
 
         // The store at `<path>` is replaced, and the user re-picks the folder
-        // they have always had — through the real Settings path, which is where
-        // the destination-instance epoch is bumped.
+        // they have always had — through the real Settings path.
         let store = SettingsStore(database: database)
-        #expect(await HandoffDestination.epoch(from: store) == 0)
         try FileManager.default.removeItem(at: path)
         try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
         let model = HandoffSettingsModel(settings: store, kicker: NoopHandoffKicker())
         await model.load()
         #expect(await model.chooseLocalFolder(path))
-        #expect(await HandoffDestination.epoch(from: store) == 1, "the re-pick is a new instance")
 
         // A file with v1's name at the new store: another producer's, not ours.
         let dest = path.appendingPathComponent(v1.meetingID, isDirectory: true)
@@ -499,44 +495,13 @@ private func audioNames(_ dir: URL) -> [String] {
 
         #expect(
             jsonNames(dest) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
-            "a version delivered to the resource that WAS here authorizes nothing at this one")
+            "the name was authorized, the bytes were not")
         #expect(
             try Data(contentsOf: dest.appendingPathComponent("\(v1.versionHash).json")) == foreign,
             "the foreign file is untouched, byte for byte")
     }
 
-    /// R3-C1 (Critical), SSH half: the endpoint spelling (user, host list, root)
-    /// is unchanged — the machine behind it was re-provisioned, and the user's
-    /// only trace of that is a Settings edit (here the identity file, the new
-    /// key). That edit bumps the destination epoch, so v1's delivery to the OLD
-    /// machine stops being authority and no remote rm is sent.
-    @MainActor @Test func sshSettingsEditRetiresThePreviousMachinesAuthority() async throws {
-        let database = try makeDatabase()
-        let v1 = try await seedDeliverable(database, title: "Reprovisioned host")
-        let store = SettingsStore(database: database)
-        try await store.set(HandoffDestination.Key.removeSupersededPayloads, to: true)
-        let first = makeWorker(database)
-        await first.kick()
-        await first.waitUntilSettled()
-
-        let model = HandoffSettingsModel(settings: store, kicker: NoopHandoffKicker())
-        await model.load()
-        model.identityFile = "~/.ssh/id_ed25519_reprovisioned"
-        #expect(await model.save())
-        #expect(await HandoffDestination.epoch(from: store) == 1, "the edit is a destination change")
-
-        _ = try await enqueueSecondVersion(database, v1.meetingID)
-        let transport = MockTransport()
-        let worker = makeWorker(database, transport: transport)
-        await worker.kick()
-        await worker.waitUntilSettled()
-
-        #expect(
-            transport.calls.count == 1,
-            "v1 was delivered to the previous instance: no candidate here, so no remote rm command")
-    }
-
-    // MARK: - G5 v1.7 (R4-F1 / R4-F2): verify before delete
+    // MARK: - G5 v1.7 (R4-F2): verify before delete
 
     /// R4-F2 (Critical), Codex's trace at the seam that times it: the local
     /// cleanup dereferences the destination PATHNAME long after the resource
@@ -627,58 +592,6 @@ private func audioNames(_ dir: URL) -> [String] {
         #expect(
             jsonNames(path.appendingPathComponent(v1.meetingID)) == [],
             "identical bytes ARE the payload the records authorize: removable")
-    }
-
-    /// R4-F1 (Critical): the destination-defining setting was written and the
-    /// epoch write beside it was not — the failure Codex's trace turns into
-    /// revived deletion authority. Here the epoch value is present but
-    /// UNREADABLE, which pre-fix read as `0`: the value that maximally matches
-    /// historical rows. It is not a value — no authority is derivable, so the
-    /// drain deletes nothing. The planted file is Blaise's OWN delivered
-    /// payload, so it hashes to its own name and the content check would let it
-    /// go; only the epoch fix saves it.
-    @Test func anUnreadableDestinationEpochDeletesNothingThisDrain() async throws {
-        let database = try makeDatabase()
-        let v1 = try await seedDeliverable(database, title: "Epoch unreadable")
-        let folder = try g5TempFolder()
-        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: true)
-
-        let first = makeWorker(database)
-        await first.start()
-        await first.waitUntilSettled()
-        let destDir = folder.appendingPathComponent(v1.meetingID)
-        #expect(jsonNames(destDir) == ["\(v1.versionHash).json"])
-        let deliveredBytes = try Data(
-            contentsOf: destDir.appendingPathComponent("\(v1.versionHash).json"))
-        #expect(
-            EvidencePayloadBuilder.sha256Hex(deliveredBytes) == v1.versionHash,
-            "the candidate hashes to its own name: the content check does not save it here")
-
-        // The destination edit landed; the epoch write beside it did not.
-        try await database.pool.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO app_setting (key, value) VALUES (?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                arguments: [HandoffDestination.Key.destinationEpoch, "not-an-int"])
-        }
-        #expect(
-            await HandoffDestination.epoch(from: SettingsStore(database: database)) == nil,
-            "an unreadable epoch is nil — distinct from the absent key's 0")
-
-        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
-        let worker = makeWorker(database)
-        await worker.kick()
-        await worker.waitUntilSettled()
-
-        #expect(
-            jsonNames(destDir) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
-            "no readable epoch ⇒ no deletion authority ⇒ no cleanup this drain")
-        #expect(
-            try Data(contentsOf: destDir.appendingPathComponent("\(v1.versionHash).json"))
-                == deliveredBytes,
-            "untouched, byte for byte")
     }
 
     /// The other half of R2-C1: a version that only ever sat in the queue

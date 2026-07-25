@@ -348,24 +348,13 @@ public actor HandoffWorker: HandoffKicking {
             // immediately before each cleanup, after the transport await.)
             let deliverAudio = await HandoffDestination.deliverAudio(from: settingsStore)
 
-            // G5 v1.6: the identity of the destination INSTANCE this drain
-            // writes to, recorded on every delivered row and required to match
-            // before a payload here may be deleted — the destination epoch plus
-            // the destination CONFIGURATION (never the host that answered, so a
-            // Tailscale→LAN failover is not a destination switch; never the
-            // folder path, so a replacement volume at the same mount point is
-            // not the same store). `endpointIdentity(epoch:)` carries the WHY of
-            // each half. Changing the folder, the remote root, the user or the
-            // host list — or replacing the resource behind an unchanged
-            // configuration — changes it, and then nothing here is provably ours.
-            //
-            // A FAILED epoch read (nil, distinct from an absent key ⇒ 0) is not
-            // a value: cleanup is skipped entirely this drain (R4-F1). The
-            // delivery still stamps `?? 0`, which can only fail toward
-            // UNDER-deletion — a row stamped with a lower epoch than the live
-            // one never matches a later query.
-            let epoch = await HandoffDestination.epoch(from: settingsStore)
-            let identity = destination.endpointIdentity(epoch: epoch ?? 0)
+            // The identity of the destination this drain writes to, recorded on
+            // every delivered row and required to match before a payload here
+            // may be deleted — the destination CONFIGURATION, never the host
+            // that answered (a Tailscale→LAN failover is not a destination
+            // switch). Changing the folder, the remote root, the user or the
+            // host list changes it, and then nothing here is provably ours.
+            let identity = destination.endpointIdentity()
 
             switch destination {
             case .ssh(let settings, let sidecar):
@@ -432,7 +421,7 @@ public actor HandoffWorker: HandoffKicking {
                 // with NO suspension in between. The actor is reentrant at every
                 // await, so any authorization read BEFORE a further await can be
                 // stale by the time it is used — and the user's OFF must win.
-                if outcome.exitStatus == 0, epochIsReadable(epoch, item: claimed) {
+                if outcome.exitStatus == 0 {
                     let hashes = await supersededCandidates(item: claimed, endpoint: identity)
                     if await HandoffDestination.removeSupersededPayloads(from: settingsStore) {
                         await cleanupSupersededSSH(
@@ -487,7 +476,7 @@ public actor HandoffWorker: HandoffKicking {
                 // files are untouched — only THIS meeting's payloads PROVED delivered
                 // here are removed. Same candidates-then-re-read order as the SSH
                 // path (R2-C2), for the same actor-reentrancy reason.
-                if outcome.exitStatus == 0, epochIsReadable(epoch, item: claimed) {
+                if outcome.exitStatus == 0 {
                     let hashes = await supersededCandidates(item: claimed, endpoint: identity)
                     if await HandoffDestination.removeSupersededPayloads(from: settingsStore) {
                         await cleanupSupersededLocal(item: claimed, root: url, hashes: hashes)
@@ -601,17 +590,6 @@ public actor HandoffWorker: HandoffKicking {
     /// enqueued (pending / failed / damaged / superseded), and a version
     /// delivered to a PREVIOUS destination are all excluded — the last of these
     /// is what makes a destination switch safe (round-2 R2-C1).
-    /// Whether the destination epoch was READ this drain (R4-F1). `nil` is a
-    /// failed settings read, not the value `0`: no deletion authority is
-    /// derivable, so this drain deletes nothing and says so.
-    private func epochIsReadable(_ epoch: Int?, item: HandoffItem) -> Bool {
-        guard epoch == nil else { return true }
-        logger.warning(
-            "payload cleanup: the destination epoch could not be read for \(item.meetingID, privacy: .public) — nothing removed this drain; retried next delivery"
-        )
-        return false
-    }
-
     private func supersededCandidates(item: HandoffItem, endpoint: String) async -> [String] {
         let hashes = (try? await repository.deliveredVersionHashes(
             meetingID: item.meetingID, endpoint: endpoint)) ?? []
@@ -628,17 +606,15 @@ public actor HandoffWorker: HandoffKicking {
     /// delivered audio included. FAILURE-ISOLATED: never fails or retries the
     /// JSON queue item — logged and retried on this meeting's next delivery.
     ///
-    /// VERIFY BEFORE DELETE (G5 v1.7, round-4 R4-F1/R4-F2): the candidate set
-    /// names a file; the file's own BYTES decide. A candidate is removed only
-    /// when its SHA-256 equals its filename stem — the store is
-    /// content-addressed, so that is the constructive proof that these bytes
-    /// ARE the payload Blaise's records authorize. Everything the identity
-    /// metadata can get wrong (an epoch that failed to persist, a resource
-    /// swapped at this pathname between the sample and this call, a file system
-    /// that answers no identity) then fails toward under-deletion: a foreign
-    /// file either does not hash to the name and survives, or is byte-identical
-    /// to what Blaise delivered here, in which case removing it destroys
-    /// nothing unique.
+    /// VERIFY BEFORE DELETE (G5 v1.7, round-4 R4-F2): the candidate set names a
+    /// file; the file's own BYTES decide. A candidate is removed only when its
+    /// SHA-256 equals its filename stem — the store is content-addressed, so
+    /// that is the constructive proof that these bytes ARE the payload Blaise's
+    /// records authorize. A resource swapped at this pathname between the
+    /// candidate query and this call then fails toward under-deletion: a
+    /// foreign file either does not hash to the name and survives, or is
+    /// byte-identical to what Blaise delivered here, in which case removing it
+    /// destroys nothing unique.
     private func cleanupSupersededLocal(item: HandoffItem, root: URL, hashes: [String]) async {
         let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
         let candidates = Set(hashes.map { "\($0).json" })
