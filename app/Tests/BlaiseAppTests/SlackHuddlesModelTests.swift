@@ -18,15 +18,23 @@ private final class LifecycleRecorder: MeetBatchIngesting, @unchecked Sendable {
     var count: Int { store.withLock { $0.count } }
 }
 
-/// Structural mirror of the model's private settings record. Decoding this
-/// from the settings store is how a test observes that a lifecycle Task ran to
-/// COMPLETION: persisting settings is the Task's last action, so a persisted
-/// `enabled` matching the requested value means every step before it — the
-/// tracker identity push/clear, the socket start/stop — has already happened.
-/// (Polling `model.enabled` does NOT work: it is assigned synchronously before
-/// the Task starts, so the condition is true immediately and the wait is a no-op.)
+/// Structural mirror of the model's private settings record. Decoding this from
+/// the settings store lets a test observe that a lifecycle Task ran to
+/// COMPLETION: persisting settings is the Task's last action, so every step
+/// before it — the tracker identity push/clear, the socket start/stop — has
+/// already happened.
+///
+/// Two traps this shape exists to avoid. (1) Polling `model.enabled` does not
+/// work at all: it is assigned SYNCHRONOUSLY before the Task starts, so the
+/// condition is true immediately and the wait is a no-op. (2) Polling persisted
+/// `enabled` for a value it ALREADY holds is the same no-op one level down —
+/// the poll evaluates its condition before its first sleep, so a settle that
+/// merely re-observes existing state returns without waiting. Waits that need
+/// to observe a TRANSITION key on `memberID` instead, which only the surviving
+/// lifecycle task can write.
 private struct PersistedSlackSettings: Codable {
     var enabled: Bool
+    var memberID: String
 }
 
 @MainActor
@@ -61,12 +69,15 @@ struct SlackHuddlesModelTests {
     /// inspecting private state.
     private let lifecycleRecorder = LifecycleRecorder()
 
-    /// A huddle event for the configured self member id.
-    private func selfHuddleEvent(callID: String?, inHuddle: Bool, ts: String) -> SlackHuddleEvent {
+    /// A huddle event for a self member id (defaults to the one the tests
+    /// configure at connect).
+    private func selfHuddleEvent(
+        memberID: String = "U012AB3CD", callID: String?, inHuddle: Bool, ts: String
+    ) -> SlackHuddleEvent {
         SlackHuddleEvent(
             type: SlackHuddleEvent.huddleChangedType,
             user: SlackUser(
-                id: "U012AB3CD", name: nil,
+                id: memberID, name: nil,
                 profile: SlackUserProfile(
                     displayName: nil, realName: nil,
                     huddleState: inHuddle ? SlackHuddleEvent.inHuddleState : "default_unset",
@@ -239,13 +250,13 @@ struct SlackHuddlesModelTests {
 
         // Disable → the tracker is cleared, so a fresh event is ignored.
         model.setEnabled(false)
-        _ = await settleLifecycle(settings, enabled: false)
+        #expect(await settleLifecycle(settings, enabled: false), "lifecycle task never settled")
         await tracker.handle(selfHuddleEvent(callID: "R2", inHuddle: true, ts: "2000.1"), at: Date())
         #expect(lifecycleRecorder.count == afterConnect, "disabled ⇒ tracker deaf")
 
         // Re-enable → the member id is pushed back and events land again.
         model.setEnabled(true)
-        _ = await settleLifecycle(settings, enabled: true)
+        #expect(await settleLifecycle(settings, enabled: true), "lifecycle task never settled")
         await tracker.handle(selfHuddleEvent(callID: "R3", inHuddle: true, ts: "3000.1"), at: Date())
         #expect(lifecycleRecorder.count > afterConnect, "re-enabled ⇒ tracker listening again")
         await model.disconnect()
@@ -261,13 +272,24 @@ struct SlackHuddlesModelTests {
         await model.connect()
         let baseline = lifecycleRecorder.count
 
+        // Change the member id so the settle observes a TRANSITION. Waiting on
+        // `enabled: true` here would not wait at all — connect() already
+        // persisted it — and the test would then assert against a tracker the
+        // lifecycle tasks had not finished touching, passing vacuously with the
+        // epoch guards reverted.
+        model.memberID = "U987ZY6XW"
+
         // Both toggles issued before either unstructured Task completes: the
         // stale disable must not clear the identity the re-enable just pushed.
         model.setEnabled(false)
         model.setEnabled(true)
-        _ = await settleLifecycle(settings, enabled: true)
+        #expect(
+            await settleLifecycle(settings, memberID: "U987ZY6XW"),
+            "the surviving lifecycle task never completed")
 
-        await tracker.handle(selfHuddleEvent(callID: "R9", inHuddle: true, ts: "9000.1"), at: Date())
+        await tracker.handle(
+            selfHuddleEvent(memberID: "U987ZY6XW", callID: "R9", inHuddle: true, ts: "9000.1"),
+            at: Date())
         #expect(
             lifecycleRecorder.count > baseline,
             "final state is enabled ⇒ the tracker must still be listening")
@@ -275,12 +297,11 @@ struct SlackHuddlesModelTests {
         await model.disconnect()
     }
 
-    /// Waits for a lifecycle Task to run to COMPLETION, rather than spinning a
-    /// guessed number of yields (a fixed spin either flakes red or passes
-    /// vacuously depending on how long socket teardown actually takes). Keys on
-    /// the persisted settings — the Task's final action — so every earlier step
-    /// is guaranteed done. Uses the file's existing polled idiom.
-    @discardableResult
+    /// Waits for a lifecycle Task to run to COMPLETION by observing the
+    /// persisted settings — the Task's final action, so every earlier step is
+    /// guaranteed done. Never `_ =`-discard the result: a poll that times out
+    /// returns false, and in a test whose assertion is "nothing happened" a
+    /// silent timeout reads exactly like success.
     private func settleLifecycle(_ settings: SettingsStore, enabled expected: Bool) async -> Bool {
         await waitUntilApp {
             let persisted = try? await settings.get(
@@ -289,7 +310,21 @@ struct SlackHuddlesModelTests {
         }
     }
 
-    @Test("no socket is opened while the integration is disabled (startSocket enabled guard)")
+    /// Waits for a TRANSITION rather than a state. Use when the value being
+    /// waited on may already hold the expected result — `settleLifecycle` would
+    /// then return without waiting at all, because the poll evaluates its
+    /// condition before its first sleep. Only the surviving lifecycle task can
+    /// persist the new member id, so seeing it proves that task completed.
+    private func settleLifecycle(_ settings: SettingsStore, memberID expected: String) async -> Bool
+    {
+        await waitUntilApp {
+            let persisted = try? await settings.get(
+                SlackHuddlesModel.settingsKey, as: PersistedSlackSettings.self)
+            return (persisted ?? nil)?.memberID == expected
+        }
+    }
+
+    @Test("INVARIANT: no socket is opened while the integration is disabled")
     func disabledNeverOpensASocket() async throws {
         let rec = SocketRecorder()
         let client = SlackSocketClient(
@@ -305,14 +340,18 @@ struct SlackHuddlesModelTests {
         let afterConnect = rec.channels.withLock { $0.count }
 
         model.setEnabled(false)
-        _ = await settleLifecycle(settings, enabled: false)
+        #expect(await settleLifecycle(settings, enabled: false), "lifecycle task never settled")
 
-        // Every path that can reach startSocket while disabled must refuse:
-        // the launch path, and a stale enable task resolving after the disable.
+        // Drives the reachable disabled-state doors: the launch path, and a
+        // toggle pair whose final state is OFF. This pins the INVARIANT, not
+        // one specific guard — the pre-mutation epoch checks in `setEnabled`
+        // already stop a stale enable before it reaches `startSocket`, so that
+        // method's own `enabled` precondition is defense-in-depth. Both layers
+        // are cheap; the invariant is what must hold.
         model.startIfEnabled()
         model.setEnabled(true)
         model.setEnabled(false)
-        _ = await settleLifecycle(settings, enabled: false)
+        #expect(await settleLifecycle(settings, enabled: false), "lifecycle task never settled")
         // Give any stale task room to do the wrong thing before asserting.
         _ = await waitUntilApp(timeout: .milliseconds(300)) {
             rec.channels.withLock { $0.count } > afterConnect

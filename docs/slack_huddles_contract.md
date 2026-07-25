@@ -59,11 +59,16 @@ code (`MeetEventsIngestor.ingest(batch:)`). A recorded huddle files under
   as a leave. Ending a live recording on it would irrecoverably destroy that
   meeting's transcript and notes.
 - **Belief is bounded.** Between self events "still in a call" is belief, and
-  the heartbeat is manufactured from it. After 4 hours with no genuine self
-  event the tracker stops heartbeating — it does not end the call — which lets
-  the recording watchdog reclaim the session through its normal
-  notify-with-Resume path. Without that bound a dropped self-leave event would
-  keep a recording running indefinitely.
+  both the heartbeat and the roster flush are manufactured from it. After 4
+  hours with no genuine self event the tracker stops **all** manufactured
+  liveness — heartbeats *and* roster flushes — without ending the call, which
+  lets the recording watchdog reclaim the session through its normal path (a
+  notification with Resume when a resume window is configured, the default;
+  an immediate finalize with an informational notification when it is Off —
+  audio retained either way). Gating only the heartbeat would leave the bound
+  inert whenever co-participants stay in the huddle, because downstream rearms
+  its watchdog from any batch. Without the bound a dropped self-leave event
+  would keep a recording running indefinitely.
 
 ## Tokens
 
@@ -140,12 +145,18 @@ Driven per `user_huddle_changed` event plus a periodic evaluation tick:
    a redundant heartbeat, and no two batches ever share a timestamp (which the
    downstream monotonic guard would otherwise reject).
 8. **Liveness-belief bound** (tick): 4 hours past the last genuine self event,
-   heartbeats STOP. The call is not ended — going quiet lets the recording
-   watchdog reclaim the session through its normal notify-with-Resume path.
+   ALL manufactured liveness STOPS — heartbeats AND roster flushes (rule 3
+   emits are liveness downstream exactly as a heartbeat is). The call is not
+   ended — going quiet lets the recording watchdog reclaim the session through
+   its normal path (a notification WITH Resume when a resume window is
+   configured, the default; immediate finalize with an informational
+   notification when it is Off — audio retained either way).
    Because every manufactured heartbeat refreshes that watchdog's signal clock,
    without this bound a dropped self-leave would suppress the watchdog forever
-   and leave a recording running indefinitely. A fresh self event revives the
-   belief and heartbeats resume.
+   and leave a recording running indefinitely. A fresh self event revives the belief; a
+   roster change buffered while stale is not lost — it flushes on the next tick,
+   carrying the heartbeat lifecycle in the SAME batch so the revival is
+   recognised by the kind-gated grace-resume path.
 
 ## App manifest
 

@@ -199,7 +199,19 @@ public actor SlackHuddleTracker {
         if rosterDirty, !beliefIsStale(at: clock), let last = lastRosterFlushAt,
             clock.timeIntervalSince(last) >= Self.rosterCoalesceSeconds
         {
-            await flushRoster(at: clock)
+            // A flush that is the FIRST emission after a stale period carries
+            // the heartbeat lifecycle with it, in ONE batch. Downstream resumes
+            // a grace window only on a kind-carrying batch (`callStarted` /
+            // `heartbeat`) — plain liveness deliberately must not resurrect a
+            // recording — and EVERY emission resets the 60 s heartbeat window.
+            // So a bare roster flush here would consume the revival's slot and
+            // delay the automatic grace-resume by up to a minute of a live
+            // meeting. Emitting two batches at the same instant is not the
+            // alternative: the downstream monotonic guard drops the second
+            // (the same-millisecond collision C15 v1.1 item 4 closed).
+            let reviving = livenessBeliefStale
+            await flushRoster(at: clock, withHeartbeat: reviving)
+            if reviving { livenessBeliefStale = false }
         }
 
         // Expiration ADVISORY: `now > huddle_state_expiration_ts + 120 s` with
@@ -247,7 +259,7 @@ public actor SlackHuddleTracker {
             if currentCallID == callID {
                 // Refresh: same call, no lifecycle re-emit. Take the latest
                 // event's expiration verbatim (a refresh that omits it clears
-                // the backstop — a live huddle is kept alive by heartbeats/the
+                // the advisory — a live huddle is kept alive by heartbeats/the
                 // watchdog, not force-ended on a stale expiry).
                 expirationTs = event.expirationTs
                 lastSelfEventAt = at
@@ -363,10 +375,16 @@ public actor SlackHuddleTracker {
     }
 
     private func noteRosterChanged(at: Date) async {
-        // Stale belief: record the change but emit nothing. `rosterDirty` stays
-        // set, so a genuine self event revives the belief and the next tick
-        // flushes the accumulated roster — nothing is lost, and the roster is
-        // cumulative downstream so a suppressed flush retracts nobody.
+        // Stale belief: record the change but emit nothing. `rosterDirty`
+        // stays set, so a self event that REVIVES the belief (a refresh for the
+        // same call) flushes the accumulated roster on the next tick — nothing
+        // is lost while the call is alive, and the roster is cumulative
+        // downstream so a suppressed flush retracts nobody. A self event that
+        // TEARS THE CALL DOWN instead (leave, or a join to a different call)
+        // discards the buffer: `endCurrentCall` emits an empty roster. That is
+        // deliberate — downstream the meeting was stopped hours earlier by the
+        // watchdog, so a participant first seen during the stale window is not
+        // an attendee of the recording that exists.
         guard !beliefIsStale(at: at) else {
             rosterDirty = true
             return
@@ -379,14 +397,21 @@ public actor SlackHuddleTracker {
         }
     }
 
-    private func flushRoster(at: Date) async {
+    /// `withHeartbeat` folds the heartbeat lifecycle into this roster batch
+    /// instead of emitting a separate one — used for the first emission after a
+    /// stale period, so the revival carries a kind the downstream grace-resume
+    /// recognises (see the call site in `tick`).
+    private func flushRoster(at: Date, withHeartbeat: Bool = false) async {
         guard let callID = currentCallID else {
             rosterDirty = false
             return
         }
         lastRosterFlushAt = at
         rosterDirty = false
-        await emitBatch(callID: callID, roster: currentRoster(), lifecycle: nil, at: at)
+        await emitBatch(
+            callID: callID, roster: currentRoster(),
+            lifecycle: withHeartbeat ? MeetWireLifecycle(kind: .heartbeat, atMs: ms(at)) : nil,
+            at: at)
     }
 
     private func emitHeartbeat(at: Date) async {

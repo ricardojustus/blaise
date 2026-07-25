@@ -235,16 +235,21 @@ final class SlackHuddlesModel {
             // tracker identity this connect just pushed — socket live, status
             // "Connected", tracker deaf, no error surface.
             lifecycleEpoch &+= 1
-            let epoch = lifecycleEpoch
+            let lifecycleGeneration = lifecycleEpoch
             await tracker.setSelfUserID(memberID)
-            guard epoch == lifecycleEpoch else { return }
+            guard lifecycleGeneration == lifecycleEpoch else { return }
             await saveSettings()
-            guard epoch == lifecycleEpoch else { return }
             // Reconnect with rotated tokens: tear the old socket down (awaited)
             // before starting fresh, or it would keep streaming the old
             // workspace forever (startSocket no-ops while a task exists).
+            // This teardown is deliberately NOT epoch-guarded: stopping is
+            // always safe, and skipping it strands a socket authenticated with
+            // the PREVIOUS tokens while the Keychain and settings describe the
+            // new ones — a superseding toggle's own startSocket() then no-ops
+            // because `socketTask` is still occupied, so nothing else would
+            // ever tear it down.
             await stopSocket()
-            guard epoch == lifecycleEpoch else { return }
+            guard lifecycleGeneration == lifecycleEpoch else { return }
             startSocket()
         } catch is CancellationError {
             lastError = nil
@@ -299,12 +304,12 @@ final class SlackHuddlesModel {
     // MARK: - Socket lifecycle
 
     private func startSocket() {
-        // The integration being ON is a precondition, not an assumption of the
-        // caller: `startSocket` is reached from `startIfEnabled`, `connect`, and
-        // a suspended `setEnabled` task. Only the first two check `enabled`, so
-        // without this guard a stale enable-task could open a socket after the
-        // user switched the integration off — a connection running while the UI
-        // says it is disabled.
+        // Defense-in-depth precondition. The pre-mutation epoch checks in
+        // `setEnabled` now stop a stale enable task before it reaches here, so
+        // the door this still covers on its own is `load()`, which writes
+        // `enabled` at startup without an epoch bump. Kept because it is one
+        // line and states the precondition for any future caller; the INVARIANT
+        // (no socket while disabled) is pinned by `disabledNeverOpensASocket`.
         guard enabled else { return }
         guard SlackSocketPolicy.connectAllowed() else {
             logger.notice(

@@ -41,9 +41,11 @@ call id is a co-participant. Join/leave timing = event arrival times.
 - Between self events, "in a call" is BELIEF and the heartbeat is manufactured
   from it. Every heartbeat refreshes the downstream watchdog's signal clock, so
   an undelivered self-leave would suppress that watchdog indefinitely — hence
-  the belief is BOUNDED: 4 h with no genuine self event stops the heartbeats
-  (never ends the call), handing the end to the watchdog's normal
-  notify-with-Resume path.
+  the belief is BOUNDED: 4 h with no genuine self event stops ALL manufactured
+  liveness — heartbeats and roster flushes alike (never ends the call), handing
+  the end to the watchdog. With a resume window configured (the default) that is
+  a notification WITH Resume; with "Resume window: Off" the stop finalizes
+  immediately per C14. Audio is retained either way.
 
 ## Repo layout
 
@@ -158,14 +160,19 @@ Transitions (all driven by `user_huddle_changed`):
    path (same rule as the extension's "heartbeats skipped when any batch shipped
    within 60 s").
 8. **Liveness-belief bound** — tick: `SlackHuddleTracker.livenessBeliefMaxAgeSeconds`
-   (4 h) past the last genuine self event, heartbeats STOP; the call is not ended
+   (4 h) past the last genuine self event, ALL manufactured liveness stops —
+   heartbeats AND roster flushes (rule 3), since downstream rearms its watchdog
+   from ANY code-carrying batch, so gating only the heartbeat leaves the bound
+   inert whenever co-participants remain in the huddle. The call is not ended
    and no lifecycle is emitted. Rationale: rule 7's heartbeat is manufactured from
    belief and refreshes `MeetCallTracker.lastSignalAt`, so an undelivered
    self-leave would suppress that 5-min watchdog forever and leave a recording
    running indefinitely. Going quiet instead lets the watchdog stop the recording
    through its normal path (user-visible notification + Resume + grace window),
-   so a false trigger costs one click rather than a lost meeting. A fresh self
-   event revives the belief and heartbeats resume. The constant is generous
+   so a false trigger costs one click rather than a lost meeting. A fresh self event revives the belief;
+   the roster change buffered while stale is NOT lost — it flushes on the next
+   tick, carrying the heartbeat lifecycle in the same batch so the revival is
+   recognised by the kind-gated grace-resume path. The constant is generous
    against a ~45-min average meeting because Slack's self-event cadence during a
    long huddle is UNVERIFIED (Human Touchpoint below); confirming a periodic
    refresh would allow tightening it by an order of magnitude.
