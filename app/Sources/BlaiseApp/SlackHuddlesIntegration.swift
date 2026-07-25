@@ -314,13 +314,11 @@ final class SlackHuddlesModel {
     // MARK: - Socket lifecycle
 
     private func startSocket() {
-        // Defense-in-depth precondition. The pre-mutation epoch checks in
-        // `setEnabled` now stop a stale enable task before it reaches here, so
-        // the door this still covers on its own is `load()`, which writes
-        // `enabled` at startup without an epoch bump. Kept because it is one
-        // line and states the precondition for any future caller; the INVARIANT
-        // (no socket while disabled) is pinned by `disabledNeverOpensASocket`.
-        guard enabled else { return }
+        // Every caller establishes `enabled` before reaching here — startIfEnabled
+        // guards it; the setEnabled/connect paths set it true behind their epoch
+        // checks. The INVARIANT (no socket while disabled) is pinned by
+        // `disabledNeverOpensASocket`. (Unreachable enabled-guard removed by
+        // operator ruling, 25/07/2026.)
         guard SlackSocketPolicy.connectAllowed() else {
             logger.notice(
                 "slack socket disabled: BLAISE_DATA_ROOT override active (set BLAISE_SLACK_SOCKET=1 to opt in)")
