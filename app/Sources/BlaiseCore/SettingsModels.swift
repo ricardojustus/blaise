@@ -197,6 +197,9 @@ public final class HandoffSettingsModel {
     public private(set) var localFolderPath = ""
     /// Markdown sidecar toggle for the local folder (default ON).
     public var markdownSidecar = true
+    /// Transcript Markdown sidecar, LOCAL FOLDER only (default OFF): writes the
+    /// transcript as its own `.md` beside the notes sidecar.
+    public var transcriptSidecar = false
     /// G5 v1.3: REMOVE superseded payloads at the destination. Default OFF ⇒
     /// delivered payloads accumulate, preserving the published "older versions
     /// are not deleted" contract. ON ⇒ a correction/regeneration replaces the
@@ -239,6 +242,7 @@ public final class HandoffSettingsModel {
             ?? nil ?? ""
         markdownSidecar = (try? await settings.get(HandoffDestination.Key.localMarkdownSidecar, as: Bool.self))
             ?? nil ?? true
+        transcriptSidecar = await HandoffDestination.transcriptSidecar(from: settings)
         removeSupersededPayloads = await HandoffDestination.removeSupersededPayloads(from: settings)
         deliverAudio = await HandoffDestination.deliverAudio(from: settings)
         includeMemoryDigest = await MemoryDigestSettings.isEnabled(in: settings)
@@ -287,6 +291,7 @@ public final class HandoffSettingsModel {
         // persisted for the local folder.
         try? await settings.set(HandoffDestination.Key.kind, to: destinationKind)
         try? await settings.set(HandoffDestination.Key.localMarkdownSidecar, to: markdownSidecar)
+        try? await settings.set(HandoffDestination.Key.transcriptSidecar, to: transcriptSidecar)
         // G5 v1.3 destination-independent toggles (forward deliveries only).
         try? await settings.set(
             HandoffDestination.Key.removeSupersededPayloads, to: removeSupersededPayloads)

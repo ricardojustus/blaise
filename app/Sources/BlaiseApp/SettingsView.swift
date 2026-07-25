@@ -868,6 +868,14 @@ private struct HandoffSection: View {
             Toggle("Write Markdown sidecar (Obsidian-ready)", isOn: $model.markdownSidecar)
                 .accessibilityLabel("Write Markdown sidecar alongside the evidence payload")
 
+            // Community request: the transcript as its OWN Markdown file. Local
+            // Folder only (the SSH path is unchanged), default OFF.
+            Toggle("Also write the transcript as Markdown", isOn: $model.transcriptSidecar)
+                .accessibilityLabel("Write the transcript as a separate Markdown file")
+            Text("Off by default. On writes the full transcript to its own \"…-transcript.md\" beside the notes Markdown. Local Folder destinations only; applies to each meeting's next delivery.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
             // G5 v1.3: superseded-payload REMOVAL. Default OFF ⇒ delivered
             // payloads accumulate, preserving the published immutable-history
             // contract. Named for the ACTION it performs: "Keep …" defaulting

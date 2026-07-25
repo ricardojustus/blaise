@@ -254,7 +254,7 @@ private func selectLocalFolder(_ database: BlaiseDatabase, _ folder: URL, sideca
             meetingID: meetingID, title: title,
             startedAt: Date(timeIntervalSince1970: 1_770_000_000),
             attendeeNames: attendees, versionHash: String(repeating: "a", count: 64),
-            notesMarkdown: "# Notes\n\n- point\n")
+            bodyMarkdown: "# Notes\n\n- point\n")
     }
 
     @Test func frontmatterGoldenEN() {
@@ -297,12 +297,12 @@ private func selectLocalFolder(_ database: BlaiseDatabase, _ folder: URL, sideca
         _ = MarkdownSidecar.write(
             MarkdownSidecar.Fields(
                 meetingID: m, title: "Planning", startedAt: Date(), attendeeNames: [],
-                versionHash: String(repeating: "1", count: 64), notesMarkdown: "v1"),
+                versionHash: String(repeating: "1", count: 64), bodyMarkdown: "v1"),
             to: dir)
         let name2 = MarkdownSidecar.write(
             MarkdownSidecar.Fields(
                 meetingID: m, title: "Planning", startedAt: Date(), attendeeNames: [],
-                versionHash: String(repeating: "2", count: 64), notesMarkdown: "v2 updated"),
+                versionHash: String(repeating: "2", count: 64), bodyMarkdown: "v2 updated"),
             to: dir)
         #expect(jsonCountMD(dir) == 1)
         let text = try String(contentsOf: dir.appendingPathComponent(name2!), encoding: .utf8)

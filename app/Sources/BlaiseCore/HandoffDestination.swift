@@ -64,6 +64,10 @@ public enum HandoffDestination: Sendable, Equatable {
         /// destination (iCloud/network) then means audio leaves the machine. The
         /// payload bytes are unchanged (no audio field).
         public static let deliverAudio = "handoff.deliverAudio"
+        /// Transcript Markdown sidecar; absent ⇒ OFF. LOCAL FOLDER ONLY (the SSH
+        /// path is untouched): writes `<slug>-transcript.md` next to the notes
+        /// sidecar, rendered from the persisted transcript rows.
+        public static let transcriptSidecar = "handoff.localFolder.transcriptSidecar"
     }
 
     /// The destination identity stamped on every delivered row and required to
@@ -98,6 +102,12 @@ public enum HandoffDestination: Sendable, Equatable {
     /// Absent ⇒ false ⇒ OFF (the privacy default).
     public static func deliverAudio(from store: SettingsStore) async -> Bool {
         (try? await store.get(Key.deliverAudio, as: Bool.self)) ?? nil ?? false
+    }
+
+    /// Local-folder only: whether to write the transcript Markdown sidecar.
+    /// Absent ⇒ false ⇒ OFF.
+    public static func transcriptSidecar(from store: SettingsStore) async -> Bool {
+        (try? await store.get(Key.transcriptSidecar, as: Bool.self)) ?? nil ?? false
     }
 
     public var kind: Kind {

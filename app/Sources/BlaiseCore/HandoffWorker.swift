@@ -347,6 +347,9 @@ public actor HandoffWorker: HandoffKicking {
             // cleanup toggle is deliberately NOT cached here — it is re-read
             // immediately before each cleanup, after the transport await.)
             let deliverAudio = await HandoffDestination.deliverAudio(from: settingsStore)
+            // Local-folder-only transcript sidecar (default OFF), read on the
+            // same fresh-each-drain basis.
+            let transcriptSidecar = await HandoffDestination.transcriptSidecar(from: settingsStore)
 
             // The identity of the destination this drain writes to, recorded on
             // every delivered row and required to match before a payload here
@@ -463,6 +466,11 @@ public actor HandoffWorker: HandoffKicking {
                     if sidecar {
                         await writeSidecar(item: claimed, root: url)
                     }
+                    // The transcript sidecar rides the same call site on its OWN
+                    // toggle (default OFF), equally failure-isolated.
+                    if transcriptSidecar {
+                        await writeTranscriptSidecar(item: claimed, root: url)
+                    }
                     // G5 v1.3: audio delivery AFTER the sidecar step (opt-in,
                     // failure-isolated). Runs inside the still-open security scope.
                     if deliverAudio {
@@ -518,7 +526,32 @@ public actor HandoffWorker: HandoffKicking {
             startedAt: meeting.startedAt,
             attendeeNames: meeting.attendees.map(\.name),
             versionHash: item.versionHash,
-            notesMarkdown: notes.markdown)
+            bodyMarkdown: notes.markdown)
+        let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
+        MarkdownSidecar.write(fields, to: dir)
+    }
+
+    /// Writes the transcript Markdown sidecar next to the notes sidecar at the
+    /// LOCAL destination (opt-in, default OFF). The body is the app's existing
+    /// copy-transcript render over the PERSISTED transcript rows, so note edits
+    /// never change it. Same failure isolation as the notes sidecar: no
+    /// transcript (or no meeting) simply skips; a write failure is logged inside
+    /// `MarkdownSidecar.write` and retried on the next delivery.
+    private func writeTranscriptSidecar(item: HandoffItem, root: URL) async {
+        guard
+            let meeting = try? await MeetingRepository(database: database).fetch(item.meetingID),
+            let segments = try? await TranscriptRepository(database: database)
+                .segments(meetingID: item.meetingID),
+            !segments.isEmpty
+        else { return }
+        let fields = MarkdownSidecar.Fields(
+            meetingID: meeting.id,
+            title: meeting.title,
+            startedAt: meeting.startedAt,
+            attendeeNames: meeting.attendees.map(\.name),
+            versionHash: item.versionHash,
+            bodyMarkdown: TranscriptCopyText.assemble(segments),
+            kind: .transcript)
         let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
         MarkdownSidecar.write(fields, to: dir)
     }
@@ -544,7 +577,7 @@ public actor HandoffWorker: HandoffKicking {
             startedAt: meeting.startedAt,
             attendeeNames: meeting.attendees.map(\.name),
             versionHash: item.versionHash,
-            notesMarkdown: notes.markdown)
+            bodyMarkdown: notes.markdown)
         let slug = MarkdownSidecar.slug(fields.title)
         // Injection-safety guard: the slug is `[a-z0-9-]` by construction, so it
         // can never break out of the single-quoted remote command. Assert that
