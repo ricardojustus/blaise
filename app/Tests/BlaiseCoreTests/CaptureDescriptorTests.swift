@@ -346,6 +346,46 @@ struct RouteChangeResilienceTests {
         #expect(next.recorded == [.captureDown(active: true)])
     }
 
+    /// The raise guard's ARITHMETIC, driven through the alarm's own surface
+    /// with controlled `now` values (the four ordering tests above pin the
+    /// production-observable wiring, not this). `base` sits in the future, so
+    /// the real deadline blocks `arm` schedules compute a negative elapsed and
+    /// stay silent: every raise here is the one the test asked for. Threshold
+    /// and offsets are exact binary fractions, so `at the threshold` really is
+    /// equality. Generation counting is `reset` +1, `arm` +1 from 0 — a wrong
+    /// key fails (b) loudly rather than passing silently.
+    @Test("capture-down alarm: raises AT the threshold, never below, never twice, never stale")
+    func alarmRaiseGuardArithmetic() {
+        let threshold = 0.0625
+        let alarm = CaptureDownAlarm(threshold: threshold)
+        let recorder = EventRecorder()
+        alarm.reset(onEvent: { recorder.record($0) })  // generation 1
+        let base = ProcessInfo.processInfo.systemUptime.rounded(.up) + 3600
+        alarm.arm(now: base)  // generation 2 — this down-period's key
+        let period = 2
+
+        // (a) Below the threshold: the warning is 8 s of CONTINUOUS downtime.
+        alarm.raiseIfOverdue(now: base + threshold - 0.0078125, generation: period)
+        #expect(!recorder.waitForEvent(timeout: 0.3))
+        // (b) Exactly AT the threshold raises (`>=`): the timer is the sole
+        // raise opportunity per period, so a `>` here loses the warning.
+        alarm.raiseIfOverdue(now: base + threshold, generation: period)
+        #expect(recorder.waitForEvent(timeout: 2))
+        // (c) Once per down-period, however overdue it gets.
+        alarm.raiseIfOverdue(now: base + 1, generation: period)
+        #expect(!recorder.waitForEvent(timeout: 0.3))
+
+        // (d) A stale deadline block from the retired period must not raise the
+        // FRESHLY armed one: its clock has barely started (spurious "recording
+        // is paused" after ~0.1 s of downtime).
+        alarm.clear()  // generation 3; clears the raised warning
+        #expect(recorder.waitForEvent(timeout: 2))
+        alarm.arm(now: base + 100)  // generation 4 — a new period, new clock
+        alarm.raiseIfOverdue(now: base + 100 + 0.0078125, generation: period)
+        #expect(!recorder.waitForEvent(timeout: 0.3))
+        #expect(recorder.recorded == [.captureDown(active: true), .captureDown(active: false)])
+    }
+
     @Test("effectiveDebounceDelay: trailing window clamps to the ceiling, never restarts")
     func debounceCeiling() {
         let f = CaptureSession.effectiveDebounceDelay
