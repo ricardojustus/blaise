@@ -16,7 +16,7 @@ private func g5TempFolder() throws -> URL {
 
 private func selectLocalDest(
     _ database: BlaiseDatabase, _ folder: URL, sidecar: Bool = true,
-    keepHistory: Bool? = nil, deliverAudio: Bool? = nil
+    removeSuperseded: Bool? = nil, deliverAudio: Bool? = nil
 ) async throws {
     let store = SettingsStore(database: database)
     let bookmark = try folder.bookmarkData(
@@ -25,7 +25,9 @@ private func selectLocalDest(
     try await store.set(HandoffDestination.Key.localBookmark, to: bookmark.base64EncodedString())
     try await store.set(HandoffDestination.Key.localPath, to: folder.path)
     try await store.set(HandoffDestination.Key.localMarkdownSidecar, to: sidecar)
-    if let keepHistory { try await store.set(HandoffDestination.Key.keepPayloadHistory, to: keepHistory) }
+    if let removeSuperseded {
+        try await store.set(HandoffDestination.Key.removeSupersededPayloads, to: removeSuperseded)
+    }
     if let deliverAudio { try await store.set(HandoffDestination.Key.deliverAudio, to: deliverAudio) }
 }
 
@@ -79,7 +81,7 @@ private func audioNames(_ dir: URL) -> [String] {
         let database = try makeDatabase()
         let v1 = try await seedDeliverable(database, title: "Correção")
         let folder = try g5TempFolder()
-        try await selectLocalDest(database, folder, sidecar: true, keepHistory: false)
+        try await selectLocalDest(database, folder, sidecar: true, removeSuperseded: true)
 
         let worker = makeWorker(database)
         await worker.start()
@@ -105,11 +107,37 @@ private func audioNames(_ dir: URL) -> [String] {
             atPath: handoffDir.appendingPathComponent("\(v2.versionHash).json").path))
     }
 
-    @Test func keepPayloadHistoryPreservesBothPayloads() async throws {
+    /// The DEFAULT with the key entirely ABSENT — the state every existing
+    /// install upgrades into. This is the regression pin that matters most: the
+    /// shipped behaviour must be "delivered evidence accumulates", so an upgrade
+    /// never starts silently deleting files at someone's destination. Asserted
+    /// from the absent key, never from an explicitly seeded value, because a
+    /// seeded value tests the seed rather than the default.
+    @Test func absentKeyPreservesBothPayloads() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Default history")
+        let folder = try g5TempFolder()
+        // `removeSuperseded` deliberately not passed — the key stays unset.
+        try await selectLocalDest(database, folder, sidecar: false)
+
+        let worker = makeWorker(database)
+        await worker.start()
+        await worker.waitUntilSettled()
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        let destDir = folder.appendingPathComponent(v1.meetingID)
+        #expect(
+            jsonNames(destDir) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
+            "absent key ⇒ payloads accumulate; an upgrade must not delete delivered evidence")
+    }
+
+    @Test func defaultPreservesBothPayloads() async throws {
         let database = try makeDatabase()
         let v1 = try await seedDeliverable(database, title: "History")
         let folder = try g5TempFolder()
-        try await selectLocalDest(database, folder, sidecar: false, keepHistory: true)
+        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: false)
 
         let worker = makeWorker(database)
         await worker.start()
@@ -126,13 +154,13 @@ private func audioNames(_ dir: URL) -> [String] {
         let database = try makeDatabase()
         let item = try await seedDeliverable(database, title: "SSH cleanup")  // sidecar OFF
         try await SettingsStore(database: database)
-            .set(HandoffDestination.Key.keepPayloadHistory, to: false)  // cleanup ON
+            .set(HandoffDestination.Key.removeSupersededPayloads, to: true)  // cleanup ON
         let transport = MockTransport()
         let worker = makeWorker(database, transport: transport)
         await worker.kick()
         await worker.waitUntilSettled()
 
-        // JSON (0) then the cleanup glob removal (1), default keepHistory=false.
+        // JSON (0) then the cleanup glob removal (1), removal explicitly ON.
         #expect(transport.calls.count == 2)
         let remoteDir = handoffValidExample.remoteRoot + "/" + item.meetingID
         #expect(transport.calls[1].argv == HandoffCommand.cleanupArgv(
@@ -145,23 +173,23 @@ private func audioNames(_ dir: URL) -> [String] {
             + "[ \"$f\" = '\(item.versionHash).json' ] || rm -f \"$f\"; done")
     }
 
-    @Test func sshKeepHistorySkipsCleanupCall() async throws {
+    @Test func sshDefaultSkipsCleanupCall() async throws {
         let database = try makeDatabase()
         _ = try await seedDeliverable(database, title: "Keep")
         try await SettingsStore(database: database)
-            .set(HandoffDestination.Key.keepPayloadHistory, to: true)
+            .set(HandoffDestination.Key.removeSupersededPayloads, to: false)
         let transport = MockTransport()
         let worker = makeWorker(database, transport: transport)
         await worker.kick()
         await worker.waitUntilSettled()
-        #expect(transport.calls.count == 1, "keepPayloadHistory ⇒ no cleanup call")
+        #expect(transport.calls.count == 1, "removal OFF (the default) ⇒ no cleanup call")
     }
 
     @Test func sshCleanupFailureDoesNotFailDelivery() async throws {
         let database = try makeDatabase()
         let item = try await seedDeliverable(database, title: "Isolated cleanup")
         try await SettingsStore(database: database)
-            .set(HandoffDestination.Key.keepPayloadHistory, to: false)  // cleanup ON
+            .set(HandoffDestination.Key.removeSupersededPayloads, to: true)  // cleanup ON
         // JSON succeeds; the cleanup call fails non-zero — isolated.
         let transport = MockTransport(script: [
             HandoffTransportOutcome(exitStatus: 0, stderrTail: "", timedOut: false),
@@ -370,11 +398,20 @@ private func audioNames(_ dir: URL) -> [String] {
     }
 
     @Test func handoffDocStatesAudioAndCleanupSemantics() throws {
-        let doc = try read("docs/handoff.md")
+        // Whitespace-collapsed: these phrases are prose and wrap across lines,
+        // so a raw `contains` would assert the line-breaking rather than the
+        // claim.
+        let doc = flat(try read("docs/handoff.md"))
         #expect(doc.contains("Include audio recordings"))
-        #expect(doc.contains("Keep superseded payloads at the destination"))
-        // The stale "older versions are not deleted" paragraph is superseded.
-        #expect(!doc.contains("older versions are not deleted"))
+        #expect(doc.contains("Remove superseded payloads at the destination"))
+        // The immutable-history guarantee STANDS as the default. An earlier
+        // draft made removal the default and asserted this sentence had to be
+        // GONE; the operator reversed that (24/07/2026), so the doc must state
+        // the guarantee AND present removal as the opt-in. Asserting both
+        // directions is the point — the doc has to be unambiguous about which
+        // behaviour you get by doing nothing.
+        #expect(doc.contains("older versions are not deleted"))
+        #expect(doc.contains("Removing superseded payloads (opt-in, off by default)"))
     }
 
     /// H1: NO unqualified audio-privacy claim may survive anywhere in the docs —

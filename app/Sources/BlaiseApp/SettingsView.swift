@@ -779,12 +779,17 @@ private struct HandoffSection: View {
             Toggle("Write Markdown sidecar (Obsidian-ready)", isOn: $model.markdownSidecar)
                 .accessibilityLabel("Write Markdown sidecar alongside the evidence payload")
 
-            // G5 v1.3: superseded-payload history. Default OFF ⇒ cleanup ON: a
-            // correction/regeneration REPLACES the delivered evidence so the
-            // destination holds exactly one current payload per meeting.
-            Toggle("Keep superseded payloads at the destination", isOn: $model.keepPayloadHistory)
-                .accessibilityLabel("Keep superseded payloads at the destination")
-            Text("Off (default): a correction or regeneration replaces the delivered evidence, so each meeting keeps one current payload. On: every delivered version is kept.")
+            // G5 v1.3: superseded-payload REMOVAL. Default OFF ⇒ delivered
+            // payloads accumulate, preserving the published immutable-history
+            // contract. Named for the ACTION it performs: "Keep …" defaulting
+            // to off is a double negative the reader must resolve before
+            // learning that files get deleted.
+            Toggle(
+                "Remove superseded payloads at the destination",
+                isOn: $model.removeSupersededPayloads
+            )
+            .accessibilityLabel("Remove superseded payloads at the destination")
+            Text("Off (default): every delivered version is kept, so anything referencing an older payload can still find it. On: a correction or regeneration deletes the previous payload at the destination, leaving one current file per meeting.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

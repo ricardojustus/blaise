@@ -197,11 +197,13 @@ public final class HandoffSettingsModel {
     public private(set) var localFolderPath = ""
     /// Markdown sidecar toggle for the local folder (default ON).
     public var markdownSidecar = true
-    /// G5 v1.3: keep superseded payloads at the destination. Default OFF ⇒
-    /// cleanup ON (the destination holds exactly ONE current payload per
-    /// meeting). ON preserves the pre-v1.3 accumulate-forever behavior.
-    /// Destination-independent.
-    public var keepPayloadHistory = false
+    /// G5 v1.3: REMOVE superseded payloads at the destination. Default OFF ⇒
+    /// delivered payloads accumulate, preserving the published "older versions
+    /// are not deleted" contract. ON ⇒ a correction/regeneration replaces the
+    /// delivered evidence (one current payload per meeting).
+    /// Destination-independent. Default-OFF is operator-ratified: deleted
+    /// evidence is unrecoverable, an untidy folder is not.
+    public var removeSupersededPayloads = false
     /// G5 v1.3: deliver the meeting's retained audio to the destination. Default
     /// OFF (the privacy default). ON copies `audio*.m4a` — a syncing destination
     /// then means audio leaves the machine. Destination-independent.
@@ -237,7 +239,7 @@ public final class HandoffSettingsModel {
             ?? nil ?? ""
         markdownSidecar = (try? await settings.get(HandoffDestination.Key.localMarkdownSidecar, as: Bool.self))
             ?? nil ?? true
-        keepPayloadHistory = await HandoffDestination.keepPayloadHistory(from: settings)
+        removeSupersededPayloads = await HandoffDestination.removeSupersededPayloads(from: settings)
         deliverAudio = await HandoffDestination.deliverAudio(from: settings)
         includeMemoryDigest = await MemoryDigestSettings.isEnabled(in: settings)
         verifyMemoryDigest = await MemoryDigestSettings.isVerifyEnabled(in: settings)
@@ -281,7 +283,8 @@ public final class HandoffSettingsModel {
         try? await settings.set(HandoffDestination.Key.kind, to: destinationKind)
         try? await settings.set(HandoffDestination.Key.localMarkdownSidecar, to: markdownSidecar)
         // G5 v1.3 destination-independent toggles (forward deliveries only).
-        try? await settings.set(HandoffDestination.Key.keepPayloadHistory, to: keepPayloadHistory)
+        try? await settings.set(
+            HandoffDestination.Key.removeSupersededPayloads, to: removeSupersededPayloads)
         try? await settings.set(HandoffDestination.Key.deliverAudio, to: deliverAudio)
         // G14: persist the memory-digest toggle (forward renders only — it
         // never rewrites already-minted payloads).

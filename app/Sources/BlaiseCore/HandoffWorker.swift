@@ -336,7 +336,7 @@ public actor HandoffWorker: HandoffKicking {
 
             // G5 v1.3 destination-independent toggles, read fresh each drain so a
             // Settings change takes effect on the next delivery.
-            let keepHistory = await HandoffDestination.keepPayloadHistory(from: settingsStore)
+            let removeSuperseded = await HandoffDestination.removeSupersededPayloads(from: settingsStore)
             let deliverAudio = await HandoffDestination.deliverAudio(from: settingsStore)
 
             switch destination {
@@ -396,9 +396,9 @@ public actor HandoffWorker: HandoffKicking {
                 }
                 await recordOutcome(outcome, item: claimed, endpoint: host)
                 // G5 v1.3: superseded-payload cleanup AFTER delivery + supersession
-                // (default ON; failure-isolated). Never touches the local
+                // (OPT-IN, default OFF; failure-isolated). Never touches the local
                 // `handoff/` snapshots — the destination is a delivery target.
-                if outcome.exitStatus == 0, !keepHistory {
+                if outcome.exitStatus == 0, removeSuperseded {
                     await cleanupSupersededSSH(
                         item: claimed, settings: settings, host: host, remoteDir: remoteDir)
                 }
@@ -444,9 +444,9 @@ public actor HandoffWorker: HandoffKicking {
                 }
                 await recordOutcome(outcome, item: claimed, endpoint: endpoint)
                 // G5 v1.3: superseded-payload cleanup AFTER delivery + supersession
-                // (default ON; failure-isolated). `.tmp-*` and the sidecar/audio
+                // (OPT-IN, default OFF; failure-isolated). `.tmp-*` and the sidecar/audio
                 // files are untouched — only OTHER `<hash>.json` are removed.
-                if outcome.exitStatus == 0, !keepHistory {
+                if outcome.exitStatus == 0, removeSuperseded {
                     await cleanupSupersededLocal(item: claimed, root: url)
                 }
             }

@@ -42,21 +42,27 @@ Per meeting, into a per-meeting directory:
   the identical file name — duplicates are impossible.
 - **Queue-and-retry.** Delivery survives the app restarting and the destination
   being unreachable; nothing is lost.
-- **One current payload per meeting (default).** Regenerating a meeting (better
-  engine, corrected names) produces a *new* content-addressed file; after it is
-  delivered and the older queue rows are superseded, Blaise removes this meeting's
-  OTHER `<hash>.json` from the destination meeting dir, so a correction *replaces*
-  the delivered evidence instead of accumulating beside it. The dir is per-meeting
-  and Blaise-owned; only `*.json` other than the just-delivered hash are removed —
-  the sidecar `.md`, any delivered audio, and `.tmp-*` are untouched. Cleanup is
-  failure-isolated (it never fails or retries the JSON delivery; it retries on the
-  meeting's next delivery). To keep every delivered version instead, turn on
-  "Keep superseded payloads at the destination" (Settings → Evidence Store) — then
-  history accumulates and you order versions of the same meeting by the record's
-  own `updated_at_ms`, not the file mtime (re-deliveries and idempotent rewrites
-  can change mtime). Either way, the LOCAL `handoff/<hash>.json` snapshots under
-  the meeting directory (Blaise's own archive) are never touched — the destination
-  is a delivery target, not the archive.
+- **Immutable history (default).** Regenerating a meeting (better engine,
+  corrected names) produces a *new* content-addressed file, and older versions
+  are not deleted. Order versions of the same meeting by the record's own
+  `updated_at_ms`, not the file mtime (re-deliveries and idempotent rewrites can
+  change mtime). This is the shipped default, so anything that referenced an
+  older payload by hash can still resolve it.
+- **Removing superseded payloads (opt-in, off by default).** If you would rather
+  each meeting keep exactly one current file at the destination, turn on "Remove
+  superseded payloads at the destination" (Settings → Evidence Store). Then,
+  after a new payload is delivered and the older queue rows are superseded,
+  Blaise removes this meeting's OTHER `<hash>.json` from the destination meeting
+  dir, so a correction *replaces* the delivered evidence instead of accumulating
+  beside it. The dir is per-meeting and Blaise-owned; only `*.json` other than
+  the just-delivered hash are removed — the sidecar `.md`, any delivered audio,
+  and `.tmp-*` are untouched. Removal is failure-isolated (it never fails or
+  retries the JSON delivery; it retries on the meeting's next delivery).
+  **Weigh it if anything downstream cites payloads by hash:** an accumulating
+  destination is easy to tidy later; a deleted payload is not recoverable.
+  Either way, the LOCAL `handoff/<hash>.json` snapshots under the meeting
+  directory (Blaise's own archive) are never touched — the destination is a
+  delivery target, not the archive.
 - **Audio delivery (opt-in, off by default).** With "Include audio recordings"
   (Settings → Evidence Store) turned on, Blaise delivers a meeting's retained
   `audio*.m4a` set (system + mic + part files) into the destination meeting dir
