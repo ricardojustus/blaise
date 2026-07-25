@@ -174,8 +174,9 @@ Transitions (all driven by `user_huddle_changed`):
    finalizes immediately and the notification is informational, per C14 §3. Audio
    is retained either way. A fresh self event revives the belief;
    the roster change buffered while stale is NOT lost — it flushes on the next
-   tick, carrying the heartbeat lifecycle in the same batch so the revival is
-   recognised by the kind-gated grace-resume path. The constant is generous
+   ELIGIBLE flush (normally the next tick, or immediately if a further roster
+   event opens the direct-flush door), carrying the heartbeat lifecycle in the
+   same batch so the revival is recognised by the kind-gated grace-resume path. The constant is generous
    against a ~45-min average meeting because Slack's self-event cadence during a
    long huddle is UNVERIFIED (Human Touchpoint below); confirming a periodic
    refresh would allow tightening it by an order of magnitude.

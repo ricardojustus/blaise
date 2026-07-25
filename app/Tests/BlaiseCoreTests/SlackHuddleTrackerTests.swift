@@ -216,27 +216,47 @@ struct SlackHuddleTrackerTests {
             "the revival flush must carry the heartbeat lifecycle in the SAME batch")
     }
 
-    @Test("revival heartbeat survives the self event that clears the log latch")
-    func revivalHeartbeatOutlivesTheLogLatch() async {
+    /// The SECOND revival door. After a stale period the 5 s coalescing window
+    /// has long elapsed, so a co-participant event arriving after the reviving
+    /// self event flushes IMMEDIATELY — without waiting for a tick. That flush
+    /// must fold the heartbeat too, or it consumes the 60 s heartbeat slot with
+    /// a kind-less batch and the grace-resume is delayed exactly as it was
+    /// before the fix. Discriminating: revert the `withHeartbeat` argument at
+    /// the immediate door and this batch carries `lifecycle: nil`.
+    ///
+    /// (An earlier version of this test drove the no-roster path instead. That
+    /// one was NOT discriminating — the ordinary cadence heartbeat fires there
+    /// whether or not the revival debt works — so it was replaced rather than
+    /// kept as false reassurance.)
+    @Test("revival via the immediate flush door also carries the heartbeat")
+    func revivalHeartbeatOnImmediateFlushDoor() async {
         let rec = BatchRecorder()
         let tracker = makeTracker(rec)
         await tracker.handle(selfEvent(callID: "R1", inHuddle: true, ts: "1000.1"), at: t(0))
         let bound = SlackHuddleTracker.livenessBeliefMaxAgeSeconds
 
-        // Go stale with NO buffered roster change, so the revival's first
-        // emission comes from the heartbeat path rather than the roster flush.
+        // Go stale; the tick suppresses the heartbeat and records the debt.
         await tracker.tick(now: t(bound + 1))
         let beforeRevival = rec.all.count
 
-        // The self event clears the STALE-LOG latch. The revival debt must not
-        // die with it: the next tick still owes a kind-carrying batch.
+        // A self refresh revives the belief. It clears the STALE-LOG latch but
+        // must NOT clear the revival debt — no kind-carrying batch has shipped.
         await tracker.handle(
             selfEvent(callID: "R1", inHuddle: true, ts: "1000.2"), at: t(bound + 10))
-        await tracker.tick(now: t(bound + 15))
-        #expect(rec.all.count > beforeRevival, "revival must emit")
+
+        // A co-participant event now takes the IMMEDIATE flush door, before any
+        // tick runs. That batch is the revival's first emission.
+        await tracker.handle(
+            event(user: "U_B", callID: "R1", inHuddle: true, ts: "1600.1", name: "Marco"),
+            at: t(bound + 15))
+
+        #expect(rec.all.count > beforeRevival, "the immediate door must emit")
+        #expect(
+            rec.all.last?.roster.contains { $0.displayName == "Marco" } == true,
+            "the immediate flush carries the roster")
         #expect(
             rec.all.last?.lifecycle?.kind == .heartbeat,
-            "revival emission carries a lifecycle kind even with no buffered roster")
+            "the immediate flush must fold the heartbeat — it is the revival's first batch")
     }
 
     @Test("heartbeat emitted on cadence while in a call")

@@ -154,9 +154,10 @@ Driven per `user_huddle_changed` event plus a periodic evaluation tick:
    Because every manufactured heartbeat refreshes that watchdog's signal clock,
    without this bound a dropped self-leave would suppress the watchdog forever
    and leave a recording running indefinitely. A fresh self event revives the belief; a
-   roster change buffered while stale is not lost — it flushes on the next tick,
-   carrying the heartbeat lifecycle in the SAME batch so the revival is
-   recognised by the kind-gated grace-resume path.
+   roster change buffered while stale is not lost — it flushes on the next
+   ELIGIBLE flush (normally the next tick, or immediately if a further roster
+   event opens the direct-flush door), carrying the heartbeat lifecycle in the
+   SAME batch so the revival is recognised by the kind-gated grace-resume path.
 
 ## App manifest
 
