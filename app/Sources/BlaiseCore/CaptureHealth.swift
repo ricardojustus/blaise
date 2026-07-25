@@ -232,10 +232,10 @@ public struct IndicatorStateMachine: Sendable, Equatable {
         return state
     }
 
-    /// Resolves `state` from the standing inputs in spec §4 priority order:
-    /// alarm > recording > processing > grace > paused > idle. A LIVE capture
-    /// (`startedAt != nil`) outranks the alarm — the alarm belongs to a
-    /// finished capture and only shows once nothing is recording (the
+    /// Resolves `state` from the standing inputs in priority order:
+    /// live recording > alarm > processing > grace > paused > idle. A LIVE
+    /// capture (`startedAt != nil`) outranks the alarm — the alarm belongs to
+    /// a finished capture and only shows once nothing is recording (the
     /// stale-completion contract: a new capture owns the display, the alarm
     /// rides the menu). `now` (from `.tick`) upgrades a long session to its
     /// warning; otherwise the long-session warning, once shown, persists.

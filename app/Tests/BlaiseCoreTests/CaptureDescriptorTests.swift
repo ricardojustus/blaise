@@ -133,10 +133,44 @@ struct CaptureRateResolutionTests {
 }
 
 /// B4: route-change resilience — the deterministic, headless-testable parts
-/// (rate-move gate, gap-fill sizing). The WIRING (debounced rebuild, retry
-/// ladder, silence actually landing in the CAFs) needs live HAL devices and
-/// is covered by the gated capture integration test at the Human Touchpoint.
+/// (rate-move gate, gap-fill sizing, debounce-ceiling math, capture-down
+/// predicate). The WIRING (debounced rebuild firing, retry ladder timing,
+/// silence actually landing in the CAFs) needs live HAL devices and has NO
+/// automated coverage — the gated capture integration test does not exercise
+/// route changes; wiring-level discrimination rests on the audit lenses and
+/// live verification (round-1 F-4, minimality ruling 25/07).
 struct RouteChangeResilienceTests {
+
+    @Test("effectiveDebounceDelay: trailing window clamps to the ceiling, never restarts")
+    func debounceCeiling() {
+        let f = CaptureSession.effectiveDebounceDelay
+        // First trigger of a burst: full debounce window.
+        #expect(f(0.5, nil, 100, 3) == 0.5)
+        // Mid-burst: the ceiling counts from the FIRST trigger.
+        #expect(f(0.5, 100, 101, 3) == 0.5)
+        #expect(f(0.5, 100, 102.75, 3) == 0.25)
+        // At/past the ceiling: fire immediately no matter how fast triggers arrive.
+        #expect(f(0.5, 100, 103, 3) == 0)
+        #expect(f(0.5, 100, 200, 3) == 0)
+        // A LADDER delay routed through this math is CLAMPED — the reason
+        // retries must NOT pass through it (F-2; scheduleRetry exists so the
+        // 4 s/8 s rungs run at full length). This pins the hazard.
+        #expect(f(8, 100, 100, 3) == 3)
+    }
+
+    @Test("shouldRaiseCaptureDown: raises exactly at the threshold, once")
+    func captureDownPredicate() {
+        let f = CaptureSession.shouldRaiseCaptureDown
+        // No down-period, nothing to raise.
+        #expect(!f(nil, 100, false, 8))
+        // Below the threshold: quiet (sub-threshold blips produce no UI).
+        #expect(!f(100, 107.999, false, 8))
+        // At/past the threshold: raise.
+        #expect(f(100, 108, false, 8))
+        #expect(f(100, 500, false, 8))
+        // Already raised: never twice per down-period.
+        #expect(!f(100, 500, true, 8))
+    }
 
     @Test("rateChangeRequiresRebuild: only a MOVED readable rate rebuilds (loop-proof)")
     func rateMoveGate() {

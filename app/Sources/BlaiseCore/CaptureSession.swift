@@ -28,12 +28,14 @@ public enum CaptureSessionError: Error, CustomStringConvertible {
     case coreAudio(String, OSStatus)
     case noDefaultInputDevice
     case tapFormatUnavailable
+    case converterUnavailable(String)
 
     public var description: String {
         switch self {
         case .coreAudio(let step, let status): return "\(step) failed (OSStatus \(status))"
         case .noDefaultInputDevice: return "no default input device"
         case .tapFormatUnavailable: return "tap format query failed"
+        case .converterUnavailable(let track): return "\(track) converter could not be built"
         }
     }
 }
@@ -97,6 +99,11 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     /// Whether the capture-down warning is currently raised (so it is emitted
     /// and cleared exactly once per down-period).
     private var captureDownReported = false
+    /// F-1: the one-shot threshold alarm for the capture-down warning
+    /// (armed at teardown, cancelled on successful rebuild / stop).
+    private var pendingCaptureDownAlarm: DispatchWorkItem?
+    /// F-6: one-shot latch for the multi-mic-stream drop log.
+    private var multiMicStreamsReported = false
     /// Monotonic uptime when buffers were last accepted for writing — the
     /// gap-fill anchor. Uptime, never wall-clock: system sleep must not be
     /// back-filled as hours of silence (the silence watchdog pins the same
@@ -125,6 +132,19 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             self.pendingForced = false
             self.rebuildAttempt = 0
             self.lastBufferUptime = nil
+            // F-3: the route-change bounds are PER RECORDING, and the engine
+            // instance is app-lifetime — without these resets the rate ceiling
+            // was per-app-launch, a stale down-clock could warn instantly (or
+            // a stale latch could suppress the warning entirely), and a stale
+            // debounce anchor defeated the next session's first debounce.
+            self.rateTriggeredRebuilds = 0
+            self.rateCeilingReported = false
+            self.captureDownSince = nil
+            self.captureDownReported = false
+            self.pendingCaptureDownAlarm?.cancel()
+            self.pendingCaptureDownAlarm = nil
+            self.debounceFirstTriggerUptime = nil
+            self.multiMicStreamsReported = false
             do {
                 try buildGraph()
             } catch {
@@ -146,6 +166,8 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             pendingRebuild?.cancel()
             pendingRebuild = nil
             pendingForced = false
+            pendingCaptureDownAlarm?.cancel()
+            pendingCaptureDownAlarm = nil
             removeRouteListeners()
             teardownGraph()
             writers?.system.close()
@@ -259,8 +281,12 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             }
             let streamFormats: [AVAudioFormat]
             if let rate = deliveredRate {
+                // F-8 / B3 §3-observability: master UID + per-stream virtual
+                // rates + converter input rate, so a field report ("silent /
+                // pitched after AirPods") can be diagnosed from this one line.
+                let virtualRates = streamASBDs.map(\.mSampleRate)
                 logger.notice(
-                    "capture rate: aggregate Fs=\(rate, privacy: .public) streams=\(streams.count, privacy: .public) target=\(CaptureCAFWriter.sampleRate, privacy: .public)")
+                    "capture rate: aggregate Fs=\(rate, privacy: .public) master=\(inputUID, privacy: .private(mask: .hash)) streams=\(streams.count, privacy: .public) virtualRates=\(virtualRates, privacy: .public) converterInput=\(rate, privacy: .public) target=\(CaptureCAFWriter.sampleRate, privacy: .public)")
                 streamFormats = try streamASBDs.map { asbd in
                     guard let format = Self.converterInputFormat(streamASBD: asbd, rate: rate)
                     else { throw CaptureSessionError.tapFormatUnavailable }
@@ -281,6 +307,27 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 ? AVAudioConverter(from: streamFormats[0], to: target) : nil
             let systemConverter = streamFormats.indices.contains(micStreamCount)
                 ? AVAudioConverter(from: streamFormats[micStreamCount], to: target) : nil
+            // A stream the layout SELECTED whose converter cannot be built is a
+            // failed build, not a silent no-op: a nil converter here previously
+            // left that track empty for the whole session with a green
+            // indicator (audit F-5; floor 2 — un-captured audio cannot be
+            // regenerated). Throwing routes through the existing ladder →
+            // `.writeFailure` stop policy.
+            if micStreamCount > 0, micConverter == nil {
+                throw CaptureSessionError.converterUnavailable("mic")
+            }
+            if streamFormats.indices.contains(micStreamCount), systemConverter == nil {
+                throw CaptureSessionError.converterUnavailable("system")
+            }
+            // F-6: additional mic streams beyond stream 0 are DROPPED, loudly —
+            // concatenating simultaneous streams serializes them as consecutive
+            // time (a 2-stream device doubled the mic track's duration).
+            // Proper same-timestamp mixing is backlogged (AB entry).
+            if micStreamCount > 1, !multiMicStreamsReported {
+                multiMicStreamsReported = true
+                logger.error(
+                    "input device exposes \(micStreamCount) streams; capturing stream 0 only — further streams are dropped, not serialized")
+            }
 
             // 5. IOProc on the dedicated serial queue; the block copies
             // buffers out and hops to processingQueue, never blocking IO.
@@ -410,6 +457,12 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 AudioObjectID(kAudioObjectSystemObject), &address, processingQueue, block)
             if status == noErr {
                 listeners.append((address, block))
+            } else {
+                // F-7: a dead route listener means that selector's device
+                // changes never rebuild — capture degrades silently. Same
+                // observability rule as the rate-listener install above.
+                logger.error(
+                    "route listener install failed (selector \(selector), OSStatus \(status)) — that selector's route changes will not rebuild")
             }
         }
     }
@@ -437,7 +490,25 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         // so the ladder would never exhaust, `.writeFailure` would never fire,
         // and the recording would stay green while capturing nothing.
         if forced, graph != nil { rebuildAttempt = 0 }
+        // F-2: during a down-period the RETRY LADDER owns the schedule. A
+        // fresh trigger while a retry backoff is pending must not collapse it
+        // to the debounce window (that let a trigger storm exhaust the ladder
+        // in ~3-5 s and stop the recording on a transient — floor 2). The
+        // trigger's meaning is preserved: `pendingForced` is already latched
+        // and honored when the pending rebuild fires.
+        if graph == nil, pendingRebuild != nil { return }
         enqueueRebuild(after: Self.rebuildDebounceSeconds)
+    }
+
+    /// F-4: the debounce-ceiling arithmetic, pure (mirrors `silenceFillFrames`
+    /// / `rateChangeRequiresRebuild`). First trigger of a burst stamps the
+    /// anchor; once `maxWait` has elapsed since it, the effective delay is 0.
+    static func effectiveDebounceDelay(
+        requested: TimeInterval, firstTriggerUptime: TimeInterval?, now: TimeInterval,
+        maxWait: TimeInterval
+    ) -> TimeInterval {
+        guard let first = firstTriggerUptime else { return min(requested, maxWait) }
+        return min(requested, max(0, maxWait - (now - first)))
     }
 
     private func enqueueRebuild(after delay: TimeInterval) {
@@ -445,18 +516,28 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         // stamps the deadline, and once `rebuildMaxWaitSeconds` has elapsed the
         // rebuild fires no matter how fast triggers keep arriving. Without the
         // ceiling a device flapping faster than the window starves the rebuild
-        // forever (see `rebuildMaxWaitSeconds`).
+        // forever (see `rebuildMaxWaitSeconds`). RETRY BACKOFFS DO NOT PASS
+        // THROUGH HERE (F-2): the ceiling clamped the ladder's 4 s/8 s rungs
+        // to 3 s — see `scheduleRetry`.
         let now = ProcessInfo.processInfo.systemUptime
         if debounceFirstTriggerUptime == nil { debounceFirstTriggerUptime = now }
-        var effective = delay
-        if let first = debounceFirstTriggerUptime {
-            let waited = now - first
-            effective = min(delay, max(0, Self.rebuildMaxWaitSeconds - waited))
-        }
+        let effective = Self.effectiveDebounceDelay(
+            requested: delay, firstTriggerUptime: debounceFirstTriggerUptime, now: now,
+            maxWait: Self.rebuildMaxWaitSeconds)
         pendingRebuild?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.performPendingRebuild() }
         pendingRebuild = item
         processingQueue.asyncAfter(deadline: .now() + effective, execute: item)
+    }
+
+    /// F-2: a retry backoff is scheduled DIRECTLY at the ladder's delay — never
+    /// through `enqueueRebuild`, whose ceiling is a DEBOUNCE bound, not a
+    /// backoff bound.
+    private func scheduleRetry(after delay: TimeInterval) {
+        pendingRebuild?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.performPendingRebuild() }
+        pendingRebuild = item
+        processingQueue.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     private func performPendingRebuild() {
@@ -497,6 +578,16 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         }
         logger.notice("default device or delivered rate changed — rebuilding capture graph")
         teardownGraph()
+        // F-1: the down-period clock starts AT teardown — not at the first
+        // failure — and the visible-warning alarm is TIMER-armed, so it fires
+        // at the 8 s threshold regardless of when (or whether) the next retry
+        // failure lands. Event-driven raising alone was unreachable on the
+        // fast-failure path: every failure event sat below the threshold and
+        // the exhaustion branch never raised.
+        if captureDownSince == nil {
+            captureDownSince = ProcessInfo.processInfo.systemUptime
+            armCaptureDownAlarm()
+        }
         do {
             try buildGraph()
             rebuildAttempt = 0
@@ -516,10 +607,12 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             logger.error(
                 "capture graph rebuild failed (attempt \(self.rebuildAttempt)): \(error) — retrying in \(delay)s")
             // The dead air accumulating during retries is back-filled by the
-            // next successful rebuild's gap fill.
+            // next successful rebuild's gap fill. (The 8 s warning is
+            // timer-armed at teardown — F-1; the on-failure check below is a
+            // belt for a build call that itself blocked past the threshold.)
             raiseCaptureDownIfOverdue()
             pendingForced = true
-            enqueueRebuild(after: delay)
+            scheduleRetry(after: delay)
         }
     }
 
@@ -529,11 +622,33 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     /// while the graph is nil `processCopiedBuffers` short-circuits and zero
     /// bytes reach either track, so a silent green indicator would let the user
     /// finish a meeting believing it recorded. Honest degradation instead.
+    /// F-4: the raise decision, pure.
+    static func shouldRaiseCaptureDown(
+        downSince: TimeInterval?, now: TimeInterval, alreadyReported: Bool,
+        threshold: TimeInterval
+    ) -> Bool {
+        guard let since = downSince, !alreadyReported else { return false }
+        return now - since >= threshold
+    }
+
+    /// F-1: one-shot alarm armed when the down-period starts, so the warning
+    /// fires AT the threshold even if no retry-failure event lands near it.
+    /// Cancelled by `clearCaptureDownAlarm()` (successful rebuild) and `stop()`.
+    private func armCaptureDownAlarm() {
+        pendingCaptureDownAlarm?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.raiseCaptureDownIfOverdue() }
+        pendingCaptureDownAlarm = item
+        processingQueue.asyncAfter(
+            deadline: .now() + Self.captureDownAlarmSeconds, execute: item)
+    }
+
     private func raiseCaptureDownIfOverdue() {
         let now = ProcessInfo.processInfo.systemUptime
         if captureDownSince == nil { captureDownSince = now }
-        guard let since = captureDownSince, !captureDownReported,
-            now - since >= Self.captureDownAlarmSeconds
+        guard
+            Self.shouldRaiseCaptureDown(
+                downSince: captureDownSince, now: now, alreadyReported: captureDownReported,
+                threshold: Self.captureDownAlarmSeconds), let since = captureDownSince
         else { return }
         captureDownReported = true
         logger.error(
@@ -545,6 +660,8 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     /// clearing event ONLY if the warning was actually raised, so a normal
     /// sub-threshold rebuild produces no UI churn at all.
     private func clearCaptureDownAlarm() {
+        pendingCaptureDownAlarm?.cancel()
+        pendingCaptureDownAlarm = nil
         captureDownSince = nil
         guard captureDownReported else { return }
         captureDownReported = false
@@ -615,7 +732,13 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             guard
                 let buffer = AVAudioPCMBuffer(
                     pcmFormat: CaptureCAFWriter.format, frameCapacity: n)
-            else { return }
+            else {
+                // F-5: a failed silence allocation silently truncated the
+                // gap fill — the timeline compression the fill exists to
+                // prevent. Throw to the caller's `.writeFailure` handler.
+                throw CaptureCAFWriterError.writeFailed(
+                    "silence buffer allocation failed (\(n) frames)")
+            }
             buffer.frameLength = n
             if let channel = buffer.int16ChannelData?[0] {
                 channel.update(repeating: 0, count: Int(n))
@@ -654,7 +777,16 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         var micData = Data()
         var systemData = Data()
         for (index, copy) in copies.enumerated() {
-            if index < graph.micStreamCount { micData.append(copy) } else { systemData.append(copy) }
+            // F-6: the mic track takes STREAM 0 ONLY. Appending simultaneous
+            // mic streams here interpreted them as consecutive frames in
+            // stream 0's format — duration and alignment corruption on any
+            // multi-stream input device. Streams 1..<micStreamCount are
+            // dropped (logged once at build).
+            if index == 0, graph.micStreamCount > 0 {
+                micData = copy
+            } else if index >= graph.micStreamCount {
+                systemData.append(copy)
+            }
         }
 
         // Health: all-zero mic while the system track carries signal.
@@ -718,12 +850,19 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         _ data: Data, sourceFormat: AVAudioFormat, converter: AVAudioConverter,
         writer: CaptureCAFWriter
     ) throws {
+        // F-5: broken formats and failed allocations THROW (→ `.writeFailure`
+        // stop-and-salvage). A silent `return` here dropped live audio with a
+        // green indicator. A zero-frame slice alone stays a benign no-op.
         let bytesPerFrame = Int(sourceFormat.streamDescription.pointee.mBytesPerFrame)
-        guard bytesPerFrame > 0 else { return }
+        guard bytesPerFrame > 0 else {
+            throw CaptureCAFWriterError.writeFailed("source format has 0 bytes per frame")
+        }
         let frames = AVAudioFrameCount(data.count / bytesPerFrame)
-        guard frames > 0,
-            let input = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frames)
-        else { return }
+        guard frames > 0 else { return }
+        guard let input = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frames)
+        else {
+            throw CaptureCAFWriterError.writeFailed("input buffer allocation failed (\(frames) frames)")
+        }
         input.frameLength = frames
         data.withUnsafeBytes { raw in
             let target = input.audioBufferList.pointee.mBuffers
@@ -737,7 +876,9 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         let capacity = AVAudioFrameCount((Double(frames) * ratio).rounded(.up) + 64)
         guard
             let output = AVAudioPCMBuffer(pcmFormat: CaptureCAFWriter.format, frameCapacity: capacity)
-        else { return }
+        else {
+            throw CaptureCAFWriterError.writeFailed("output buffer allocation failed (\(capacity) frames)")
+        }
         final class FeedOnce: @unchecked Sendable {
             var fed = false
         }
@@ -755,7 +896,12 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         if let conversionError {
             throw CaptureCAFWriterError.writeFailed("conversion: \(conversionError)")
         }
-        if status != .error, output.frameLength > 0 {
+        // F-5: `.error` without a populated NSError was previously a silent
+        // drop of the whole slice.
+        if status == .error {
+            throw CaptureCAFWriterError.writeFailed("conversion returned .error with no error object")
+        }
+        if output.frameLength > 0 {
             try writer.write(output)
         }
     }
