@@ -62,13 +62,13 @@ public enum IndicatorState: Equatable, Sendable {
     /// C14 resume grace window: post-recording template glyph variant
     /// (pause-adjacent, calm), shown only when not recording. Grace and
     /// processing can coexist (back-to-back meetings); under the M-3 §4 order
-    /// processing wins the icon (alarm > recording > processing > grace >
+    /// processing wins the icon (live recording > alarm > processing > grace >
     /// paused > idle — see `resolveDisplay`).
     case grace(meetingTitle: String, until: Date)
     /// G9 manual pause: the meeting is held open, no capture live. Carries
     /// the accumulated recorded time (sum of part durations) for the timer
     /// display. Display priority (fully ordered, §4):
-    /// alarm > recording > processing > grace > paused > idle.
+    /// live recording > alarm > processing > grace > paused > idle.
     case paused(meetingTitle: String, accumulatedSeconds: TimeInterval)
 }
 

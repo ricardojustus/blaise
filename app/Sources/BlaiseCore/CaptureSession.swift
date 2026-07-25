@@ -93,15 +93,13 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     private var rateTriggeredRebuilds = 0
     /// One-shot latch for the ceiling log line.
     private var rateCeilingReported = false
-    /// Monotonic uptime when the graph most recently went down, or nil while
-    /// it is up. Drives the visible capture-down warning.
-    private var captureDownSince: TimeInterval?
-    /// Whether the capture-down warning is currently raised (so it is emitted
-    /// and cleared exactly once per down-period).
-    private var captureDownReported = false
-    /// F-1: the one-shot threshold alarm for the capture-down warning
-    /// (armed at teardown, cancelled on successful rebuild / stop).
-    private var pendingCaptureDownAlarm: DispatchWorkItem?
+    /// F-1: the down-clock + one-shot threshold alarm behind the visible
+    /// capture-down warning (armed at teardown, cleared on successful rebuild
+    /// / stop). It owns its own queue and state — R2-F2: a `buildGraph()`
+    /// blocking `processingQueue` past the deadline must not starve the
+    /// watchdog that watches it.
+    private let captureDownAlarm = CaptureDownAlarm(
+        threshold: CaptureSession.captureDownAlarmSeconds)
     /// F-6: one-shot latch for the multi-mic-stream drop log.
     private var multiMicStreamsReported = false
     /// Monotonic uptime when buffers were last accepted for writing — the
@@ -139,10 +137,7 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             // debounce anchor defeated the next session's first debounce.
             self.rateTriggeredRebuilds = 0
             self.rateCeilingReported = false
-            self.captureDownSince = nil
-            self.captureDownReported = false
-            self.pendingCaptureDownAlarm?.cancel()
-            self.pendingCaptureDownAlarm = nil
+            self.captureDownAlarm.reset(onEvent: onEvent)
             self.debounceFirstTriggerUptime = nil
             self.multiMicStreamsReported = false
             do {
@@ -166,8 +161,7 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             pendingRebuild?.cancel()
             pendingRebuild = nil
             pendingForced = false
-            pendingCaptureDownAlarm?.cancel()
-            pendingCaptureDownAlarm = nil
+            captureDownAlarm.reset(onEvent: nil)
             removeRouteListeners()
             teardownGraph()
             writers?.system.close()
@@ -280,11 +274,12 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 return asbd
             }
             let streamFormats: [AVAudioFormat]
+            // F-8 / B3 §3-observability: master UID + per-stream virtual
+            // rates + converter input rate, so a field report ("silent /
+            // pitched after AirPods") can be diagnosed from this one line —
+            // on BOTH branches (the fallback is where drift is EXPECTED).
+            let virtualRates = streamASBDs.map(\.mSampleRate)
             if let rate = deliveredRate {
-                // F-8 / B3 §3-observability: master UID + per-stream virtual
-                // rates + converter input rate, so a field report ("silent /
-                // pitched after AirPods") can be diagnosed from this one line.
-                let virtualRates = streamASBDs.map(\.mSampleRate)
                 logger.notice(
                     "capture rate: aggregate Fs=\(rate, privacy: .public) master=\(inputUID, privacy: .private(mask: .hash)) streams=\(streams.count, privacy: .public) virtualRates=\(virtualRates, privacy: .public) converterInput=\(rate, privacy: .public) target=\(CaptureCAFWriter.sampleRate, privacy: .public)")
                 streamFormats = try streamASBDs.map { asbd in
@@ -294,13 +289,8 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 }
             } else {
                 logger.error(
-                    "aggregate nominal rate unavailable/implausible (got \(aggregateRate ?? -1, privacy: .public)); falling back to per-stream virtual format")
-                streamFormats = try streamASBDs.map { asbd in
-                    var mutable = asbd
-                    guard let format = AVAudioFormat(streamDescription: &mutable)
-                    else { throw CaptureSessionError.tapFormatUnavailable }
-                    return format
-                }
+                    "aggregate nominal rate unavailable/implausible (got \(aggregateRate ?? -1, privacy: .public)); falling back to per-stream virtual format — master=\(inputUID, privacy: .private(mask: .hash)) streams=\(streams.count, privacy: .public) virtualRates=\(virtualRates, privacy: .public) converterInput=per-stream target=\(CaptureCAFWriter.sampleRate, privacy: .public)")
+                streamFormats = try streamASBDs.map { try Self.fallbackInputFormat(streamASBD: $0) }
             }
             let target = CaptureCAFWriter.format
             let micConverter = streamFormats.indices.contains(0) && micStreamCount > 0
@@ -318,6 +308,15 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             }
             if streamFormats.indices.contains(micStreamCount), systemConverter == nil {
                 throw CaptureSessionError.converterUnavailable("system")
+            }
+            // R2-F4: the tap contributed NO stream to the aggregate, so there
+            // is nothing to select for the system track and it stays empty for
+            // the whole recording behind a green indicator. Loud, mirroring
+            // the mic-side treatment above (log only: the guard above cannot
+            // fire here — the converter was never built).
+            if streams.count <= micStreamCount {
+                logger.error(
+                    "aggregate exposes no tap streams (\(streams.count) streams, \(micStreamCount) mic); system track will be EMPTY")
             }
             // F-6: additional mic streams beyond stream 0 are DROPPED, loudly —
             // concatenating simultaneous streams serializes them as consecutive
@@ -583,15 +582,12 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         // at the 8 s threshold regardless of when (or whether) the next retry
         // failure lands. Event-driven raising alone was unreachable on the
         // fast-failure path: every failure event sat below the threshold and
-        // the exhaustion branch never raised.
-        if captureDownSince == nil {
-            captureDownSince = ProcessInfo.processInfo.systemUptime
-            armCaptureDownAlarm()
-        }
+        // the exhaustion branch never raised. Arming is once per down-period.
+        captureDownAlarm.arm(now: ProcessInfo.processInfo.systemUptime)
         do {
             try buildGraph()
             rebuildAttempt = 0
-            clearCaptureDownAlarm()
+            captureDownAlarm.clear()
             fillCaptureGap()
         } catch {
             guard rebuildAttempt < Self.rebuildRetryDelays.count else {
@@ -608,9 +604,10 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 "capture graph rebuild failed (attempt \(self.rebuildAttempt)): \(error) — retrying in \(delay)s")
             // The dead air accumulating during retries is back-filled by the
             // next successful rebuild's gap fill. (The 8 s warning is
-            // timer-armed at teardown — F-1; the on-failure check below is a
-            // belt for a build call that itself blocked past the threshold.)
-            raiseCaptureDownIfOverdue()
+            // timer-armed at teardown on the alarm's OWN queue — F-1/R2-F2;
+            // the on-failure check below is a belt, idempotent within the
+            // down-period.)
+            captureDownAlarm.raiseIfOverdue(now: ProcessInfo.processInfo.systemUptime)
             pendingForced = true
             scheduleRetry(after: delay)
         }
@@ -631,43 +628,6 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         return now - since >= threshold
     }
 
-    /// F-1: one-shot alarm armed when the down-period starts, so the warning
-    /// fires AT the threshold even if no retry-failure event lands near it.
-    /// Cancelled by `clearCaptureDownAlarm()` (successful rebuild) and `stop()`.
-    private func armCaptureDownAlarm() {
-        pendingCaptureDownAlarm?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.raiseCaptureDownIfOverdue() }
-        pendingCaptureDownAlarm = item
-        processingQueue.asyncAfter(
-            deadline: .now() + Self.captureDownAlarmSeconds, execute: item)
-    }
-
-    private func raiseCaptureDownIfOverdue() {
-        let now = ProcessInfo.processInfo.systemUptime
-        if captureDownSince == nil { captureDownSince = now }
-        guard
-            Self.shouldRaiseCaptureDown(
-                downSince: captureDownSince, now: now, alreadyReported: captureDownReported,
-                threshold: Self.captureDownAlarmSeconds), let since = captureDownSince
-        else { return }
-        captureDownReported = true
-        logger.error(
-            "capture graph has been down for \(Int(now - since))s while rebuilding — surfacing the indicator warning")
-        onEvent?(.captureDown(active: true))
-    }
-
-    /// Clear the capture-down warning after a successful rebuild. Emits the
-    /// clearing event ONLY if the warning was actually raised, so a normal
-    /// sub-threshold rebuild produces no UI churn at all.
-    private func clearCaptureDownAlarm() {
-        pendingCaptureDownAlarm?.cancel()
-        pendingCaptureDownAlarm = nil
-        captureDownSince = nil
-        guard captureDownReported else { return }
-        captureDownReported = false
-        logger.notice("capture graph rebuilt — clearing the indicator warning")
-        onEvent?(.captureDown(active: false))
-    }
 
     /// B4: rebuild only when the aggregate's reported nominal rate MOVED
     /// against the build-time observation. nil current (unreadable now) →
@@ -872,8 +832,8 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             }
         }
 
-        let ratio = CaptureCAFWriter.sampleRate / sourceFormat.sampleRate
-        let capacity = AVAudioFrameCount((Double(frames) * ratio).rounded(.up) + 64)
+        let capacity = try Self.resampleCapacity(
+            frames: frames, sourceRate: sourceFormat.sampleRate)
         guard
             let output = AVAudioPCMBuffer(pcmFormat: CaptureCAFWriter.format, frameCapacity: capacity)
         else {
@@ -1102,5 +1062,162 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         var asbd = streamASBD
         asbd.mSampleRate = rate
         return AVAudioFormat(streamDescription: &asbd)
+    }
+
+    /// The B3 FALLBACK converter input format: the stream's OWN virtual
+    /// format, verbatim. That rate never passed `isPlausibleRate` (the
+    /// aggregate read that did is exactly what is missing on this branch), so
+    /// it is checked here: a 0 Hz virtual rate makes the resample ratio
+    /// infinite and `AVAudioFrameCount(inf)` TRAPS — the process dies
+    /// mid-recording, past the retry ladder, the capture-down warning and the
+    /// `.writeFailure` salvage (floor 2). Throwing routes the bad build
+    /// through the ladder instead. The HAL is already known to report a
+    /// non-positive rate for the AGGREGATE in this same unsettled window —
+    /// that reading is what selects this branch; the per-stream read has no
+    /// equivalent guard.
+    static func fallbackInputFormat(
+        streamASBD: AudioStreamBasicDescription
+    ) throws -> AVAudioFormat {
+        var asbd = streamASBD
+        guard asbd.mSampleRate > 0, asbd.mSampleRate.isFinite else {
+            throw CaptureSessionError.converterUnavailable("stream rate \(asbd.mSampleRate)")
+        }
+        guard let format = AVAudioFormat(streamDescription: &asbd)
+        else { throw CaptureSessionError.tapFormatUnavailable }
+        return format
+    }
+
+    /// The resample output capacity, pure. The ratio divides by the SOURCE
+    /// rate, so a degenerate rate (0, non-finite, or denormal-small) makes
+    /// this `inf`/out-of-range and `AVAudioFrameCount(…)` TRAPS. A capacity
+    /// that is not representable is a write failure (stop-and-salvage), never
+    /// arithmetic — the belt behind `fallbackInputFormat`'s build-time check.
+    static func resampleCapacity(
+        frames: AVAudioFrameCount, sourceRate: Double
+    ) throws -> AVAudioFrameCount {
+        // 0 Hz (the reproduced crash input) makes the ratio +inf; NaN/negative
+        // rates are equally unusable.
+        guard sourceRate > 0, sourceRate.isFinite else {
+            throw CaptureCAFWriterError.writeFailed("unusable source sample rate \(sourceRate)")
+        }
+        // A denormal-small rate stays finite but overflows the frame count.
+        let capacity = (Double(frames) * (CaptureCAFWriter.sampleRate / sourceRate)).rounded(.up) + 64
+        guard capacity <= Double(AVAudioFrameCount.max) else {
+            throw CaptureCAFWriterError.writeFailed(
+                "source sample rate \(sourceRate) yields an unrepresentable output capacity (\(capacity) frames)")
+        }
+        return AVAudioFrameCount(capacity)
+    }
+}
+
+// MARK: - Capture-down alarm (its own queue, R2-F2)
+
+/// The down-clock and one-shot threshold alarm behind the visible
+/// capture-down warning. It runs on its OWN serial queue because
+/// `processingQueue` cannot host it: a synchronous `buildGraph()` spanning
+/// the deadline is precisely the case the warning exists for, and a watchdog
+/// queued behind the work it watches never fires — the rebuild's success then
+/// clears it unfired, so >8 s of dead air passes with a green indicator
+/// (audit H-R2-1). Both queues touch the state, so it is `Mutex`-guarded.
+///
+/// Down-periods are GENERATION-keyed rather than cancelled: an alarm whose
+/// deadline elapses after its period ended (successful rebuild, stop, next
+/// recording) finds a bumped generation and does nothing — the same zero
+/// stale fires the cancel-based version had, without a cross-queue cancel
+/// race.
+final class CaptureDownAlarm: @unchecked Sendable {
+    private struct State {
+        /// Monotonic uptime when the graph went down, or nil while it is up.
+        var downSince: TimeInterval?
+        /// Whether the warning is currently raised (emitted and cleared
+        /// exactly once per down-period).
+        var reported = false
+        var generation = 0
+        /// Read under the lock: the alarm queue emits through it while the
+        /// processing queue may be replacing it in `start()`/`stop()`.
+        var onEvent: (@Sendable (CaptureEngineEvent) -> Void)?
+    }
+
+    private let logger = Logger(subsystem: BlaiseBundle.identifier, category: "capture.session")
+    private let queue = DispatchQueue(label: BlaiseBundle.subsystem("capture.alarm"))
+    private let state = Mutex(State())
+    /// Injectable so the wiring is testable without sleeping the real 8 s.
+    let threshold: TimeInterval
+
+    init(threshold: TimeInterval) { self.threshold = threshold }
+
+    /// `start()` / `stop()`: install (or drop) the event sink and end any
+    /// standing down-period, per-recording bounds included (F-3).
+    func reset(onEvent: (@Sendable (CaptureEngineEvent) -> Void)?) {
+        state.withLock { state in
+            state.generation += 1
+            state.downSince = nil
+            state.reported = false
+            state.onEvent = onEvent
+        }
+    }
+
+    /// The graph went down at `now`: start the down-clock and schedule the
+    /// threshold alarm. Once per down-period — a re-arm while one is standing
+    /// is a no-op, so the clock keeps measuring CONTINUOUS downtime.
+    func arm(now: TimeInterval) {
+        let armed: Int? = state.withLock { state in
+            guard state.downSince == nil else { return nil }
+            state.downSince = now
+            state.generation += 1
+            return state.generation
+        }
+        guard let generation = armed else { return }
+        queue.asyncAfter(deadline: .now() + threshold) { [weak self] in
+            self?.raiseIfOverdue(
+                now: ProcessInfo.processInfo.systemUptime, generation: generation)
+        }
+    }
+
+    /// Raise the VISIBLE warning if the graph has been down past the
+    /// threshold, once per down-period. The recording is NOT stopped — the
+    /// retry ladder is still working and a transient failure recovers — but
+    /// while the graph is nil zero bytes reach either track, so a silent green
+    /// indicator would let the user finish a meeting believing it recorded.
+    /// `generation` scopes a fired alarm to the period that armed it; nil is
+    /// the retry path's belt call against whatever period is standing.
+    func raiseIfOverdue(now: TimeInterval, generation: Int? = nil) {
+        let raised: (handler: (@Sendable (CaptureEngineEvent) -> Void)?, downSeconds: TimeInterval)? =
+            state.withLock { state in
+                if let generation, state.generation != generation { return nil }
+                guard
+                    CaptureSession.shouldRaiseCaptureDown(
+                        downSince: state.downSince, now: now, alreadyReported: state.reported,
+                        threshold: threshold), let since = state.downSince
+                else { return nil }
+                state.reported = true
+                return (state.onEvent, now - since)
+            }
+        guard let raised else { return }
+        logger.error(
+            "capture graph has been down for \(Int(raised.downSeconds))s while rebuilding — surfacing the indicator warning")
+        raised.handler?(.captureDown(active: true))
+    }
+
+    /// A successful rebuild: end the down-period, and clear the warning if it
+    /// was actually raised (a normal sub-threshold rebuild produces no UI
+    /// churn at all). The clearing event rides the SAME queue as the raise, so
+    /// a rebuild landing exactly at the deadline can never emit its `false`
+    /// ahead of the alarm's `true` and strand the warning on screen.
+    func clear() {
+        let cleared: (
+            handler: (@Sendable (CaptureEngineEvent) -> Void)?, wasReported: Bool
+        ) = state.withLock { state in
+            let wasReported = state.reported
+            state.generation += 1
+            state.downSince = nil
+            state.reported = false
+            return (state.onEvent, wasReported)
+        }
+        guard cleared.wasReported else { return }
+        queue.async { [logger] in
+            logger.notice("capture graph rebuilt — clearing the indicator warning")
+            cleared.handler?(.captureDown(active: false))
+        }
     }
 }

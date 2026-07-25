@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreAudio
 import Foundation
+import Synchronization
 import Testing
 
 @testable import BlaiseCore
@@ -114,6 +115,50 @@ struct CaptureRateResolutionTests {
         #expect(!CaptureSession.isPlausibleRate(200_000, within: []))
     }
 
+    @Test("fallbackInputFormat: a degenerate per-stream rate is a FAILED build, never a converter input")
+    func fallbackFormatRateGuard() throws {
+        let base = try #require(
+            AVAudioFormat(
+                commonFormat: .pcmFormatInt16, sampleRate: 44100, channels: 1, interleaved: true))
+        let asbd = base.streamDescription.pointee
+        // The normal fallback case: the stream's own virtual format, verbatim.
+        #expect(try CaptureSession.fallbackInputFormat(streamASBD: asbd).sampleRate == 44100)
+        // 0 Hz is the reproduced crash input: it builds a NON-nil AVAudioFormat
+        // and a NON-nil AVAudioConverter, so every downstream guard passes it
+        // through to `ratio = 16000/0 = inf` and a trap. It must fail the BUILD
+        // (→ retry ladder), which is what this branch had no guard for.
+        var zero = asbd
+        zero.mSampleRate = 0
+        #expect(throws: CaptureSessionError.self) {
+            try CaptureSession.fallbackInputFormat(streamASBD: zero)
+        }
+        var nonFinite = asbd
+        nonFinite.mSampleRate = .infinity
+        #expect(throws: CaptureSessionError.self) {
+            try CaptureSession.fallbackInputFormat(streamASBD: nonFinite)
+        }
+        var negative = asbd
+        negative.mSampleRate = -48000
+        #expect(throws: CaptureSessionError.self) {
+            try CaptureSession.fallbackInputFormat(streamASBD: negative)
+        }
+    }
+
+    @Test("resampleCapacity: a degenerate source rate throws instead of trapping the process")
+    func resampleCapacityGuard() throws {
+        // 48 kHz → the 16 kHz writer format: a third of the frames, plus the pad.
+        #expect(try CaptureSession.resampleCapacity(frames: 480, sourceRate: 48000) == 224)
+        #expect(try CaptureSession.resampleCapacity(frames: 160, sourceRate: 16000) == 224)
+        // The belt behind the build-time guard. `AVAudioFrameCount(inf)` and
+        // `AVAudioFrameCount(4.3e9)` are Swift runtime TRAPS — the process dies
+        // mid-recording, bypassing the ladder, the warning and the salvage.
+        for badRate in [0, .infinity, .nan, 1e-300, -48000] as [Double] {
+            #expect(throws: CaptureCAFWriterError.self) {
+                try CaptureSession.resampleCapacity(frames: 400, sourceRate: badRate)
+            }
+        }
+    }
+
     @Test("converterInputFormat: overrides ONLY the sample rate; channels + format preserved")
     func inputFormat() throws {
         let base = try #require(
@@ -134,12 +179,78 @@ struct CaptureRateResolutionTests {
 
 /// B4: route-change resilience — the deterministic, headless-testable parts
 /// (rate-move gate, gap-fill sizing, debounce-ceiling math, capture-down
-/// predicate). The WIRING (debounced rebuild firing, retry ladder timing,
-/// silence actually landing in the CAFs) needs live HAL devices and has NO
-/// automated coverage — the gated capture integration test does not exercise
-/// route changes; wiring-level discrimination rests on the audit lenses and
-/// live verification (round-1 F-4, minimality ruling 25/07).
+/// predicate, and the capture-down alarm's own scheduling, which owns no HAL
+/// object). The REST of the wiring (debounced rebuild firing, retry ladder
+/// timing, silence actually landing in the CAFs) needs live HAL devices and
+/// has NO automated coverage — the gated capture integration test does not
+/// exercise route changes; wiring-level discrimination there rests on the
+/// audit lenses and live verification (round-1 F-4, minimality ruling 25/07).
 struct RouteChangeResilienceTests {
+
+    /// Thread-safe sink: the alarm emits from its own queue.
+    private final class EventRecorder: @unchecked Sendable {
+        private let events = Mutex<[CaptureEngineEvent]>([])
+        private let arrived = DispatchSemaphore(value: 0)
+        func record(_ event: CaptureEngineEvent) {
+            events.withLock { $0.append(event) }
+            arrived.signal()
+        }
+        /// True if an event arrived within the timeout.
+        func waitForEvent(timeout: TimeInterval) -> Bool {
+            arrived.wait(timeout: .now() + timeout) == .success
+        }
+        var recorded: [CaptureEngineEvent] { events.withLock { $0 } }
+    }
+
+    @Test("capture-down alarm fires at its deadline while a build blocks the processing queue")
+    func alarmFiresWhileProcessingQueueBlocked() {
+        let alarm = CaptureDownAlarm(threshold: 0.05)
+        let recorder = EventRecorder()
+        alarm.reset(onEvent: { recorder.record($0) })
+
+        // The production sequence: the down-clock is armed on the processing
+        // queue at teardown, and `buildGraph()` — a synchronous CoreAudio call,
+        // slow or hung is exactly the case this warning exists for — then holds
+        // that queue ACROSS the deadline. An alarm scheduled on the processing
+        // queue cannot run here, and the rebuild's success would clear it
+        // unfired: >8 s of dead air behind a green indicator (audit H-R2-1).
+        let processingQueue = DispatchQueue(label: "test.capture.processing")
+        let building = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        processingQueue.async {
+            alarm.arm(now: ProcessInfo.processInfo.systemUptime)
+            building.signal()
+            release.wait()
+        }
+        #expect(building.wait(timeout: .now() + 2) == .success)
+
+        #expect(recorder.waitForEvent(timeout: 2))
+        #expect(recorder.recorded == [.captureDown(active: true)])
+        // Once per down-period: the retry path's belt call adds no second event.
+        alarm.raiseIfOverdue(now: ProcessInfo.processInfo.systemUptime)
+        #expect(recorder.recorded == [.captureDown(active: true)])
+        // A raised warning is the one a successful rebuild clears — and the
+        // clear lands AFTER the raise, never inverting it, even though the
+        // rebuild reports from the (still blocked) processing queue.
+        alarm.clear()
+        #expect(recorder.waitForEvent(timeout: 2))
+        #expect(recorder.recorded == [.captureDown(active: true), .captureDown(active: false)])
+        release.signal()
+    }
+
+    @Test("capture-down alarm: a rebuild that succeeds before the deadline never fires it")
+    func alarmClearedBeforeDeadline() {
+        let alarm = CaptureDownAlarm(threshold: 0.1)
+        let recorder = EventRecorder()
+        alarm.reset(onEvent: { recorder.record($0) })
+        alarm.arm(now: ProcessInfo.processInfo.systemUptime)
+        // Success below the threshold: nothing was raised, so nothing is
+        // cleared either — a normal rebuild causes no UI churn at all.
+        alarm.clear()
+        // And the armed alarm stays silent past its deadline (0 stale fires).
+        #expect(!recorder.waitForEvent(timeout: 0.4))
+        #expect(recorder.recorded.isEmpty)
+    }
 
     @Test("effectiveDebounceDelay: trailing window clamps to the ceiling, never restarts")
     func debounceCeiling() {
@@ -201,6 +312,17 @@ struct RouteChangeResilienceTests {
         #expect(
             CaptureSession.silenceFillFrames(gapSeconds: 10_000, sampleRate: rate)
                 == Int(CaptureSession.gapFillMaximumSeconds * rate))
+    }
+
+    @Test("route-resilience constants: the operator-ratified values, pinned")
+    func ratifiedConstants() {
+        // Operator-ratified B4 values: silent drift here changes what the
+        // recording does under a route change, with nothing else failing.
+        #expect(CaptureSession.rebuildDebounceSeconds == 0.5)
+        #expect(CaptureSession.rebuildMaxWaitSeconds == 3)
+        #expect(CaptureSession.captureDownAlarmSeconds == 8)
+        #expect(CaptureSession.rebuildRetryDelays == [0.5, 1, 2, 4, 8])
+        #expect(CaptureSession.maxRateTriggeredRebuilds == 3)
     }
 
     @Test("retry ladder: bounded, monotonic, finite total")
