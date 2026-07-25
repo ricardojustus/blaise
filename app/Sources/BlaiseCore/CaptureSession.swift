@@ -100,8 +100,6 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     /// watchdog that watches it.
     private let captureDownAlarm = CaptureDownAlarm(
         threshold: CaptureSession.captureDownAlarmSeconds)
-    /// F-6: one-shot latch for the multi-mic-stream drop log.
-    private var multiMicStreamsReported = false
     /// Monotonic uptime when buffers were last accepted for writing — the
     /// gap-fill anchor. Uptime, never wall-clock: system sleep must not be
     /// back-filled as hours of silence (the silence watchdog pins the same
@@ -139,7 +137,6 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             self.rateCeilingReported = false
             self.captureDownAlarm.reset(onEvent: onEvent)
             self.debounceFirstTriggerUptime = nil
-            self.multiMicStreamsReported = false
             do {
                 try buildGraph()
             } catch {
@@ -322,8 +319,7 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
             // concatenating simultaneous streams serializes them as consecutive
             // time (a 2-stream device doubled the mic track's duration).
             // Proper same-timestamp mixing is backlogged (AB entry).
-            if micStreamCount > 1, !multiMicStreamsReported {
-                multiMicStreamsReported = true
+            if micStreamCount > 1 {
                 logger.error(
                     "input device exposes \(micStreamCount) streams; capturing stream 0 only — further streams are dropped, not serialized")
             }
@@ -503,11 +499,10 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     /// / `rateChangeRequiresRebuild`). First trigger of a burst stamps the
     /// anchor; once `maxWait` has elapsed since it, the effective delay is 0.
     static func effectiveDebounceDelay(
-        requested: TimeInterval, firstTriggerUptime: TimeInterval?, now: TimeInterval,
+        requested: TimeInterval, firstTriggerUptime: TimeInterval, now: TimeInterval,
         maxWait: TimeInterval
     ) -> TimeInterval {
-        guard let first = firstTriggerUptime else { return min(requested, maxWait) }
-        return min(requested, max(0, maxWait - (now - first)))
+        min(requested, max(0, maxWait - (now - firstTriggerUptime)))
     }
 
     private func enqueueRebuild(after delay: TimeInterval) {
@@ -519,14 +514,14 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         // THROUGH HERE (F-2): the ceiling clamped the ladder's 4 s/8 s rungs
         // to 3 s — see `scheduleRetry`.
         let now = ProcessInfo.processInfo.systemUptime
-        if debounceFirstTriggerUptime == nil { debounceFirstTriggerUptime = now }
+        let first = debounceFirstTriggerUptime ?? now
+        debounceFirstTriggerUptime = first
         let effective = Self.effectiveDebounceDelay(
-            requested: delay, firstTriggerUptime: debounceFirstTriggerUptime, now: now,
+            requested: delay, firstTriggerUptime: first, now: now,
             maxWait: Self.rebuildMaxWaitSeconds)
-        pendingRebuild?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.performPendingRebuild() }
-        pendingRebuild = item
-        processingQueue.asyncAfter(deadline: .now() + effective, execute: item)
+        // The ceiling is applied HERE, before the hand-off: `scheduleRetry`
+        // only owns the (re)scheduling, never the debounce bound (F-2).
+        scheduleRetry(after: effective)
     }
 
     /// F-2: a retry backoff is scheduled DIRECTLY at the ladder's delay — never
@@ -1102,20 +1097,20 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
 /// clears it unfired, so >8 s of dead air passes with a green indicator
 /// (audit H-R2-1). Both queues touch the state, so it is `Mutex`-guarded.
 ///
-/// Down-periods are GENERATION-keyed rather than cancelled: an alarm whose
-/// deadline elapses after its period ended (successful rebuild, stop, next
-/// recording) finds a bumped generation and does nothing — the same zero
-/// stale fires the cancel-based version had, without a cross-queue cancel
-/// race.
+/// Deadline blocks are never cancelled: an alarm whose deadline elapses after
+/// its period ended (successful rebuild, stop, next recording) finds
+/// `downSince` nil — or, if a NEW period has since armed, an elapsed time
+/// necessarily below the threshold — and does nothing. The same zero stale
+/// fires a cancel-based version would have, without a cross-queue cancel race.
 ///
 /// `reset` is also a FENCE (R3-F1): EVERY event invocation runs on this queue
-/// and re-reads the sink under the lock at emission time, and `reset` bumps
-/// the keys under the lock and then drains the queue synchronously. Once
-/// `reset` returns, an emission that was already queued or already running has
-/// either finished (through the sink of its own recording, before `reset`
-/// returned) or found the bumped keys and emitted nothing — so no event can
-/// reach a dropped or replaced sink, and no old-period event can stand a
-/// warning over the next recording.
+/// and re-reads the sink under the lock at emission time, and `reset` ends the
+/// down-period and bumps the sink key under the lock and then drains the queue
+/// synchronously. Once `reset` returns, an emission that was already queued or
+/// already running has either finished (through the sink of its own recording,
+/// before `reset` returned) or found the cleared period / bumped sink key and
+/// emitted nothing — so no event can reach a dropped or replaced sink, and no
+/// old-period event can stand a warning over the next recording.
 final class CaptureDownAlarm: @unchecked Sendable {
     private struct State {
         /// Monotonic uptime when the graph went down, or nil while it is up.
@@ -1123,12 +1118,12 @@ final class CaptureDownAlarm: @unchecked Sendable {
         /// Whether the warning is currently raised (emitted and cleared
         /// exactly once per down-period).
         var reported = false
-        var generation = 0
         /// Bumped ONLY by `reset`, so a queued emission can tell at emission
         /// time whether the sink it was queued for is still the installed one.
-        /// The down-period `generation` cannot answer that: a new down-period
-        /// bumps it WITHIN one recording, and a clear queued before that must
-        /// still clear the warning it raised there.
+        /// The down-period state cannot answer that: a clear ENDS the period
+        /// as it queues its emission, and a new period may arm WITHIN the same
+        /// recording, while the clear queued before it must still clear the
+        /// warning it raised there.
         var sinkEpoch = 0
         /// Read under the lock: the alarm queue emits through it while the
         /// processing queue may be replacing it in `start()`/`stop()`.
@@ -1149,21 +1144,20 @@ final class CaptureDownAlarm: @unchecked Sendable {
     /// afterwards (R3-F1).
     func reset(onEvent: (@Sendable (CaptureEngineEvent) -> Void)?) {
         state.withLock { state in
-            state.generation += 1
             state.sinkEpoch += 1
             state.downSince = nil
             state.reported = false
             state.onEvent = onEvent
         }
-        // The keys are bumped FIRST, so an emission that has not yet re-read
-        // the state finds them and drops; this barrier then waits out the one
-        // case the keys cannot cover — an emission already past its read,
-        // mid-invocation of the old sink. Called from `processingQueue`
-        // (`start`/`stop`): safe because the alarm queue never syncs back onto
-        // that queue — its blocks take only this lock and call the sink, which
-        // must not block (the production sink hands off to a Task). Delayed
-        // `arm` blocks are NOT waited for (not yet due); their generation key
-        // retires them.
+        // The state is updated FIRST, so an emission that has not yet re-read
+        // it finds the cleared period / bumped sink key and drops; this
+        // barrier then waits out the one case the state cannot cover — an
+        // emission already past its read, mid-invocation of the old sink.
+        // Called from `processingQueue` (`start`/`stop`): safe because the
+        // alarm queue never syncs back onto that queue — its blocks take only
+        // this lock and call the sink, which must not block (the production
+        // sink hands off to a Task). Delayed `arm` blocks are NOT waited for
+        // (not yet due); the nil `downSince` retires them.
         queue.sync {}
     }
 
@@ -1171,16 +1165,14 @@ final class CaptureDownAlarm: @unchecked Sendable {
     /// threshold alarm. Once per down-period — a re-arm while one is standing
     /// is a no-op, so the clock keeps measuring CONTINUOUS downtime.
     func arm(now: TimeInterval) {
-        let armed: Int? = state.withLock { state in
-            guard state.downSince == nil else { return nil }
+        let armed: Bool = state.withLock { state in
+            guard state.downSince == nil else { return false }
             state.downSince = now
-            state.generation += 1
-            return state.generation
+            return true
         }
-        guard let generation = armed else { return }
+        guard armed else { return }
         queue.asyncAfter(deadline: .now() + threshold) { [weak self] in
-            self?.raiseIfOverdue(
-                now: ProcessInfo.processInfo.systemUptime, generation: generation)
+            self?.raiseIfOverdue(now: ProcessInfo.processInfo.systemUptime)
         }
     }
 
@@ -1189,13 +1181,16 @@ final class CaptureDownAlarm: @unchecked Sendable {
     /// `CaptureSession.captureDownAlarmSeconds` for why this must be visible;
     /// the recording is NOT stopped — the retry ladder is still working and a
     /// transient failure recovers.
-    /// `generation` scopes a fired alarm to the period that armed it.
+    /// A block whose period already ended finds `downSince` nil; one that
+    /// outlived its period into a NEWLY armed one finds an elapsed time below
+    /// the threshold (the new clock started after this block was scheduled),
+    /// so a fired alarm can only ever be the period that armed it.
     ///
     /// The check and the emission both run on the alarm queue (R3-F1): an
     /// event invoked on the caller's thread would be outside the fence. The
     /// deadline block re-enters here asynchronously, which a serial queue
     /// permits (never `sync`).
-    func raiseIfOverdue(now: TimeInterval, generation: Int) {
+    func raiseIfOverdue(now: TimeInterval) {
         queue.async { [weak self] in
             guard let self else { return }
             let raised:
@@ -1203,7 +1198,7 @@ final class CaptureDownAlarm: @unchecked Sendable {
                 state.withLock { state in
                     // At the threshold raises, below it does not; once per
                     // down-period (`reported`).
-                    guard state.generation == generation, let since = state.downSince,
+                    guard let since = state.downSince,
                         !state.reported, now - since >= threshold
                     else { return nil }
                     state.reported = true
@@ -1227,7 +1222,6 @@ final class CaptureDownAlarm: @unchecked Sendable {
         // deferred to the alarm queue.
         let cleared: (sinkEpoch: Int, wasReported: Bool) = state.withLock { state in
             let wasReported = state.reported
-            state.generation += 1
             state.downSince = nil
             state.reported = false
             return (state.sinkEpoch, wasReported)
