@@ -104,13 +104,17 @@ private func markdownNames(_ dir: URL) -> [String] {
 
         let destDir = folder.appendingPathComponent(item.meetingID)
         #expect(markdownNames(destDir) == ["quoll-harbor-sync-transcript.md", "quoll-harbor-sync.md"])
-        for name in markdownNames(destDir) {
-            let text = try String(
-                contentsOf: destDir.appendingPathComponent(name), encoding: .utf8)
-            #expect(
-                text.contains("version_hash: \(v2.versionHash)\n"),
-                "\(name) was overwritten by the re-delivery")
-        }
+        let notesText = try String(
+            contentsOf: destDir.appendingPathComponent("quoll-harbor-sync.md"), encoding: .utf8)
+        #expect(
+            notesText.contains("version_hash: \(v2.versionHash)\n"),
+            "the notes sidecar was overwritten by the re-delivery")
+        // The transcript carries NO payload hash — its provenance is the
+        // transcript rows, which a payload correction does not touch.
+        let transcriptText = try String(
+            contentsOf: destDir.appendingPathComponent("quoll-harbor-sync-transcript.md"),
+            encoding: .utf8)
+        #expect(!transcriptText.contains("version_hash:"))
     }
 
     /// The superseded-payload sweep is `<hash>.json`-only: opting INTO it never
@@ -136,7 +140,7 @@ private func markdownNames(_ dir: URL) -> [String] {
     }
 
     /// No transcript rows ⇒ skip, exactly like a missing notes row: no
-    /// header-only file, and any previously written transcript survives.
+    /// header-only file is written.
     @Test func noTranscriptRowsSkipsTheSidecar() async throws {
         let database = try makeDatabase()
         let item = try await seedDeliverable(database, title: "Quoll Harbor sync")
@@ -152,6 +156,78 @@ private func markdownNames(_ dir: URL) -> [String] {
         let destDir = folder.appendingPathComponent(item.meetingID)
         #expect(markdownNames(destDir) == ["quoll-harbor-sync.md"])
     }
+
+    // MARK: - Kind detection (the frontmatter-scoped classifier)
+
+    /// A notes BODY containing the line `kind: transcript` (a note quoting this
+    /// very format) must not be read as the transcript sidecar: classification
+    /// is frontmatter-only. Otherwise the transcript write deletes the notes
+    /// file and a notes re-delivery mints a ULID-suffixed twin.
+    @Test func poisonedNotesBodyKeepsItsKind() throws {
+        let dir = try tsTempFolder()
+        let m = ULID.generate()
+        let poisoned = "# Notes\n\nWe agreed the frontmatter reads:\n\nkind: transcript\n"
+        let notesName = MarkdownSidecar.write(tsFields(m, body: poisoned), to: dir)
+        MarkdownSidecar.write(tsFields(m, body: "Sam: olá", kind: .transcript), to: dir)
+        #expect(markdownNames(dir) == ["quoll-harbor-sync-transcript.md", "quoll-harbor-sync.md"])
+
+        // Toggle OFF ⇒ a notes-only re-delivery: overwrites in place, no twin.
+        let again = MarkdownSidecar.write(tsFields(m, body: "# Notes v2\n"), to: dir)
+        #expect(again == notesName)
+        #expect(markdownNames(dir) == ["quoll-harbor-sync-transcript.md", "quoll-harbor-sync.md"])
+        let text = try String(contentsOf: dir.appendingPathComponent(notesName!), encoding: .utf8)
+        #expect(text.hasSuffix("# Notes v2\n"))
+    }
+
+    /// A newline in a title cannot inject a frontmatter line.
+    @Test func newlineInTitleCannotInjectFrontmatter() {
+        let doc = MarkdownSidecar.render(
+            tsFields(ULID.generate(), title: "Quoll Harbor\nkind: transcript", body: "# Notes\n"))
+        let header = doc.components(separatedBy: "\n---\n")[0]
+        #expect(!header.contains("\nkind: transcript"))
+        #expect(header.contains("title: "))
+    }
+
+    /// A sidecar written before the `kind:` line existed is still THIS meeting's
+    /// NOTES sidecar: a transcript write leaves it alone, a notes re-delivery
+    /// overwrites it in place.
+    @Test func legacyKindlessSidecarIsStillTheNotesSidecar() throws {
+        let dir = try tsTempFolder()
+        let m = ULID.generate()
+        let legacy = dir.appendingPathComponent("quoll-harbor-sync.md")
+        try Data(
+            """
+            ---
+            title: Quoll Harbor sync
+            source: blaise
+            native_id: \(m)
+            version_hash: \(String(repeating: "a", count: 64))
+            ---
+
+            legacy body
+
+            """.utf8
+        ).write(to: legacy)
+
+        MarkdownSidecar.write(tsFields(m, body: "Sam: olá", kind: .transcript), to: dir)
+        #expect(try String(contentsOf: legacy, encoding: .utf8).contains("legacy body"))
+
+        let name = MarkdownSidecar.write(tsFields(m, body: "# Notes v2\n"), to: dir)
+        #expect(name == "quoll-harbor-sync.md")
+        #expect(markdownNames(dir) == ["quoll-harbor-sync-transcript.md", "quoll-harbor-sync.md"])
+        #expect(try String(contentsOf: legacy, encoding: .utf8).hasSuffix("# Notes v2\n"))
+    }
+}
+
+private func tsFields(
+    _ meetingID: String, title: String = "Quoll Harbor sync", body: String,
+    kind: MarkdownSidecar.Kind = .notes
+) -> MarkdownSidecar.Fields {
+    MarkdownSidecar.Fields(
+        meetingID: meetingID, title: title,
+        startedAt: Date(timeIntervalSince1970: 1_770_000_000),
+        attendeeNames: ["Sam Rivera"], versionHash: String(repeating: "a", count: 64),
+        bodyMarkdown: body, kind: kind)
 }
 
 /// Re-mints a different payload version for the same meeting (a correction) and

@@ -18,8 +18,9 @@ import os
 ///
 /// The same machinery writes the OPT-IN transcript sidecar (`kind: .transcript`,
 /// local destination only): `<slug>-transcript.md`, body rendered by
-/// `TranscriptCopyText`, a `kind: transcript` frontmatter line. The kinds are
-/// independent files and never delete each other.
+/// `TranscriptCopyText`, a `kind: transcript` frontmatter line and no
+/// `version_hash` (its provenance is the transcript rows, not the payload). The
+/// kinds are independent files and never delete each other.
 public enum MarkdownSidecar {
     private static let logger = Logger(subsystem: BlaiseBundle.identifier, category: "handoff.sidecar")
 
@@ -103,8 +104,14 @@ public enum MarkdownSidecar {
         }
         lines.append("source: blaise")
         lines.append("native_id: \(fields.meetingID)")
-        lines.append("version_hash: \(fields.versionHash)")
-        if fields.kind == .transcript { lines.append("kind: transcript") }
+        // The transcript's provenance is the persisted transcript rows, not the
+        // payload — stamping the payload hash would claim a version the rows may
+        // postdate (a regeneration that failed to re-mint). Notes: unchanged.
+        if fields.kind == .transcript {
+            lines.append("kind: transcript")
+        } else {
+            lines.append("version_hash: \(fields.versionHash)")
+        }
         lines.append("---")
         lines.append("")
         // The rendered body verbatim (single trailing newline).
@@ -117,6 +124,11 @@ public enum MarkdownSidecar {
     /// character that would otherwise change YAML meaning), escaping `"` and
     /// `\`. Plain titles stay unquoted and human-readable.
     static func yamlScalar(_ value: String) -> String {
+        // Flatten newlines FIRST: a title or attendee name carrying one would
+        // otherwise inject arbitrary frontmatter lines (including `kind:`).
+        let value = value.replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
         let needsQuote =
             value.isEmpty
             || value.first == " " || value.last == " "
@@ -174,8 +186,15 @@ public enum MarkdownSidecar {
     private static func ours(_ name: String, meetingID: String, kind: Kind, in dir: URL) -> Bool {
         guard let text = try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)
         else { return false }
-        let isTranscript = text.contains("\nkind: transcript\n")
-        return text.contains("native_id: \(meetingID)\n") && isTranscript == (kind == .transcript)
+        // Classify from the FRONTMATTER ONLY (everything before the closing
+        // `---`): a BODY line reading `kind: transcript` — a note quoting this
+        // very format — must never flip a file's kind or its ownership. No
+        // closing delimiter ⇒ no frontmatter ⇒ not ours.
+        let parts = text.components(separatedBy: "\n---\n")
+        guard parts.count > 1 else { return false }
+        let header = parts[0] + "\n"
+        let isTranscript = header.contains("\nkind: transcript\n")
+        return header.contains("\nnative_id: \(meetingID)\n") && isTranscript == (kind == .transcript)
     }
 
     private static func removePriorSidecars(
