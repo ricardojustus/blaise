@@ -13,7 +13,7 @@ import os
 // tokens live in the Keychain and never leave the machine except as Blaise's
 // own calls to slack.com.
 
-private struct SlackHuddlesSettings: Codable, Equatable, Sendable {
+struct SlackHuddlesSettings: Codable, Equatable, Sendable {
     var enabled: Bool
     var memberID: String
     /// Workspace name from `auth.test`, cached for the status line.

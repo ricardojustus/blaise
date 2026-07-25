@@ -232,9 +232,7 @@ public actor SlackHuddleTracker {
             // meeting. Emitting two batches at the same instant is not the
             // alternative: the downstream monotonic guard drops the second
             // (the same-millisecond collision C15 v1.1 item 4 closed).
-            let reviving = owesRevivalHeartbeat
-            await flushRoster(at: clock, withHeartbeat: reviving)
-            if reviving { owesRevivalHeartbeat = false }
+            await flushRoster(at: clock)
         }
 
         // Expiration ADVISORY: `now > huddle_state_expiration_ts + 120 s` with
@@ -428,32 +426,35 @@ public actor SlackHuddleTracker {
             // This is the SECOND door onto the revival path: a co-participant
             // event arriving after the reviving self event but before the next
             // tick flushes immediately (the coalescing window elapsed hours
-            // ago). It must settle the revival debt for the same reason the
-            // tick's flush does — otherwise it consumes the 60 s heartbeat slot
-            // with a kind-less batch and the grace-resume is delayed anyway.
-            let reviving = owesRevivalHeartbeat
-            await flushRoster(at: at, withHeartbeat: reviving)
-            if reviving { owesRevivalHeartbeat = false }
+            // ago). It settles the revival debt for the same reason the tick's
+            // flush does — otherwise it consumes the 60 s heartbeat slot with a
+            // kind-less batch and the grace-resume is delayed anyway — which
+            // `flushRoster` now does for every door.
+            await flushRoster(at: at)
         } else {
             rosterDirty = true  // the tick flushes it once the window elapses
         }
     }
 
-    /// `withHeartbeat` folds the heartbeat lifecycle into this roster batch
-    /// instead of emitting a separate one — used for the first emission after a
-    /// stale period, so the revival carries a kind the downstream grace-resume
-    /// recognises (see the call site in `tick`).
-    private func flushRoster(at: Date, withHeartbeat: Bool = false) async {
+    /// When the revival debt is outstanding, the heartbeat lifecycle is folded
+    /// into this roster batch instead of being emitted separately: this is the
+    /// first emission after a stale period, so the revival carries a kind the
+    /// downstream grace-resume recognises. Settling the debt HERE rather than at
+    /// each flush door is what makes it structural — a future emission door
+    /// cannot forget to settle it and ship a kind-less first batch.
+    private func flushRoster(at: Date) async {
         guard let callID = currentCallID else {
             rosterDirty = false
             return
         }
+        let reviving = owesRevivalHeartbeat
         lastRosterFlushAt = at
         rosterDirty = false
         await emitBatch(
             callID: callID, roster: currentRoster(),
-            lifecycle: withHeartbeat ? MeetWireLifecycle(kind: .heartbeat, atMs: ms(at)) : nil,
+            lifecycle: reviving ? MeetWireLifecycle(kind: .heartbeat, atMs: ms(at)) : nil,
             at: at)
+        if reviving { owesRevivalHeartbeat = false }
     }
 
     private func emitHeartbeat(at: Date) async {
