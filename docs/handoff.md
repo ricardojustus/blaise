@@ -52,11 +52,12 @@ Per meeting, into a per-meeting directory:
   each meeting keep exactly one current file at the destination, turn on "Remove
   superseded payloads at the destination" (Settings → Evidence Store). Then,
   after a new payload is delivered and the older queue rows are superseded,
-  Blaise removes this meeting's OTHER `<hash>.json` from the destination meeting
-  dir, so a correction *replaces* the delivered evidence instead of accumulating
-  beside it. The dir is per-meeting and Blaise-owned; only `*.json` other than
-  the just-delivered hash are removed — the sidecar `.md`, any delivered audio,
-  and `.tmp-*` are untouched. Removal is failure-isolated (it never fails or
+  Blaise removes this meeting's KNOWN older `<hash>.json` payload versions from
+  the destination meeting dir — an explicit candidate set built from Blaise's
+  own delivery records, never a `*.json` pattern — so a correction *replaces*
+  the delivered evidence instead of accumulating beside it. Anything Blaise did
+  not itself enqueue for this meeting is never a candidate: non-payload JSON,
+  the sidecar `.md`, any delivered audio, and `.tmp-*` are all untouched. Removal is failure-isolated (it never fails or
   retries the JSON delivery; it retries on the meeting's next delivery).
   **Weigh it if anything downstream cites payloads by hash:** an accumulating
   destination is easy to tidy later; a deleted payload is not recoverable.

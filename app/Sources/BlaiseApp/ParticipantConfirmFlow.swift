@@ -23,6 +23,9 @@ final class ParticipantConfirmModel {
     var voiceCount = 0
     var loading = true
     var working = false
+    /// Set when Confirm/Skip did not take effect: the sheet stays open with this
+    /// message instead of dismissing as if it had worked.
+    var errorMessage: String?
 
     init(meeting: Meeting, env: AppEnvironment) {
         self.meeting = meeting
@@ -62,16 +65,23 @@ final class ParticipantConfirmModel {
             })
     }
 
-    func confirm() async {
+    /// Returns whether the sheet may dismiss.
+    func confirm() async -> Bool {
         working = true
-        await env.confirmParticipants(meetingID: meeting.id, names: enteredNames)
+        let ok = await env.confirmParticipants(meetingID: meeting.id, names: enteredNames)
+        errorMessage = ok ? nil : "Couldn't save the participants. Try again."
         working = false
+        return ok
     }
 
-    func skip(dontAskAgain: Bool) async {
+    /// Returns whether the sheet may dismiss.
+    func skip(dontAskAgain: Bool) async -> Bool {
         working = true
-        await env.skipParticipantConfirmation(meetingID: meeting.id, dontAskAgain: dontAskAgain)
+        let ok = await env.skipParticipantConfirmation(
+            meetingID: meeting.id, dontAskAgain: dontAskAgain)
+        errorMessage = ok ? nil : "Couldn't skip right now. Try again."
         working = false
+        return ok
     }
 }
 
@@ -136,6 +146,12 @@ struct ParticipantConfirmSheet: View {
             .font(.caption2)
             .foregroundStyle(.secondary)
 
+            if let errorMessage = model.errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
             Divider()
 
             HStack {
@@ -145,15 +161,13 @@ struct ParticipantConfirmSheet: View {
                 Spacer()
                 Button("Skip") {
                     Task {
-                        await model.skip(dontAskAgain: dontAskAgain)
-                        isPresented = false
+                        if await model.skip(dontAskAgain: dontAskAgain) { isPresented = false }
                     }
                 }
                 .disabled(model.working)
                 Button("Confirm") {
                     Task {
-                        await model.confirm()
-                        isPresented = false
+                        if await model.confirm() { isPresented = false }
                     }
                 }
                 .keyboardShortcut(.defaultAction)

@@ -69,29 +69,33 @@ public enum HandoffCommand {
 
     // MARK: - G5 v1.3: superseded-payload cleanup + audio delivery
 
-    /// Superseded-payload cleanup remote command (G5 v1.3): remove every
-    /// `*.json` in the per-meeting dir EXCEPT the just-delivered `<keepHash>.json`.
-    /// `find`-free glob (the dir is per-meeting and Blaise-owned — the same
-    /// justification as the sidecar's `rm -f '<dir>'/*.md`). Both interpolated
-    /// values are single-quoted and validated upstream (`remoteDir` by
-    /// `HandoffSettings.isValidRemoteRoot` + ULID; `keepHash` is 64-hex by
-    /// `isValidVersionHash`), so the single-quote model is the whole injection
-    /// defense. `.tmp-*` and `.md` files are untouched (only `*.json` globs); the
-    /// `[ -e "$f" ]` guard skips the literal glob when the dir holds no `.json`.
-    public static func cleanupRemoteCommand(remoteDir: String, keepHash: String) -> String {
-        "cd '\(remoteDir)' 2>/dev/null || exit 0; "
-            + "for f in *.json; do [ -e \"$f\" ] || continue; "
-            + "[ \"$f\" = '\(keepHash).json' ] || rm -f \"$f\"; done"
+    /// Superseded-payload cleanup remote command (G5 v1.3): remove the EXACT
+    /// `<hash>.json` names Blaise knows are OLDER payload versions of THIS
+    /// meeting — never a `*.json` glob, so a non-payload file, a hash-shaped
+    /// name Blaise never wrote, or another producer's JSON in the dir is not a
+    /// deletion candidate. The caller builds `hashes` from the meeting's own
+    /// queue records and re-validates each as 64-hex (`isValidVersionHash`)
+    /// before it reaches this interpolation; `remoteDir` is validated upstream
+    /// (`HandoffSettings.isValidRemoteRoot` + ULID). The single-quote model is
+    /// the whole injection defense, unchanged. Each removed name is echoed to
+    /// stdout so the sweep leaves an auditable record the worker logs. `[ -f ]`
+    /// skips an absent name and never removes a directory; `rm -f --` so a
+    /// dash-leading name is never parsed as options.
+    public static func cleanupRemoteCommand(remoteDir: String, hashes: [String]) -> String {
+        let names = hashes.map { "'\($0).json'" }.joined(separator: " ")
+        return "cd '\(remoteDir)' 2>/dev/null || exit 0; "
+            + "for f in \(names); do [ -f \"$f\" ] || continue; "
+            + "echo \"$f\"; rm -f -- \"$f\"; done"
     }
 
     /// Full ssh argv for the superseded-payload cleanup — same option set +
     /// identity handling as `argv`, empty stdin.
     public static func cleanupArgv(
-        user: String, host: String, identityFile: String, remoteDir: String, keepHash: String
+        user: String, host: String, identityFile: String, remoteDir: String, hashes: [String]
     ) -> [String] {
         sshInvocation(
             user: user, host: host, identityFile: identityFile,
-            remoteCommand: cleanupRemoteCommand(remoteDir: remoteDir, keepHash: keepHash))
+            remoteCommand: cleanupRemoteCommand(remoteDir: remoteDir, hashes: hashes))
     }
 
     /// Audio size pre-check remote command (G5 v1.3): the byte count of an
@@ -103,14 +107,20 @@ public enum HandoffCommand {
     }
 
     /// Audio write remote command (G5 v1.3, M2): stream the audio bytes on stdin
-    /// to a REMOTE `.tmp-audio-<name>` then `mv` it into place — a died stream
-    /// never leaves a truncated file at the visible name, and the `.tmp-` prefix
-    /// lets the JSON command's stale-temp sweep (`find … -name '.tmp-*' -mtime +1
-    /// -delete`) reclaim a crash orphan. The sidecar's argv/quoting pattern;
-    /// `name` is asserted `isSafeAudioName` (no new interpolated values).
-    public static func audioWriteRemoteCommand(remoteDir: String, name: String) -> String {
-        "mkdir -p '\(remoteDir)' && cat > '\(remoteDir)/.tmp-audio-\(name)' && "
-            + "mv '\(remoteDir)/.tmp-audio-\(name)' '\(remoteDir)/\(name)'"
+    /// to a REMOTE `.tmp-audio-<name>`, check the received byte count against the
+    /// locally known `byteCount`, and only THEN `mv` it into place — a died
+    /// stream (a watchdog kill whose channel closes cleanly enough for `cat` to
+    /// see EOF and exit 0) leaves a short temp that fails the check, never a
+    /// truncated file at the visible name. The `.tmp-` prefix lets the JSON
+    /// command's stale-temp sweep (`find … -name '.tmp-*' -mtime +1 -delete`)
+    /// reclaim the orphan. The sidecar's argv/quoting pattern; `name` is asserted
+    /// `isSafeAudioName` and `byteCount` is a decimal integer (no new
+    /// interpolated-value class).
+    public static func audioWriteRemoteCommand(remoteDir: String, name: String, byteCount: Int) -> String {
+        let temp = "\(remoteDir)/.tmp-audio-\(name)"
+        return "mkdir -p '\(remoteDir)' && cat > '\(temp)' && "
+            + "[ $(wc -c < '\(temp)') -eq \(byteCount) ] && "
+            + "mv '\(temp)' '\(remoteDir)/\(name)'"
     }
 
     public static func audioSizeCheckArgv(
@@ -122,11 +132,13 @@ public enum HandoffCommand {
     }
 
     public static func audioWriteArgv(
-        user: String, host: String, identityFile: String, remoteDir: String, name: String
+        user: String, host: String, identityFile: String, remoteDir: String, name: String,
+        byteCount: Int
     ) -> [String] {
         sshInvocation(
             user: user, host: host, identityFile: identityFile,
-            remoteCommand: audioWriteRemoteCommand(remoteDir: remoteDir, name: name))
+            remoteCommand: audioWriteRemoteCommand(
+                remoteDir: remoteDir, name: name, byteCount: byteCount))
     }
 
     /// A retained-audio canonical file name is injection-safe by construction

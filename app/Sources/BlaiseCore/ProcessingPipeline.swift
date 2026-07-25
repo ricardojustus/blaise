@@ -933,8 +933,22 @@ public actor ProcessingPipeline {
                     .fetch(meetingID: meetingID)
             else { return 0 }
 
+            // ONE effective replacement for EVERY layer this correction touches
+            // (notes, digest, rename rows, transcript, payload), resolved ONCE
+            // before anything is mutated: the §4 store rule-1/3 normalization can
+            // map the typed surface onto a different name (a `Marsa → Dana Marsh`
+            // store row), and applying it to the speaker layer alone would leave
+            // the re-minted payload's notes and transcript disagreeing about the
+            // person just corrected. M-3 still stands: the rename-input X-(Y)
+            // parenthetical heuristic is rename-input only, so a surface that no
+            // store/polish rule resolves is used verbatim in all layers.
+            let renameContext = await self.renameNormalizationContext()
+            let resolved = NameSubstitution.normalizeRename(clean, context: renameContext)
+            let effective =
+                resolved == NameSubstitution.normalizeRenameInput(clean) ? clean : resolved
+
             let (edited, count) = NameSubstitution.applyNoteCorrection(
-                notes: notes.structured, original: original, replacement: clean,
+                notes: notes.structured, original: original, replacement: effective,
                 allOccurrences: allOccurrences, occurrenceIndex: occurrenceIndex)
             guard count > 0 else { return 0 }
             // M3: a name correction also rewrites the STORED digest string
@@ -943,7 +957,7 @@ public actor ProcessingPipeline {
             // lockstep with the notes. A non-name edit never reaches here.
             if let digest = notes.memoryDigest {
                 notes.memoryDigest = NameSubstitution.applyTextCorrection(
-                    text: digest, original: original, replacement: clean).text
+                    text: digest, original: original, replacement: effective).text
             }
             let user = await self.userIdentity()
             var segments = try await TranscriptRepository(database: self.database)
@@ -963,7 +977,13 @@ public actor ProcessingPipeline {
             // is a single value and always updates wholly.
             let originalFold = VocabNormalization.canonicalMode(original)
             let matchingLabels = Set(segments.compactMap { segment -> String? in
-                guard let name = segment.speakerName, !name.isEmpty,
+                // The reserved `user` mic-track label is EXCLUDED: it is
+                // non-renameable in the UI, so a rename row keyed to it could
+                // never be re-confirmed and would render a permanent
+                // "needs re-confirmation" badge. The owner's naming flows from
+                // UserIdentity, not from rename rows, so skipping is correct.
+                guard segment.speakerLabel != TranscriptSegment.userLabel,
+                    let name = segment.speakerName, !name.isEmpty,
                     VocabNormalization.canonicalMode(name) == originalFold
                 else { return nil }
                 return segment.speakerLabel
@@ -972,9 +992,7 @@ public actor ProcessingPipeline {
                 let asrProvenance = meeting.asrProvenance,
                 let dominantLanguage = meeting.dominantLanguage
             {
-                let renameContext = await self.renameNormalizationContext()
-                let renameName = NameSubstitution.normalizeRename(clean, context: renameContext)
-                if !renameName.isEmpty {
+                if !effective.isEmpty {
                     let diarization = await self.loadPersistedDiarization(meetingID: meetingID)
                         ?? DiarizationOutput(segments: [], speakerCount: 0)
                     // M1: build the rename rows ONCE, apply them to segments in
@@ -986,7 +1004,7 @@ public actor ProcessingPipeline {
                     }
                     let newRows = matchingLabels.sorted().map { label in
                         SpeakerRenameStore.makeRow(
-                            meetingID: meetingID, speakerLabel: label, name: renameName,
+                            meetingID: meetingID, speakerLabel: label, name: effective,
                             diarization: diarization, now: timestamp)
                     }
                     let newLabels = Set(newRows.map(\.speakerLabel))
@@ -1958,7 +1976,16 @@ public actor ProcessingPipeline {
             }
         }
         guard didWrite else { return false }
-        _ = try? await processNotesOnly(meetingID: meetingID, confirmingParticipants: true)
+        do {
+            _ = try await processNotesOnly(meetingID: meetingID, confirmingParticipants: true)
+        } catch {
+            // The attendees ARE written (that is what `true` reports); the resume
+            // is retried by the ordinary pending self-heal. Never swallow the
+            // reason it failed.
+            logger.error(
+                "participant confirm resume failed for \(meetingID, privacy: .public): \(String(describing: error), privacy: .public) — attendees written; pending self-heal retries"
+            )
+        }
         return true
     }
 

@@ -1099,20 +1099,28 @@ final class AppEnvironment {
     }
 
     /// Confirm (§3): write the confirmed attendee names and dispatch the
-    /// gate-bypassing notes-only resume; withdraw the confirm notification.
-    func confirmParticipants(meetingID: MeetingID, names: [String]) async {
-        _ = try? await pipeline.confirmParticipants(meetingID: meetingID, names: names)
-        notificationAdapter.withdrawParticipantConfirmation(meetingID: meetingID)
+    /// gate-bypassing notes-only resume. Returns whether it actually happened;
+    /// the notification is withdrawn ONLY on success, so a failure leaves every
+    /// recovery surface in place instead of looking like it worked.
+    @discardableResult
+    func confirmParticipants(meetingID: MeetingID, names: [String]) async -> Bool {
+        let confirmed =
+            (try? await pipeline.confirmParticipants(meetingID: meetingID, names: names)) ?? false
+        if confirmed { notificationAdapter.withdrawParticipantConfirmation(meetingID: meetingID) }
+        return confirmed
     }
 
     /// Skip (§3): proceed without attendees. "Don't ask again" flips the
-    /// preference off first. Withdraws the confirm notification.
-    func skipParticipantConfirmation(meetingID: MeetingID, dontAskAgain: Bool) async {
+    /// preference off first. Same success contract as `confirmParticipants`.
+    @discardableResult
+    func skipParticipantConfirmation(meetingID: MeetingID, dontAskAgain: Bool) async -> Bool {
         if dontAskAgain {
             try? await settings.set(AutomationSettings.confirmParticipantsKey, to: false)
         }
-        _ = try? await pipeline.skipParticipantConfirmation(meetingID: meetingID)
-        notificationAdapter.withdrawParticipantConfirmation(meetingID: meetingID)
+        let skipped =
+            (try? await pipeline.skipParticipantConfirmation(meetingID: meetingID)) ?? false
+        if skipped { notificationAdapter.withdrawParticipantConfirmation(meetingID: meetingID) }
+        return skipped
     }
 
     /// The calendar Launch & Record action: open the Meet link in Google

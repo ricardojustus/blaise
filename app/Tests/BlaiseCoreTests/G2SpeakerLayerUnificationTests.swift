@@ -87,6 +87,95 @@ import Testing
         #expect(!speakerNames.contains("Fábio"), "no bare pre-correction name lingers")
     }
 
+    // MARK: - AC8: ONE effective replacement across the layers (store-resolved surface)
+
+    /// The typed surface hits a correction-store row that resolves it to a
+    /// DIFFERENT name. That single resolved value must drive the notes, the
+    /// rename row, the transcript and the re-minted payload alike — applying it
+    /// to the speaker layer only is the exact notes/transcript disagreement NH-D
+    /// exists to kill.
+    @Test func storeResolvedReplacementLandsInEveryLayer() async throws {
+        let harness = try await makePipelineHarness()
+        harness.notesPrimary.state.withLock { state in
+            state.mapping = [
+                SpeakerNameProposal(
+                    label: "S1", name: "Fábio", confidence: .high,
+                    evidence: "O Fábio vai mandar o contrato.")
+            ]
+        }
+        let meeting = try await harness.importTestMeeting()
+        _ = try await harness.pipeline.process(meetingID: meeting.id)
+        // `Marsa → Dana Marsh`: normalizeRename("Marsa") != "Marsa".
+        _ = try await harness.pipeline.rememberCorrection(
+            mishearedSurface: "Marsa", replacement: "Dana Marsh", sourceMeetingID: meeting.id)
+
+        let count = try await harness.pipeline.correctNameInNotes(
+            meetingID: meeting.id, original: "Fábio", replacement: "Marsa", allOccurrences: true)
+        #expect(count > 0)
+
+        let notes = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+        #expect(notes.structured.actionItems.first?.owner == "Dana Marsh")
+        #expect(!notes.markdown.contains("Marsa"), "the notes never keep the un-resolved surface")
+        #expect((try await renames(harness, meeting.id))
+            .contains { $0.speakerLabel == "S1" && $0.name == "Dana Marsh" })
+        let segs = try await harness.segments(meeting.id)
+        #expect(segs.filter { $0.speakerLabel == "S1" }.allSatisfy { $0.speakerName == "Dana Marsh" })
+
+        // And the payload's two layers agree.
+        let payload = try await latestPayload(harness, meeting.id)
+        let transcript = try #require(payload["transcript"] as? [[String: Any]])
+        let speakerNames = transcript.compactMap {
+            ($0["speaker"] as? [String: Any])?["name"] as? String
+        }
+        let structured = try #require(payload["notes_structured"] as? [String: Any])
+        let owners = (structured["action_items"] as? [[String: Any]] ?? [])
+            .compactMap { $0["owner"] as? String }
+        #expect(speakerNames.contains("Dana Marsh"))
+        #expect(owners.contains("Dana Marsh"))
+    }
+
+    // MARK: - NH-D never reaches the reserved `user` mic-track label
+
+    /// A correction whose original fold-equals the RECORDING USER's name must not
+    /// write a rename row keyed `user`: that label is non-renameable in the UI, so
+    /// the row's "needs re-confirmation" badge could never be cleared. The notes
+    /// correction itself still applies.
+    @Test func correctingTheUsersOwnNameWritesNoUserLabelRenameRow() async throws {
+        let harness = try await makePipelineHarness()
+        // The harness identity is "Sam"; the notes name the user.
+        harness.notesPrimary.state.withLock { $0.summary = "Sam fechou o contrato" }
+        let meeting = try await harness.importTestMeeting()
+        _ = try await harness.pipeline.process(meetingID: meeting.id)
+        let provenance = try #require((try await harness.meeting(meeting.id))?.asrProvenance)
+        // Persist the mic-track shape a two-track captured run produces: the
+        // reserved `user` label carrying the identity name.
+        let segments = [
+            TranscriptSegment(
+                meetingID: meeting.id, ord: 0, startSeconds: 0, endSeconds: 1,
+                speakerLabel: TranscriptSegment.userLabel, speakerName: "Sam", text: "Olá"),
+            TranscriptSegment(
+                meetingID: meeting.id, ord: 1, startSeconds: 1, endSeconds: 2,
+                speakerLabel: "S1", speakerName: "Fábio", text: "Tudo bem"),
+        ]
+        _ = try await harness.database.persistTranscript(
+            meetingID: meeting.id, segments: segments, asrProvenance: provenance,
+            dominantLanguage: "pt")
+
+        let count = try await harness.pipeline.correctNameInNotes(
+            meetingID: meeting.id, original: "Sam", replacement: "Sam Rivera",
+            allOccurrences: true)
+        #expect(count > 0)
+
+        let rows = try await renames(harness, meeting.id)
+        #expect(
+            !rows.contains { $0.speakerLabel == TranscriptSegment.userLabel },
+            "a rename row on the non-renameable `user` label is an unclearable stale badge")
+        let notes = try #require(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
+        #expect(notes.structured.summary == "Sam Rivera fechou o contrato", "the notes still correct")
+    }
+
     // MARK: - AC8 negative: a prose-only correction leaves the transcript byte-identical
 
     @Test func proseOnlyCorrectionLeavesTheTranscriptByteIdentical() async throws {

@@ -61,6 +61,54 @@ private func enqueueSecondVersion(_ database: BlaiseDatabase, _ meetingID: Meeti
         .enqueue(meetingID: meetingID, versionHash: payload.versionHash, payloadPath: relative)
 }
 
+/// A transport that runs a side effect INSIDE its first `deliver` — the seam for
+/// "the user flips a Settings toggle while a slow transfer is in flight": the
+/// worker is suspended at that await and the actor is reentrant there, so any
+/// value it cached before the await is stale when the call returns. Delegates to
+/// `inner` when given one (the local destination needs the real write), else
+/// reports success.
+private final class FlipDuringDeliveryTransport: HandoffTransporting, @unchecked Sendable {
+    private let inner: (any HandoffTransporting)?
+    private let duringFirstCall: @Sendable () async -> Void
+    private let lock = NSLock()
+    private var fired = false
+    private var recorded: [[String]] = []
+
+    init(
+        inner: (any HandoffTransporting)? = nil,
+        duringFirstCall: @escaping @Sendable () async -> Void
+    ) {
+        self.inner = inner
+        self.duringFirstCall = duringFirstCall
+    }
+
+    var calls: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+
+    /// Records the call and reports whether it is the first (all lock work stays
+    /// out of the async context).
+    private func record(_ argv: [String]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        recorded.append(argv)
+        let first = !fired
+        fired = true
+        return first
+    }
+
+    func deliver(argv: [String], payload: Data, timeout: TimeInterval) async throws
+        -> HandoffTransportOutcome
+    {
+        let first = record(argv)
+        if first { await duringFirstCall() }
+        if let inner { return try await inner.deliver(argv: argv, payload: payload, timeout: timeout) }
+        return HandoffTransportOutcome(exitStatus: 0, stderrTail: "", timedOut: false)
+    }
+}
+
 private func jsonNames(_ dir: URL) -> [String] {
     ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
         .filter { $0.hasSuffix(".json") }.sorted()
@@ -150,27 +198,138 @@ private func audioNames(_ dir: URL) -> [String] {
         #expect(jsonNames(destDir) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted())
     }
 
-    @Test func sshCleanupEmitsGlobRemovalAfterDelivery() async throws {
+    @Test func sshCleanupNamesOnlyKnownSupersededHashes() async throws {
         let database = try makeDatabase()
-        let item = try await seedDeliverable(database, title: "SSH cleanup")  // sidecar OFF
+        let v1 = try await seedDeliverable(database, title: "SSH cleanup")  // sidecar OFF
         try await SettingsStore(database: database)
             .set(HandoffDestination.Key.removeSupersededPayloads, to: true)  // cleanup ON
         let transport = MockTransport()
         let worker = makeWorker(database, transport: transport)
         await worker.kick()
         await worker.waitUntilSettled()
+        // v1 is the meeting's ONLY known version ⇒ nothing to remove, no call.
+        #expect(transport.calls.count == 1, "no known superseded version ⇒ no cleanup command")
 
-        // JSON (0) then the cleanup glob removal (1), removal explicitly ON.
-        #expect(transport.calls.count == 2)
-        let remoteDir = handoffValidExample.remoteRoot + "/" + item.meetingID
-        #expect(transport.calls[1].argv == HandoffCommand.cleanupArgv(
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        // v2's JSON (1) then the cleanup (2), naming v1's file EXACTLY — never a
+        // `*.json` glob, so a non-payload file, a foreign 64-hex name Blaise
+        // never wrote, or a directory in that dir is not a deletion candidate.
+        #expect(transport.calls.count == 3)
+        let remoteDir = handoffValidExample.remoteRoot + "/" + v1.meetingID
+        #expect(transport.calls[2].argv == HandoffCommand.cleanupArgv(
             user: handoffValidExample.user, host: handoffValidExample.hosts[0],
             identityFile: handoffValidExample.identityFile,
-            remoteDir: remoteDir, keepHash: item.versionHash))
-        #expect(transport.calls[1].argv.last
+            remoteDir: remoteDir, hashes: [v1.versionHash]))
+        #expect(transport.calls[2].argv.last
             == "cd '\(remoteDir)' 2>/dev/null || exit 0; "
-            + "for f in *.json; do [ -e \"$f\" ] || continue; "
-            + "[ \"$f\" = '\(item.versionHash).json' ] || rm -f \"$f\"; done")
+            + "for f in '\(v1.versionHash).json'; do [ -f \"$f\" ] || continue; "
+            + "echo \"$f\"; rm -f -- \"$f\"; done")
+        let command = try #require(transport.calls[2].argv.last)
+        #expect(!command.contains("*.json"), "no glob: only Blaise's own records authorize a delete")
+        #expect(!command.contains(v2.versionHash), "the just-delivered payload is never named")
+    }
+
+    /// C-1: a destination dir holding a non-payload JSON, a DIRECTORY named
+    /// `*.json`, and a valid-looking 64-hex payload Blaise never wrote loses NONE
+    /// of them — only the meeting's own older version goes. The pre-fix wildcard
+    /// sweep removed all four.
+    @Test func localCleanupRemovesOnlyThisMeetingsKnownSupersededPayloads() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Surgical")
+        let folder = try g5TempFolder()
+        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: true)
+
+        let worker = makeWorker(database)
+        await worker.start()
+        await worker.waitUntilSettled()
+        let destDir = folder.appendingPathComponent(v1.meetingID)
+
+        // Foreign inhabitants of the meeting dir, all of them NOT Blaise's records.
+        let foreignHash = String(repeating: "ab", count: 32)  // valid 64-hex, never enqueued
+        try Data("{}".utf8).write(to: destDir.appendingPathComponent("metadata.json"))
+        try Data("{}".utf8).write(to: destDir.appendingPathComponent("\(foreignHash).json"))
+        try FileManager.default.createDirectory(
+            at: destDir.appendingPathComponent("archive.json", isDirectory: true),
+            withIntermediateDirectories: true)
+        try Data("kept".utf8).write(
+            to: destDir.appendingPathComponent("archive.json").appendingPathComponent("old.json"))
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(destDir) == [
+                "\(foreignHash).json", "archive.json", "metadata.json", "\(v2.versionHash).json",
+            ].sorted(),
+            "only THIS meeting's known superseded payload is removed")
+        #expect(!FileManager.default.fileExists(
+            atPath: destDir.appendingPathComponent("\(v1.versionHash).json").path))
+        // The directory survived WITH its contents (removeItem would recurse).
+        #expect(FileManager.default.fileExists(
+            atPath: destDir.appendingPathComponent("archive.json")
+                .appendingPathComponent("old.json").path))
+    }
+
+    /// C-2: the toggle flipped OFF DURING a slow delivery wins — the destructive
+    /// authorization is re-read after the transport await, never cached across it.
+    @Test func localCleanupSkippedWhenToggleFlipsOffDuringDelivery() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Flip local")
+        let folder = try g5TempFolder()
+        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        let destDir = folder.appendingPathComponent(v1.meetingID)
+        #expect(jsonNames(destDir) == ["\(v1.versionHash).json"])
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        // The user turns removal OFF while v2's bytes are still being written.
+        let store = SettingsStore(database: database)
+        let worker = HandoffWorker(
+            database: database,
+            prober: MockProber(),
+            localTransportFactory: { root in
+                FlipDuringDeliveryTransport(inner: LocalFolderTransport(root: root)) {
+                    try? await store.set(HandoffDestination.Key.removeSupersededPayloads, to: false)
+                }
+            },
+            nonce: { testNonce })
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(destDir) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
+            "OFF during the transfer ⇒ the sweep that was authorized before it must not run")
+    }
+
+    @Test func sshCleanupSkippedWhenToggleFlipsOffDuringDelivery() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Flip ssh")
+        try await SettingsStore(database: database)
+            .set(HandoffDestination.Key.removeSupersededPayloads, to: true)
+        let first = makeWorker(database)
+        await first.kick()
+        await first.waitUntilSettled()
+
+        _ = try await enqueueSecondVersion(database, v1.meetingID)
+        let store = SettingsStore(database: database)
+        let transport = FlipDuringDeliveryTransport {
+            try? await store.set(HandoffDestination.Key.removeSupersededPayloads, to: false)
+        }
+        let worker = HandoffWorker(
+            database: database, transport: transport, prober: MockProber(), nonce: { testNonce })
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            transport.calls.count == 1,
+            "OFF during the transfer ⇒ the JSON is delivered and NO cleanup command is sent")
     }
 
     @Test func sshDefaultSkipsCleanupCall() async throws {
@@ -187,21 +346,27 @@ private func audioNames(_ dir: URL) -> [String] {
 
     @Test func sshCleanupFailureDoesNotFailDelivery() async throws {
         let database = try makeDatabase()
-        let item = try await seedDeliverable(database, title: "Isolated cleanup")
+        let v1 = try await seedDeliverable(database, title: "Isolated cleanup")
         try await SettingsStore(database: database)
             .set(HandoffDestination.Key.removeSupersededPayloads, to: true)  // cleanup ON
-        // JSON succeeds; the cleanup call fails non-zero — isolated.
+        // v1's JSON succeeds (no superseded version yet ⇒ no cleanup call), then
+        // v2's JSON succeeds and ITS cleanup call fails non-zero — isolated.
         let transport = MockTransport(script: [
+            HandoffTransportOutcome(exitStatus: 0, stderrTail: "", timedOut: false),
             HandoffTransportOutcome(exitStatus: 0, stderrTail: "", timedOut: false),
             HandoffTransportOutcome(exitStatus: 255, stderrTail: "cleanup boom", timedOut: false),
         ])
         let worker = makeWorker(database, transport: transport)
         await worker.kick()
         await worker.waitUntilSettled()
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        await worker.kick()
+        await worker.waitUntilSettled()
 
+        #expect(transport.calls.count == 3, "the failing call WAS the cleanup")
         let rows = try await HandoffRepository(database: database).allItems()
-        #expect(rows.first?.id == item.id)
-        #expect(rows.first?.state == .delivered, "cleanup failure never un-delivers the JSON")
+        #expect(rows.last?.id == v2.id)
+        #expect(rows.last?.state == .delivered, "cleanup failure never un-delivers the JSON")
     }
 }
 
@@ -342,8 +507,12 @@ private func audioNames(_ dir: URL) -> [String] {
 
         let remoteDir = handoffValidExample.remoteRoot + "/" + item.meetingID
         let commands = transport.calls.compactMap { $0.argv.last }
+        // The promotion is gated on the RECEIVED byte count matching the local
+        // one, so a died stream whose `cat` still exits 0 cannot install a
+        // truncated file at the visible name.
         #expect(commands.contains {
             $0 == "mkdir -p '\(remoteDir)' && cat > '\(remoteDir)/.tmp-audio-audio.m4a' && "
+                + "[ $(wc -c < '\(remoteDir)/.tmp-audio-audio.m4a') -eq 320 ] && "
                 + "mv '\(remoteDir)/.tmp-audio-audio.m4a' '\(remoteDir)/audio.m4a'"
         })
         // M3: the bytes NEVER stream directly onto the visible final name — a

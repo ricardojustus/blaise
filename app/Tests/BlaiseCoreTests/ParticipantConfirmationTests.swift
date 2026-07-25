@@ -135,31 +135,31 @@ import Testing
     @Test func confirmWritesAttendeesResumesAndFixesMisheardOwner() async throws {
         let harness = try await makePipelineHarness()
         try await enableGate(harness)
-        // The mock owner is a d=1 mishearing of the confirmed attendee "Rodrigo"
-        // (len 7 → tolerance 2): rule-2 fixes it with ZERO manual corrections.
-        harness.notesPrimary.state.withLock { $0.actionOwner = "Rodrggo" }
+        // The mock owner is a d=1 mishearing of the confirmed attendee "Marina"
+        // (len 6 → tolerance 2): rule-2 fixes it with ZERO manual corrections.
+        harness.notesPrimary.state.withLock { $0.actionOwner = "Marna" }
         let meeting = try await harness.importTestMeeting(attendees: [])
         _ = try await harness.pipeline.process(meetingID: meeting.id)
         #expect(isParticipantMarker(try await harness.meeting(meeting.id)))
 
         // Confirm with a duplicate + an empty row — folded-deduped, empties dropped.
         let confirmed = try await harness.pipeline.confirmParticipants(
-            meetingID: meeting.id, names: ["Rodrigo", "  rodrigo ", ""])
+            meetingID: meeting.id, names: ["Marina", "  marina ", ""])
         #expect(confirmed)
 
         let stored = try #require(try await harness.meeting(meeting.id))
         #expect(stored.status == .ready)
         #expect(stored.lastProcessingError == nil, "marker cleared by the resume finalize")
-        #expect(stored.attendees == [Attendee(name: "Rodrigo", source: .manual)])
+        #expect(stored.attendees == [Attendee(name: "Marina", source: .manual)])
         #expect(try await harness.queueRows(meeting.id) == 1)
 
         // The resume's notes request carried the confirmed attendee (allowed-name
         // gate + rule-2 candidate), and the minted owner was fixed.
         let resumed = try #require(harness.notesPrimary.state.withLock { $0.requests.last })
-        #expect(resumed.meeting.attendees.contains { $0.name == "Rodrigo" })
+        #expect(resumed.meeting.attendees.contains { $0.name == "Marina" })
         let notes = try #require(
             try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
-        #expect(notes.structured.actionItems.first?.owner == "Rodrigo")
+        #expect(notes.structured.actionItems.first?.owner == "Marina")
     }
 
     // MARK: - AC4: Skip mints without attendees; preference off is honored next run

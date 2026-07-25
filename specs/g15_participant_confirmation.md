@@ -17,9 +17,10 @@ the meeting transcribes normally and notes wait until the names are confirmed
 
 ## 2. The gate
 
-Evaluated ONCE per content run, at the notes-stage entry (transcript and
-diarization already persisted — the gate never blocks transcription or audio
-retention):
+Evaluated ONCE per content run, at the notes-stage entry — transcript and
+diarization have been PRODUCED, and the transcript persist still completes
+before the pending terminal becomes visible, so the gate never blocks
+transcription or audio retention:
 
 - Fires iff the preference is ON **and** `meeting.attendees` is empty. Attendees
   from ANY source (calendar merge, import, Meet/Slack roster absorption) satisfy
@@ -38,8 +39,8 @@ retention):
 
 ## 3. The confirm sheet
 
-Opened from the meeting detail view's pending banner (and from the
-notification). Contents:
+Opened from the meeting detail view's pending banner. Clicking the notification
+navigates to the meeting, where that banner opens the sheet. Contents:
 
 - An editable name list, pre-filled from the best available hints in this
   order: calendar suggestions for the meeting's time window, grounded person
@@ -93,3 +94,9 @@ Editing attendees on non-gated meetings (separate backlog: per-meeting attendee
 editor); glossary/alias admission from the sheet; renaming already-minted
 notes (G2 owns corrections); any change to speaker RESOLUTION mechanics (the
 gate only feeds it better inputs).
+
+## CHANGELOG
+- 25/07/2026: §2/§3 wording corrected to the shipped behaviour — the gate
+  evaluates after transcript and diarization are PRODUCED (the transcript persist
+  completes before the pending terminal becomes visible), and a notification
+  click navigates to the meeting whose banner opens the sheet.

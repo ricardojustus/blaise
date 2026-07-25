@@ -334,9 +334,10 @@ public actor HandoffWorker: HandoffKicking {
                 return
             }
 
-            // G5 v1.3 destination-independent toggles, read fresh each drain so a
-            // Settings change takes effect on the next delivery.
-            let removeSuperseded = await HandoffDestination.removeSupersededPayloads(from: settingsStore)
+            // G5 v1.3 destination-independent toggle, read fresh each drain so a
+            // Settings change takes effect on the next delivery. (The DESTRUCTIVE
+            // cleanup toggle is deliberately NOT cached here — it is re-read
+            // immediately before each cleanup, after the transport await.)
             let deliverAudio = await HandoffDestination.deliverAudio(from: settingsStore)
 
             switch destination {
@@ -398,9 +399,15 @@ public actor HandoffWorker: HandoffKicking {
                 // G5 v1.3: superseded-payload cleanup AFTER delivery + supersession
                 // (OPT-IN, default OFF; failure-isolated). Never touches the local
                 // `handoff/` snapshots — the destination is a delivery target.
-                if outcome.exitStatus == 0, removeSuperseded {
+                // The toggle is re-read HERE, after the transport await: the actor
+                // is reentrant at that suspension, so a value read before a slow
+                // delivery can be stale by now and the user's OFF must win.
+                if outcome.exitStatus == 0,
+                    await HandoffDestination.removeSupersededPayloads(from: settingsStore)
+                {
                     await cleanupSupersededSSH(
-                        item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                        item: claimed, settings: settings, host: host, remoteDir: remoteDir,
+                        hashes: await supersededCandidates(item: claimed))
                 }
 
             case .localFolder(let url, let sidecar):
@@ -445,9 +452,14 @@ public actor HandoffWorker: HandoffKicking {
                 await recordOutcome(outcome, item: claimed, endpoint: endpoint)
                 // G5 v1.3: superseded-payload cleanup AFTER delivery + supersession
                 // (OPT-IN, default OFF; failure-isolated). `.tmp-*` and the sidecar/audio
-                // files are untouched — only OTHER `<hash>.json` are removed.
-                if outcome.exitStatus == 0, removeSuperseded {
-                    await cleanupSupersededLocal(item: claimed, root: url)
+                // files are untouched — only THIS meeting's known older `<hash>.json`
+                // are removed. Same post-await re-read as the SSH path.
+                if outcome.exitStatus == 0,
+                    await HandoffDestination.removeSupersededPayloads(from: settingsStore)
+                {
+                    await cleanupSupersededLocal(
+                        item: claimed, root: url,
+                        hashes: await supersededCandidates(item: claimed))
                 }
             }
         }
@@ -544,22 +556,48 @@ public actor HandoffWorker: HandoffKicking {
 
     // MARK: - G5 v1.3: superseded-payload cleanup (failure-isolated)
 
-    /// Removes THIS meeting's OTHER `<hash>.json` from the LOCAL destination
-    /// meeting dir after a successful delivery + supersession (default ON). The
-    /// dir is per-meeting and Blaise-owned; `.tmp-*`, the sidecar `.md`, and any
-    /// delivered audio are untouched (only `*.json` other than the just-delivered
-    /// hash). FAILURE-ISOLATED: never fails or retries the JSON queue item —
-    /// logged and retried on this meeting's next delivery.
-    private func cleanupSupersededLocal(item: HandoffItem, root: URL) async {
+    /// The explicit deletion-candidate set for a destination cleanup: the OTHER
+    /// payload version hashes Blaise itself enqueued for THIS meeting (any queue
+    /// state — delivered, superseded, pending), excluding the just-delivered one
+    /// and each re-validated 64-hex before it can reach a path or a remote
+    /// command. Deletion authority comes from Blaise's own records, never from a
+    /// `.json` suffix: a non-payload file, a hash-shaped name Blaise never
+    /// wrote, or another producer's JSON is therefore never a candidate.
+    private func supersededCandidates(item: HandoffItem) async -> [String] {
+        let hashes = (try? await repository.versionHashes(meetingID: item.meetingID)) ?? []
+        return hashes
+            .filter { $0 != item.versionHash && MeetingPaths.isValidVersionHash($0) }
+            .sorted()
+    }
+
+    /// Removes THIS meeting's KNOWN older `<hash>.json` (the `hashes` candidate
+    /// set) from the LOCAL destination meeting dir after a successful delivery +
+    /// supersession (opt-in, default OFF). Anything not in the set is left
+    /// alone — non-payload JSON, a directory, `.tmp-*`, the sidecar `.md` and any
+    /// delivered audio included. FAILURE-ISOLATED: never fails or retries the
+    /// JSON queue item — logged and retried on this meeting's next delivery.
+    private func cleanupSupersededLocal(item: HandoffItem, root: URL, hashes: [String]) async {
         let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
-        let keep = "\(item.versionHash).json"
+        let candidates = Set(hashes.map { "\($0).json" })
         let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else {
+            logger.warning(
+                "payload cleanup: could not read the destination dir for \(item.meetingID, privacy: .public) — nothing removed; retried next delivery"
+            )
+            return
+        }
         var removed = 0
-        for name in names where name.hasSuffix(".json") && name != keep {
+        for name in names where candidates.contains(name) {
+            let url = dir.appendingPathComponent(name)
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue
+            else { continue }
             do {
-                try fm.removeItem(at: dir.appendingPathComponent(name))
+                try fm.removeItem(at: url)
                 removed += 1
+                logger.notice(
+                    "payload cleanup: removed \(name, privacy: .public) for \(item.meetingID, privacy: .public)"
+                )
             } catch {
                 logger.warning(
                     "payload cleanup: could not remove \(name, privacy: .public) for \(item.meetingID, privacy: .public): \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
@@ -573,15 +611,20 @@ public actor HandoffWorker: HandoffKicking {
         }
     }
 
-    /// Removes THIS meeting's OTHER `<hash>.json` from the SSH destination
+    /// Removes THIS meeting's KNOWN older `<hash>.json` (the `hashes` candidate
+    /// set, named EXACTLY in the remote command) from the SSH destination
     /// meeting dir via a second ssh invocation (`cleanupArgv`), the sidecar's
     /// argv/quoting discipline. FAILURE-ISOLATED exactly like `uploadSidecar`.
     private func cleanupSupersededSSH(
-        item: HandoffItem, settings: HandoffSettings, host: String, remoteDir: String
+        item: HandoffItem, settings: HandoffSettings, host: String, remoteDir: String,
+        hashes: [String]
     ) async {
+        // Nothing known to be superseded ⇒ no remote command at all (an empty
+        // name list would not even be a valid `for` loop).
+        guard !hashes.isEmpty else { return }
         let argv = HandoffCommand.cleanupArgv(
             user: settings.user, host: host, identityFile: settings.identityFile,
-            remoteDir: remoteDir, keepHash: item.versionHash)
+            remoteDir: remoteDir, hashes: hashes)
         do {
             let outcome = try await transport.deliver(
                 argv: argv, payload: Data(),
@@ -590,6 +633,16 @@ public actor HandoffWorker: HandoffKicking {
                 logger.warning(
                     "payload cleanup (ssh) for \(item.meetingID, privacy: .public) exit=\(outcome.exitLabel, privacy: .public) — JSON already delivered; retried next delivery"
                 )
+            } else {
+                // The remote command echoes each removed name; log it so a remote
+                // deletion is diagnosable after the fact.
+                let removed = String(decoding: outcome.stdout, as: UTF8.self)
+                    .split(whereSeparator: \.isNewline).joined(separator: " ")
+                if !removed.isEmpty {
+                    logger.notice(
+                        "payload cleanup (ssh): removed \(removed, privacy: .public) for \(item.meetingID, privacy: .public)"
+                    )
+                }
             }
         } catch {
             logger.warning(
@@ -689,7 +742,7 @@ public actor HandoffWorker: HandoffKicking {
             guard let bytes = try? Data(contentsOf: source) else { continue }
             let writeArgv = HandoffCommand.audioWriteArgv(
                 user: settings.user, host: host, identityFile: settings.identityFile,
-                remoteDir: remoteDir, name: name)
+                remoteDir: remoteDir, name: name, byteCount: bytes.count)
             do {
                 let outcome = try await transport.deliver(
                     argv: writeArgv, payload: bytes,

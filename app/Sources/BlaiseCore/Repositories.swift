@@ -317,6 +317,18 @@ public struct HandoffRepository: Sendable {
         }
     }
 
+    /// Every version hash Blaise has ever enqueued for a meeting, any state
+    /// (delivered, superseded, pending). This is what Blaise KNOWS it wrote to
+    /// a destination — the provenance behind destination cleanup's deletion
+    /// candidates (G5 v1.3).
+    public func versionHashes(meetingID: MeetingID) async throws -> [String] {
+        try await database.pool.read { db in
+            try String.fetchAll(
+                db, sql: "SELECT DISTINCT version_hash FROM handoff_queue WHERE meeting_id = ?",
+                arguments: [meetingID])
+        }
+    }
+
     /// Quarantined rows (`failed` + `damaged:` prefix), oldest first.
     public func damagedItems() async throws -> [HandoffItem] {
         try await database.pool.read { db in
