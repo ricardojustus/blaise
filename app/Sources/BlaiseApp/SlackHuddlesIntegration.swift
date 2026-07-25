@@ -148,13 +148,18 @@ final class SlackHuddlesModel {
         lifecycleEpoch &+= 1
         let epoch = lifecycleEpoch
         Task {
+            // Re-check BEFORE each mutation, never after: a guard placed after
+            // the mutation still performs the stale work and only then notices
+            // it was superseded.
             if value {
+                guard epoch == lifecycleEpoch else { return }
                 // Re-push the member id: a prior disable cleared the tracker's
                 // identity, and an identity-less tracker ignores every event.
                 await tracker.setSelfUserID(memberID)
                 guard epoch == lifecycleEpoch else { return }
                 startSocket()
             } else {
+                guard epoch == lifecycleEpoch else { return }
                 await stopSocket()
                 // A newer toggle superseded this one while the socket tore
                 // down — clearing the tracker now would blind the re-enabled
@@ -224,12 +229,22 @@ final class SlackHuddlesModel {
             connected = true
             enabled = true
             lastError = nil
+            // connect() is an ENABLING path, so it joins the lifecycle epoch:
+            // without this a disable task suspended in stopSocket() would
+            // resume after the reconnect, pass its stale guard, and clear the
+            // tracker identity this connect just pushed — socket live, status
+            // "Connected", tracker deaf, no error surface.
+            lifecycleEpoch &+= 1
+            let epoch = lifecycleEpoch
             await tracker.setSelfUserID(memberID)
+            guard epoch == lifecycleEpoch else { return }
             await saveSettings()
+            guard epoch == lifecycleEpoch else { return }
             // Reconnect with rotated tokens: tear the old socket down (awaited)
             // before starting fresh, or it would keep streaming the old
             // workspace forever (startSocket no-ops while a task exists).
             await stopSocket()
+            guard epoch == lifecycleEpoch else { return }
             startSocket()
         } catch is CancellationError {
             lastError = nil

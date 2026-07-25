@@ -37,10 +37,18 @@ public actor SlackHuddleTracker {
     /// real meeting — hard floor 1 from the other direction.
     ///
     /// Past this age with NO genuine self event, we stop manufacturing
-    /// heartbeats. We do NOT end the call: silence hands the decision to
-    /// `MeetCallTracker`'s stale-signal watchdog, which stops through its normal
-    /// path — a user-visible notification WITH Resume and a grace window — so a
-    /// false trigger costs one click rather than a lost meeting.
+    /// liveness — heartbeats AND roster flushes alike (see `beliefIsStale`;
+    /// downstream rearms its watchdog from any code-carrying batch, so gating
+    /// only the heartbeat leaves the bound inert while co-participants remain
+    /// in the huddle). We do NOT end the call: silence hands the decision to
+    /// `MeetCallTracker`'s stale-signal watchdog, which stops through its
+    /// normal path. With a resume window configured (the default) that is a
+    /// user-visible notification WITH Resume and a grace window, so a false
+    /// trigger costs one click; with "Resume window: Off" the stop finalizes
+    /// immediately and the notification is informational, per C14 — audio is
+    /// retained either way. The bound is ONE-SHOT per call: a resumed part
+    /// starts with an unarmed watchdog, so it has no automatic bound until a
+    /// genuine self event arrives.
     ///
     /// Cost of the pin: a legitimate huddle emitting no self event for longer
     /// than this is stopped (recoverably) at bound + watchdog ≈ 4h05m. Chosen
@@ -54,7 +62,7 @@ public actor SlackHuddleTracker {
     /// is not guaranteed.
     public static let foreignRingSeconds: TimeInterval = 60
     /// A single evaluation tick drives roster-flush coalescing (5 s),
-    /// heartbeat (60 s, timestamp-gated), and the expiration backstop.
+    /// heartbeat (60 s, timestamp-gated), the expiration advisory, and the liveness-belief bound.
     public static let tickIntervalSeconds: TimeInterval = 5
     /// Dedupe-key ring bound (redelivered-envelope guard). A session never
     /// approaches this; the FIFO cap only keeps memory flat over a long uptime.
@@ -139,7 +147,7 @@ public actor SlackHuddleTracker {
     }
 
     /// Production 5 s evaluation timer (roster coalescing + heartbeat +
-    /// expiration backstop). Tests never call it — they drive `tick(now:)`
+    /// expiration advisory + liveness bound). Tests never call it — they drive `tick(now:)`
     /// with an injected clock, exactly like `MeetCallTracker`.
     public func startTicking() {
         guard tickTask == nil else { return }
@@ -176,7 +184,8 @@ public actor SlackHuddleTracker {
     // MARK: - Input: periodic evaluation
 
     /// One evaluation pass (production: every 5 s). Flushes a coalesced roster,
-    /// applies the expiration backstop, and emits a heartbeat when due. Also
+    /// applies the expiration advisory, emits a heartbeat when due, and stops
+    /// all manufactured liveness once the belief goes stale. Also
     /// prunes the foreign-event ring while idle.
     public func tick(now injected: Date? = nil) async {
         let clock = injected ?? now()
@@ -184,8 +193,10 @@ public actor SlackHuddleTracker {
         guard let callID = currentCallID else { return }
 
         // Coalesced roster flush (a co-participant change inside the 5 s window
-        // marked the roster dirty rather than emitting).
-        if rosterDirty, let last = lastRosterFlushAt,
+        // marked the roster dirty rather than emitting). Suppressed while the
+        // belief is stale — a roster batch is manufactured liveness exactly as
+        // the heartbeat is (see `beliefIsStale`).
+        if rosterDirty, !beliefIsStale(at: clock), let last = lastRosterFlushAt,
             clock.timeIntervalSince(last) >= Self.rosterCoalesceSeconds
         {
             await flushRoster(at: clock)
@@ -212,13 +223,11 @@ public actor SlackHuddleTracker {
         // is deliberately NOT ended here — going quiet lets MeetCallTracker's
         // stale-signal watchdog reclaim the recording through its normal
         // notify-with-Resume path, which is recoverable; force-ending is not.
-        if let lastSelf = lastSelfEventAt,
-            clock.timeIntervalSince(lastSelf) >= Self.livenessBeliefMaxAgeSeconds
-        {
+        if beliefIsStale(at: clock) {
             if !livenessBeliefStale {
                 livenessBeliefStale = true
                 logger.notice(
-                    "no genuine self event for \(callID, privacy: .public) in \(Int(Self.livenessBeliefMaxAgeSeconds), privacy: .public)s — heartbeats stop; the recording watchdog now owns the end")
+                    "no genuine self event for \(callID, privacy: .public) in \(Int(Self.livenessBeliefMaxAgeSeconds), privacy: .public)s — all manufactured liveness stops; the recording watchdog now owns the end")
             }
             return
         }
@@ -337,7 +346,31 @@ public actor SlackHuddleTracker {
 
     // MARK: - Roster emission (coalesced)
 
+    /// True once the belief that we are still in a call has gone stale — no
+    /// genuine self event for `livenessBeliefMaxAgeSeconds`. Gates EVERY
+    /// manufactured-liveness emission, not just the heartbeat: downstream,
+    /// `MeetEventsIngestor` forwards every code-carrying batch as a liveness
+    /// signal and `MeetCallTracker` rearms its stale-signal watchdog from ANY
+    /// of them, so a roster batch keeps a recording alive exactly as a
+    /// heartbeat does. Gating only the heartbeat would leave the bound inert
+    /// whenever co-participants stay in the huddle — the likeliest case, since
+    /// the event that goes missing typically goes missing during a socket
+    /// outage, and an outage is precisely when the huddle you dropped out of
+    /// is still running with other people in it.
+    private func beliefIsStale(at: Date) -> Bool {
+        guard let lastSelf = lastSelfEventAt else { return false }
+        return at.timeIntervalSince(lastSelf) >= Self.livenessBeliefMaxAgeSeconds
+    }
+
     private func noteRosterChanged(at: Date) async {
+        // Stale belief: record the change but emit nothing. `rosterDirty` stays
+        // set, so a genuine self event revives the belief and the next tick
+        // flushes the accumulated roster — nothing is lost, and the roster is
+        // cumulative downstream so a suppressed flush retracts nobody.
+        guard !beliefIsStale(at: at) else {
+            rosterDirty = true
+            return
+        }
         let elapsed = lastRosterFlushAt.map { at.timeIntervalSince($0) } ?? .infinity
         if elapsed >= Self.rosterCoalesceSeconds {
             await flushRoster(at: at)

@@ -184,11 +184,26 @@ struct SlackHuddleTrackerTests {
         #expect(rec.all.count == beforeStale, "stale belief ⇒ no manufactured heartbeats")
         #expect(rec.all.compactMap(\.lifecycle).allSatisfy { $0.kind != .callEnded })
 
-        // A genuine self event revives the belief and heartbeats resume.
+        // A CO-PARTICIPANT event must not resurrect liveness either. A roster
+        // batch is manufactured liveness exactly as a heartbeat is (downstream
+        // rearms the watchdog from ANY code-carrying batch), so gating only the
+        // heartbeat would leave the bound inert whenever others stay in the
+        // huddle — the likeliest real case.
         await tracker.handle(
-            selfEvent(callID: "R1", inHuddle: true, ts: "1000.2"), at: t(bound + 130))
+            event(user: "U_A", callID: "R1", inHuddle: true, ts: "1500.1", name: "Alice"),
+            at: t(bound + 130))
+        await tracker.tick(now: t(bound + 140))
+        #expect(rec.all.count == beforeStale, "stale belief ⇒ co-participant emits nothing")
+
+        // A genuine self event revives the belief; the roster change buffered
+        // while stale is not lost — it flushes on revival.
+        await tracker.handle(
+            selfEvent(callID: "R1", inHuddle: true, ts: "1000.2"), at: t(bound + 150))
         await tracker.tick(now: t(bound + 200))
-        #expect(rec.all.count > beforeStale, "fresh self event ⇒ heartbeats resume")
+        #expect(rec.all.count > beforeStale, "fresh self event ⇒ liveness resumes")
+        #expect(
+            rec.all.last?.roster.contains { $0.displayName == "Alice" } == true,
+            "the roster change buffered while stale is flushed on revival, not dropped")
     }
 
     @Test("heartbeat emitted on cadence while in a call")

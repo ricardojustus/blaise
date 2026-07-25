@@ -18,6 +18,17 @@ private final class LifecycleRecorder: MeetBatchIngesting, @unchecked Sendable {
     var count: Int { store.withLock { $0.count } }
 }
 
+/// Structural mirror of the model's private settings record. Decoding this
+/// from the settings store is how a test observes that a lifecycle Task ran to
+/// COMPLETION: persisting settings is the Task's last action, so a persisted
+/// `enabled` matching the requested value means every step before it — the
+/// tracker identity push/clear, the socket start/stop — has already happened.
+/// (Polling `model.enabled` does NOT work: it is assigned synchronously before
+/// the Task starts, so the condition is true immediately and the wait is a no-op.)
+private struct PersistedSlackSettings: Codable {
+    var enabled: Bool
+}
+
 @MainActor
 struct SlackHuddlesModelTests {
     private func makeModel(
@@ -213,7 +224,7 @@ struct SlackHuddlesModelTests {
 
     @Test("disable stops the tracker listening; re-enable restores it")
     func disableAndReEnableWireTracker() async throws {
-        let (model, _, _, tracker) = try makeModelWithTracker(
+        let (model, _, settings, tracker) = try makeModelWithTracker(
             client: parkingClient(transport: okTransport))
         model.appToken = "xapp"
         model.botToken = "xoxb"
@@ -228,13 +239,13 @@ struct SlackHuddlesModelTests {
 
         // Disable → the tracker is cleared, so a fresh event is ignored.
         model.setEnabled(false)
-        await settleLifecycle(model)
+        _ = await settleLifecycle(settings, enabled: false)
         await tracker.handle(selfHuddleEvent(callID: "R2", inHuddle: true, ts: "2000.1"), at: Date())
         #expect(lifecycleRecorder.count == afterConnect, "disabled ⇒ tracker deaf")
 
         // Re-enable → the member id is pushed back and events land again.
         model.setEnabled(true)
-        await settleLifecycle(model)
+        _ = await settleLifecycle(settings, enabled: true)
         await tracker.handle(selfHuddleEvent(callID: "R3", inHuddle: true, ts: "3000.1"), at: Date())
         #expect(lifecycleRecorder.count > afterConnect, "re-enabled ⇒ tracker listening again")
         await model.disconnect()
@@ -242,7 +253,7 @@ struct SlackHuddlesModelTests {
 
     @Test("a rapid disable→enable toggle cannot leave the tracker deaf (lifecycle epoch)")
     func rapidToggleKeepsTrackerListening() async throws {
-        let (model, _, _, tracker) = try makeModelWithTracker(
+        let (model, _, settings, tracker) = try makeModelWithTracker(
             client: parkingClient(transport: okTransport))
         model.appToken = "xapp"
         model.botToken = "xoxb"
@@ -254,7 +265,7 @@ struct SlackHuddlesModelTests {
         // stale disable must not clear the identity the re-enable just pushed.
         model.setEnabled(false)
         model.setEnabled(true)
-        await settleLifecycle(model)
+        _ = await settleLifecycle(settings, enabled: true)
 
         await tracker.handle(selfHuddleEvent(callID: "R9", inHuddle: true, ts: "9000.1"), at: Date())
         #expect(
@@ -264,9 +275,88 @@ struct SlackHuddlesModelTests {
         await model.disconnect()
     }
 
-    /// Lets the model's unstructured lifecycle Tasks run to completion.
-    private func settleLifecycle(_ model: SlackHuddlesModel) async {
-        for _ in 0 ..< 20 { await Task.yield() }
+    /// Waits for a lifecycle Task to run to COMPLETION, rather than spinning a
+    /// guessed number of yields (a fixed spin either flakes red or passes
+    /// vacuously depending on how long socket teardown actually takes). Keys on
+    /// the persisted settings — the Task's final action — so every earlier step
+    /// is guaranteed done. Uses the file's existing polled idiom.
+    @discardableResult
+    private func settleLifecycle(_ settings: SettingsStore, enabled expected: Bool) async -> Bool {
+        await waitUntilApp {
+            let persisted = try? await settings.get(
+                SlackHuddlesModel.settingsKey, as: PersistedSlackSettings.self)
+            return (persisted ?? nil)?.enabled == expected
+        }
+    }
+
+    @Test("no socket is opened while the integration is disabled (startSocket enabled guard)")
+    func disabledNeverOpensASocket() async throws {
+        let rec = SocketRecorder()
+        let client = SlackSocketClient(
+            transport: rec.transport, opener: rec.opener,
+            backoffSleep: { _ in try await Task.sleep(for: .seconds(3600)) },
+            pingSleep: { _ in try await Task.sleep(for: .seconds(3600)) })
+        let (model, _, settings, _) = try makeModelWithTracker(client: client)
+        model.appToken = "xapp"
+        model.botToken = "xoxb"
+        model.memberID = "U012AB3CD"
+        await model.connect()
+        _ = await waitUntilApp { rec.channels.withLock { $0.count } >= 1 }
+        let afterConnect = rec.channels.withLock { $0.count }
+
+        model.setEnabled(false)
+        _ = await settleLifecycle(settings, enabled: false)
+
+        // Every path that can reach startSocket while disabled must refuse:
+        // the launch path, and a stale enable task resolving after the disable.
+        model.startIfEnabled()
+        model.setEnabled(true)
+        model.setEnabled(false)
+        _ = await settleLifecycle(settings, enabled: false)
+        // Give any stale task room to do the wrong thing before asserting.
+        _ = await waitUntilApp(timeout: .milliseconds(300)) {
+            rec.channels.withLock { $0.count } > afterConnect
+        }
+        #expect(
+            rec.channels.withLock { $0.count } == afterConnect,
+            "disabled ⇒ no new socket channel may be opened by any path")
+        await model.disconnect()
+    }
+
+    @Test("disconnect supersedes an in-flight enable (lifecycle epoch)")
+    func disconnectSupersedesInFlightEnable() async throws {
+        let rec = SocketRecorder()
+        let client = SlackSocketClient(
+            transport: rec.transport, opener: rec.opener,
+            backoffSleep: { _ in try await Task.sleep(for: .seconds(3600)) },
+            pingSleep: { _ in try await Task.sleep(for: .seconds(3600)) })
+        let (model, secrets, _, tracker) = try makeModelWithTracker(client: client)
+        model.appToken = "xapp"
+        model.botToken = "xoxb"
+        model.memberID = "U012AB3CD"
+        await model.connect()
+        _ = await waitUntilApp { rec.channels.withLock { $0.count } >= 1 }
+        let afterConnect = rec.channels.withLock { $0.count }
+        let baseline = lifecycleRecorder.count
+
+        // Enable issued, then a disconnect lands before its task settles: the
+        // disconnect's epoch bump must supersede the enable's post-await half.
+        model.setEnabled(true)
+        await model.disconnect()
+        _ = await waitUntilApp(timeout: .milliseconds(300)) {
+            rec.channels.withLock { $0.count } > afterConnect
+        }
+
+        #expect(!model.enabled)
+        #expect(!model.connected)
+        #expect(
+            rec.channels.withLock { $0.count } == afterConnect,
+            "a superseded enable must not open a socket after disconnect")
+        #expect(try secrets.get(key: SlackHuddlesModel.appTokenKey) == nil)
+        #expect(try secrets.get(key: SlackHuddlesModel.botTokenKey) == nil)
+        // And the tracker is deaf: a self event after disconnect emits nothing.
+        await tracker.handle(selfHuddleEvent(callID: "RX", inHuddle: true, ts: "7000.1"), at: Date())
+        #expect(lifecycleRecorder.count == baseline)
     }
 
     @Test("URLError connectivity classification")
