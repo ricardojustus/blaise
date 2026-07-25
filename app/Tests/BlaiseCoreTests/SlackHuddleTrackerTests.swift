@@ -221,8 +221,8 @@ struct SlackHuddleTrackerTests {
     /// self event flushes IMMEDIATELY — without waiting for a tick. That flush
     /// must fold the heartbeat too, or it consumes the 60 s heartbeat slot with
     /// a kind-less batch and the grace-resume is delayed exactly as it was
-    /// before the fix. Discriminating: revert the `withHeartbeat` argument at
-    /// the immediate door and this batch carries `lifecycle: nil`.
+    /// before the fix. Discriminating: drop the `reviving` fold inside
+    /// `flushRoster` and this batch carries `lifecycle: nil`.
     ///
     /// (An earlier version of this test drove the no-roster path instead. That
     /// one was NOT discriminating — the ordinary cadence heartbeat fires there
