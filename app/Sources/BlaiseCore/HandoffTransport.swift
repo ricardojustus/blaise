@@ -82,7 +82,7 @@ public enum HandoffCommand {
     /// skips an absent name and never removes a directory; `rm -f --` so a
     /// dash-leading name is never parsed as options.
     ///
-    /// VERIFY BEFORE DELETE (G5 v1.7, round-4 R4-F1/R4-F2): the remote file's
+    /// VERIFY BEFORE DELETE (G5 v1.7, round-4 R4-F2): the remote file's
     /// own bytes decide, using the same `shasum -a 256` the DELIVERY command
     /// already trusts for verify-before-rename. `${f%.json}` is the name's own
     /// stem — no new interpolated value, so the single-quote model is unchanged

@@ -262,7 +262,7 @@ private func audioNames(_ dir: URL) -> [String] {
         let command = try #require(transport.calls[2].argv.last)
         #expect(!command.contains("*.json"), "no glob: only Blaise's own records authorize a delete")
         #expect(!command.contains(v2.versionHash), "the just-delivered payload is never named")
-        // G5 v1.7 (R4-F1/R4-F2), the remote half of verify-before-delete: the
+        // G5 v1.7 (R4-F2), the remote half of verify-before-delete: the
         // file's own bytes must hash to its own name — the same
         // `shasum -a 256` the DELIVERY command already trusts — and the `rm`
         // sits INSIDE that branch. A named-but-foreign remote file is echoed
