@@ -826,6 +826,17 @@ final class AppEnvironment {
         }
     }
 
+    /// Manual "Slack" start from the menu bar. When the huddle tracker knows a
+    /// live call (Slack connected + self in a huddle), the recording binds to
+    /// its meeting code, so the roster stream and auto-stop attach exactly as
+    /// on the notification path. Disconnected or no huddle → a plain
+    /// slack-source recording (nil code; the ingestor never attaches batches
+    /// to nil-code sessions, by design).
+    func startSlackRecording() async {
+        let code = await slackHuddleTracker.currentMeetingCode()
+        await startRecording(source: .slack, meetingCode: code)
+    }
+
     func startRecording(suggestion: MeetingSuggestion) async {
         // G11 §1: a suggestion-matched start persists the calendar anchor.
         await startRecording(

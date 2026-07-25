@@ -308,6 +308,17 @@ struct SlackHuddleTrackerTests {
         #expect(rec.all[1].roster.contains { $0.participantID == "U_A" })
     }
 
+    @Test("currentMeetingCode: nil idle, slack:<id> mid-huddle, nil after leave")
+    func currentMeetingCodeLifecycle() async {
+        let rec = BatchRecorder()
+        let tracker = makeTracker(rec)
+        #expect(await tracker.currentMeetingCode() == nil)
+        await tracker.handle(selfEvent(callID: "R7", inHuddle: true, ts: "1010.1"), at: t(0))
+        #expect(await tracker.currentMeetingCode() == "slack:R7")
+        await tracker.handle(selfEvent(callID: nil, inHuddle: false, ts: "1010.2"), at: t(5))
+        #expect(await tracker.currentMeetingCode() == nil)
+    }
+
     @Test("self leave → callEnded(\"left\")")
     func selfLeave() async {
         let rec = BatchRecorder()

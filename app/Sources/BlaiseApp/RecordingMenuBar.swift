@@ -603,6 +603,7 @@ struct RecordingMenuView: View {
             .keyboardShortcut("r", modifiers: [.option, .command])
             Button("Zoom") { Task { await appEnv.startRecording(source: .zoom) } }
             Button("Teams") { Task { await appEnv.startRecording(source: .teams) } }
+            Button("Slack") { Task { await appEnv.startSlackRecording() } }
             Button("In Person") { Task { await appEnv.startRecording(source: .inPerson) } }
         } label: {
             Label("Start Recording", systemImage: "record.circle")

@@ -178,6 +178,16 @@ public actor SlackHuddleTracker {
         tickTask = nil
     }
 
+    /// The active huddle's ingestion meeting code (`slack:<callID>`), or nil
+    /// when no huddle is tracked. Read by the manual "Slack" menu-bar start so
+    /// a recording started by hand mid-huddle binds to the live roster stream
+    /// and auto-stop by meeting code, exactly like one started from the
+    /// notification. Belief-staleness is deliberately not consulted: the user
+    /// pressing Slack is itself fresh evidence of a live huddle.
+    public func currentMeetingCode() -> String? {
+        currentCallID.map(SlackHuddle.meetingCode(callID:))
+    }
+
     // MARK: - Input: one user_huddle_changed event
 
     /// Applies one `user_huddle_changed` event at receipt time `at`.
