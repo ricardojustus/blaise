@@ -230,8 +230,9 @@ struct RouteChangeResilienceTests {
         alarm.raiseIfOverdue(now: ProcessInfo.processInfo.systemUptime)
         #expect(recorder.recorded == [.captureDown(active: true)])
         // A raised warning is the one a successful rebuild clears — and the
-        // clear lands AFTER the raise, never inverting it, even though the
-        // rebuild reports from the (still blocked) processing queue.
+        // clear lands AFTER the raise, never inverting it, because both ride
+        // the alarm queue. (Issued here from the test thread; in production
+        // its caller is the processing queue, which is still blocked below.)
         alarm.clear()
         #expect(recorder.waitForEvent(timeout: 2))
         #expect(recorder.recorded == [.captureDown(active: true), .captureDown(active: false)])
@@ -250,6 +251,128 @@ struct RouteChangeResilienceTests {
         // And the armed alarm stays silent past its deadline (0 stale fires).
         #expect(!recorder.waitForEvent(timeout: 0.4))
         #expect(recorder.recorded.isEmpty)
+    }
+
+    /// A sink that PINS the alarm queue while it emits: the handler holds
+    /// inside the raise for a bounded `hold`, so anything queued behind it (a
+    /// clear, a later raise) is provably still pending while the test drives
+    /// `reset`. The hold releases ITSELF — the test thread must stay free to
+    /// call `reset`, and no externally-signalled release could be ordered
+    /// against reset's internals. It is a window, never a race margin: the
+    /// assertions below compare recorded instants, never durations.
+    private final class PinningSink: @unchecked Sendable {
+        let recorder = EventRecorder()
+        private let pinned = DispatchSemaphore(value: 0)
+        private let unpinned = DispatchSemaphore(value: 0)
+        private let releasedAt = Mutex<TimeInterval?>(nil)
+        private let hold: TimeInterval
+
+        init(hold: TimeInterval) { self.hold = hold }
+
+        func handle(_ event: CaptureEngineEvent) {
+            recorder.record(event)
+            guard event == .captureDown(active: true) else { return }
+            pinned.signal()
+            Thread.sleep(forTimeInterval: hold)
+            releasedAt.withLock { $0 = ProcessInfo.processInfo.systemUptime }
+            unpinned.signal()
+        }
+        /// Waits until the raise is mid-emission (the queue is pinned).
+        func waitUntilPinned() -> Bool { pinned.wait(timeout: .now() + 2) == .success }
+        /// Waits until that emission has finished.
+        func waitUntilReleased() -> Bool { unpinned.wait(timeout: .now() + 2) == .success }
+        /// The instant the pinned emission finished; nil while it is running.
+        var releasedAtUptime: TimeInterval? { releasedAt.withLock { $0 } }
+    }
+
+    /// R3-F1: `reset` is a FENCE. A clear whose emission is already queued
+    /// cannot deliver through the sink reset dropped, and reset cannot return
+    /// while an emission through that sink is still in flight.
+    @Test("capture-down alarm: reset fences a clear already queued on the alarm queue")
+    func resetFencesQueuedClear() {
+        let alarm = CaptureDownAlarm(threshold: 0.05)
+        let sink = PinningSink(hold: 1)
+        alarm.reset(onEvent: { sink.handle($0) })
+        alarm.arm(now: ProcessInfo.processInfo.systemUptime)
+        #expect(sink.waitUntilPinned())
+        #expect(sink.recorder.waitForEvent(timeout: 2))
+
+        // The rebuild succeeds while the raise is still being emitted, so the
+        // clear's `false` queues behind it; the recording then stops.
+        alarm.clear()
+        alarm.reset(onEvent: nil)
+        let resetReturnedAt = ProcessInfo.processInfo.systemUptime
+
+        // The fence outlived the emission that was in flight (nil = reset
+        // returned while the old sink was still running).
+        #expect(sink.releasedAtUptime.map { $0 <= resetReturnedAt } ?? false)
+        // And the queued `false`, re-reading the sink at emission time, found
+        // it replaced and dropped it: the old sink never sees it.
+        #expect(sink.waitUntilReleased())
+        #expect(!sink.recorder.waitForEvent(timeout: 0.3))
+        #expect(sink.recorder.recorded == [.captureDown(active: true)])
+    }
+
+    /// R3-F1: the retry path's belt raise arrives on the processing queue. It
+    /// must emit on the ALARM queue — an event invoked inline on the caller's
+    /// thread is outside the fence entirely.
+    @Test("capture-down alarm: the belt raise emits inside the fence, never inline")
+    func resetFencesBeltRaise() {
+        // Long threshold: only the belt call can raise here, never the timer.
+        let alarm = CaptureDownAlarm(threshold: 5)
+        let sink = PinningSink(hold: 1)
+        alarm.reset(onEvent: { sink.handle($0) })
+        alarm.arm(now: 0)
+
+        // The belt call, as the retry path makes it from the processing queue.
+        // An inline emission would run the sink on THIS thread and would not
+        // return until the pinned sink finished.
+        alarm.raiseIfOverdue(now: 10)
+        #expect(sink.releasedAtUptime == nil)
+
+        #expect(sink.waitUntilPinned())
+        #expect(sink.recorder.waitForEvent(timeout: 2))
+        alarm.reset(onEvent: nil)
+        let resetReturnedAt = ProcessInfo.processInfo.systemUptime
+        #expect(sink.releasedAtUptime.map { $0 <= resetReturnedAt } ?? false)
+        #expect(!sink.recorder.waitForEvent(timeout: 0.3))
+        #expect(sink.recorder.recorded == [.captureDown(active: true)])
+    }
+
+    /// R3-F1: once reset has installed the NEXT recording's sink, nothing from
+    /// the previous generation may emit — not late through the old sink (the
+    /// indicator state machine is shared across recordings, so a stale
+    /// `captureDown` would stand a false warning over a healthy recording with
+    /// nothing to clear it), and not through the new sink either.
+    @Test("capture-down alarm: reset to the next recording's sink retires the previous generation")
+    func resetRetiresPreviousGeneration() {
+        let alarm = CaptureDownAlarm(threshold: 0.05)
+        let previous = PinningSink(hold: 1)
+        let next = EventRecorder()
+        alarm.reset(onEvent: { previous.handle($0) })
+        alarm.arm(now: ProcessInfo.processInfo.systemUptime)
+        #expect(previous.waitUntilPinned())
+        #expect(previous.recorder.waitForEvent(timeout: 2))
+
+        // The rebuild succeeds (the `false` queues behind the pinned sink),
+        // the recording stops, and the next one installs its own sink.
+        alarm.clear()
+        alarm.reset(onEvent: { next.record($0) })
+        let resetReturnedAt = ProcessInfo.processInfo.systemUptime
+        #expect(previous.releasedAtUptime.map { $0 <= resetReturnedAt } ?? false)
+
+        // The next recording's first route change arms its own down-period.
+        alarm.arm(now: ProcessInfo.processInfo.systemUptime)
+        #expect(previous.waitUntilReleased())
+
+        // Nothing from the previous generation lands anywhere: not late
+        // through the old sink...
+        #expect(!previous.recorder.waitForEvent(timeout: 0.3))
+        #expect(previous.recorder.recorded == [.captureDown(active: true)])
+        // ...and the new sink sees ONLY its own period's raise.
+        #expect(next.waitForEvent(timeout: 2))
+        #expect(!next.waitForEvent(timeout: 0.3))
+        #expect(next.recorded == [.captureDown(active: true)])
     }
 
     @Test("effectiveDebounceDelay: trailing window clamps to the ceiling, never restarts")

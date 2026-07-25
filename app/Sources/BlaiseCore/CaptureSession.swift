@@ -1125,6 +1125,15 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
 /// recording) finds a bumped generation and does nothing — the same zero
 /// stale fires the cancel-based version had, without a cross-queue cancel
 /// race.
+///
+/// `reset` is also a FENCE (R3-F1): EVERY event invocation runs on this queue
+/// and re-reads the sink under the lock at emission time, and `reset` bumps
+/// the keys under the lock and then drains the queue synchronously. Once
+/// `reset` returns, an emission that was already queued or already running has
+/// either finished (through the sink of its own recording, before `reset`
+/// returned) or found the bumped keys and emitted nothing — so no event can
+/// reach a dropped or replaced sink, and no old-period event can stand a
+/// warning over the next recording.
 final class CaptureDownAlarm: @unchecked Sendable {
     private struct State {
         /// Monotonic uptime when the graph went down, or nil while it is up.
@@ -1133,6 +1142,12 @@ final class CaptureDownAlarm: @unchecked Sendable {
         /// exactly once per down-period).
         var reported = false
         var generation = 0
+        /// Bumped ONLY by `reset`, so a queued emission can tell at emission
+        /// time whether the sink it was queued for is still the installed one.
+        /// The down-period `generation` cannot answer that: a new down-period
+        /// bumps it WITHIN one recording, and a clear queued before that must
+        /// still clear the warning it raised there.
+        var sinkEpoch = 0
         /// Read under the lock: the alarm queue emits through it while the
         /// processing queue may be replacing it in `start()`/`stop()`.
         var onEvent: (@Sendable (CaptureEngineEvent) -> Void)?
@@ -1147,14 +1162,27 @@ final class CaptureDownAlarm: @unchecked Sendable {
     init(threshold: TimeInterval) { self.threshold = threshold }
 
     /// `start()` / `stop()`: install (or drop) the event sink and end any
-    /// standing down-period, per-recording bounds included (F-3).
+    /// standing down-period, per-recording bounds included (F-3). Returning
+    /// from this call FENCES the previous sink: nothing can emit through it
+    /// afterwards (R3-F1).
     func reset(onEvent: (@Sendable (CaptureEngineEvent) -> Void)?) {
         state.withLock { state in
             state.generation += 1
+            state.sinkEpoch += 1
             state.downSince = nil
             state.reported = false
             state.onEvent = onEvent
         }
+        // The keys are bumped FIRST, so an emission that has not yet re-read
+        // the state finds them and drops; this barrier then waits out the one
+        // case the keys cannot cover — an emission already past its read,
+        // mid-invocation of the old sink. Called from `processingQueue`
+        // (`start`/`stop`): safe because the alarm queue never syncs back onto
+        // that queue — its blocks take only this lock and call the sink, which
+        // must not block (the production sink hands off to a Task). Delayed
+        // `arm` blocks are NOT waited for (not yet due); their generation key
+        // retires them.
+        queue.sync {}
     }
 
     /// The graph went down at `now`: start the down-clock and schedule the
@@ -1181,22 +1209,32 @@ final class CaptureDownAlarm: @unchecked Sendable {
     /// indicator would let the user finish a meeting believing it recorded.
     /// `generation` scopes a fired alarm to the period that armed it; nil is
     /// the retry path's belt call against whatever period is standing.
+    ///
+    /// The check and the emission both run on the alarm queue — including the
+    /// retry path's belt call, which arrives on `processingQueue` (R3-F1): an
+    /// event invoked on the caller's thread would be outside the fence. The
+    /// deadline block re-enters here asynchronously, which a serial queue
+    /// permits (never `sync`).
     func raiseIfOverdue(now: TimeInterval, generation: Int? = nil) {
-        let raised: (handler: (@Sendable (CaptureEngineEvent) -> Void)?, downSeconds: TimeInterval)? =
-            state.withLock { state in
-                if let generation, state.generation != generation { return nil }
-                guard
-                    CaptureSession.shouldRaiseCaptureDown(
-                        downSince: state.downSince, now: now, alreadyReported: state.reported,
-                        threshold: threshold), let since = state.downSince
-                else { return nil }
-                state.reported = true
-                return (state.onEvent, now - since)
-            }
-        guard let raised else { return }
-        logger.error(
-            "capture graph has been down for \(Int(raised.downSeconds))s while rebuilding — surfacing the indicator warning")
-        raised.handler?(.captureDown(active: true))
+        queue.async { [weak self] in
+            guard let self else { return }
+            let raised:
+                (handler: (@Sendable (CaptureEngineEvent) -> Void)?, downSeconds: TimeInterval)? =
+                state.withLock { state in
+                    if let generation, state.generation != generation { return nil }
+                    guard
+                        CaptureSession.shouldRaiseCaptureDown(
+                            downSince: state.downSince, now: now, alreadyReported: state.reported,
+                            threshold: threshold), let since = state.downSince
+                    else { return nil }
+                    state.reported = true
+                    return (state.onEvent, now - since)
+                }
+            guard let raised else { return }
+            logger.error(
+                "capture graph has been down for \(Int(raised.downSeconds))s while rebuilding — surfacing the indicator warning")
+            raised.handler?(.captureDown(active: true))
+        }
     }
 
     /// A successful rebuild: end the down-period, and clear the warning if it
@@ -1205,19 +1243,30 @@ final class CaptureDownAlarm: @unchecked Sendable {
     /// a rebuild landing exactly at the deadline can never emit its `false`
     /// ahead of the alarm's `true` and strand the warning on screen.
     func clear() {
-        let cleared: (
-            handler: (@Sendable (CaptureEngineEvent) -> Void)?, wasReported: Bool
-        ) = state.withLock { state in
+        // The down-period ends HERE, synchronously: the next `arm` must find
+        // no standing period and start a fresh clock. Only the emission is
+        // deferred to the alarm queue.
+        let cleared: (sinkEpoch: Int, wasReported: Bool) = state.withLock { state in
             let wasReported = state.reported
             state.generation += 1
             state.downSince = nil
             state.reported = false
-            return (state.onEvent, wasReported)
+            return (state.sinkEpoch, wasReported)
         }
         guard cleared.wasReported else { return }
-        queue.async { [logger] in
+        queue.async { [weak self, logger] in
+            guard let self else { return }
+            // Emission-time re-validation (R3-F1): the CURRENT sink, read
+            // under the lock here rather than captured when `clear` ran, and
+            // only while it is still the sink this clear belongs to — a
+            // `reset` in between (stop, or the next recording) makes this a
+            // dead old-period event.
+            let handler: (@Sendable (CaptureEngineEvent) -> Void)? = state.withLock { state in
+                state.sinkEpoch == cleared.sinkEpoch ? state.onEvent : nil
+            }
+            guard let handler else { return }
             logger.notice("capture graph rebuilt — clearing the indicator warning")
-            cleared.handler?(.captureDown(active: false))
+            handler(.captureDown(active: false))
         }
     }
 }
