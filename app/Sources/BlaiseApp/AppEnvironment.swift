@@ -371,6 +371,8 @@ final class AppEnvironment {
                     self.silenceWatchdog.arm(nowUptime: ProcessInfo.processInfo.systemUptime)
                 case .micSilence(let active):
                     self.captureStatus.apply(.micSilence(active: active))
+                case .captureDown(let active):
+                    self.captureStatus.apply(.captureDown(active: active))
                 case .level(let you, let others):
                     // Feed raw RMS into the model (smoothing + silence); publish
                     // the ≤ 10 Hz result into the leaf-observed holder.

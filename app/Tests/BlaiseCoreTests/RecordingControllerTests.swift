@@ -192,6 +192,32 @@ struct RecordingControllerTests {
         collector.cancel()
     }
 
+    @Test("capture-down events pass through to the UI stream (and do NOT stop the recording)")
+    func captureDownPassthrough() async throws {
+        let harness = try makeControllerHarness()
+        let events = await harness.controller.events()
+        let collected = Recorder<RecordingEvent>()
+        let collector = Task { for await event in events { collected.append(event) } }
+        _ = try await harness.controller.start(source: .meet)
+
+        harness.engine.emit(.captureDown(active: true))
+        let raised = await waitUntil {
+            collected.values.contains { $0 == .captureDown(active: true) }
+        }
+        #expect(raised)
+        // Unlike writeFailure, this must NOT stop the recording — the retry
+        // ladder is still working; the warning buys visibility, not a stop.
+        #expect(await harness.controller.currentSession() != nil)
+
+        harness.engine.emit(.captureDown(active: false))
+        let cleared = await waitUntil {
+            collected.values.contains { $0 == .captureDown(active: false) }
+        }
+        #expect(cleared)
+        #expect(await harness.controller.currentSession() != nil)
+        collector.cancel()
+    }
+
     @Test("engine start failure: row stays, marked failed with the reason (never deleted)")
     func engineStartFailure() async throws {
         let harness = try makeControllerHarness()

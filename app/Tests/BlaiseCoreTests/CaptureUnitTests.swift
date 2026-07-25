@@ -331,6 +331,58 @@ struct IndicatorStateMachineTests {
         #expect(machine.apply(.micSilence(active: false)) == .recording(startedAt: start))
     }
 
+    @Test("capture down → visible warning while recording; rebuild → recording")
+    func captureDownWarning() {
+        var machine = IndicatorStateMachine()
+        let start = msDate()
+        machine.apply(.captureStarted(at: start))
+        // While the graph is down ZERO bytes reach either track. The indicator
+        // must NOT keep showing a healthy green recording — that is the silent
+        // loss this warning exists to prevent.
+        let warned = machine.apply(.captureDown(active: true))
+        guard case .warning(let at, let message) = warned else {
+            Issue.record("expected warning, got \(warned)")
+            return
+        }
+        #expect(at == start)
+        #expect(message.contains("Audio device"))
+        // A successful rebuild returns to a normal recording display.
+        #expect(machine.apply(.captureDown(active: false)) == .recording(startedAt: start))
+    }
+
+    @Test("capture down outranks mic silence: the dead-graph message wins")
+    func captureDownOutranksMicSilence() {
+        var machine = IndicatorStateMachine()
+        let start = msDate()
+        machine.apply(.captureStarted(at: start))
+        machine.apply(.micSilence(active: true))
+        // Both conditions standing: capture-down is the more severe fact (no
+        // bytes at all vs a silent mic track), so it must be the one surfaced.
+        let both = machine.apply(.captureDown(active: true))
+        guard case .warning(_, let message) = both else {
+            Issue.record("expected warning, got \(both)")
+            return
+        }
+        #expect(message.contains("Audio device"))
+        // Clearing capture-down falls back to the still-standing mic warning
+        // rather than to a clean recording state.
+        let afterRebuild = machine.apply(.captureDown(active: false))
+        guard case .warning(_, let micMessage) = afterRebuild else {
+            Issue.record("expected the mic warning to resurface, got \(afterRebuild)")
+            return
+        }
+        #expect(micMessage.contains("Mic"))
+    }
+
+    @Test("a fresh start clears a standing capture-down warning")
+    func captureDownClearedByStart() {
+        var machine = IndicatorStateMachine()
+        machine.apply(.captureStarted(at: msDate()))
+        machine.apply(.captureDown(active: true))
+        let restart = msDate()
+        #expect(machine.apply(.captureStarted(at: restart)) == .recording(startedAt: restart))
+    }
+
     @Test("long session: tick past 6 h → warning; recording continues underneath")
     func longSession() {
         var machine = IndicatorStateMachine()

@@ -78,6 +78,12 @@ public enum IndicatorState: Equatable, Sendable {
 public struct IndicatorStateMachine: Sendable, Equatable {
     public private(set) var state: IndicatorState = .idle
     private var micSilence = false
+    /// B4 (audit): the capture graph has been DOWN longer than
+    /// `CaptureSession.captureDownAlarmSeconds` while a rebuild retries. Zero
+    /// bytes reach either track in this state, so it must be visible — a green
+    /// indicator with a running timer over a dead graph is the silent-loss
+    /// failure this warning exists to prevent.
+    private var captureDown = false
     private var startedAt: Date?
     /// Standing grace window (C14): survives interleaved back-to-back
     /// capture events; grace wins the icon whenever nothing is recording.
@@ -119,6 +125,8 @@ public struct IndicatorStateMachine: Sendable, Equatable {
         /// live recording wins the indicator.
         case captureStopped(alarm: String?)
         case micSilence(active: Bool)
+        /// The capture graph went down / came back during a route-change rebuild.
+        case captureDown(active: Bool)
         /// Periodic clock tick (long-session check, > 6 h).
         case tick(now: Date)
         case processingFinished
@@ -148,6 +156,7 @@ public struct IndicatorStateMachine: Sendable, Equatable {
             // and resurfaces once this recording stops.
             startedAt = at
             micSilence = false
+            captureDown = false
             paused = nil
             processing = false
             alarmMessage = nil
@@ -156,6 +165,7 @@ public struct IndicatorStateMachine: Sendable, Equatable {
             // The session is no longer live.
             startedAt = nil
             micSilence = false
+            captureDown = false
             processing = true
         case .captureStopped(let alarm):
             // The stop's encode finished. A NEWER capture may already be live
@@ -166,6 +176,7 @@ public struct IndicatorStateMachine: Sendable, Equatable {
             // done, but the pipeline run continues until `.processingFinished`).
             guard startedAt == nil else { break }
             micSilence = false
+            captureDown = false
             if let alarm {
                 // The loud path: persists until acknowledged or the next
                 // successful start. The encode finished, so it is no longer
@@ -175,6 +186,10 @@ public struct IndicatorStateMachine: Sendable, Equatable {
             }
         case .micSilence(let active):
             micSilence = active
+            resolveDisplay(now: nil)
+            return state
+        case .captureDown(let active):
+            captureDown = active
             resolveDisplay(now: nil)
             return state
         case .tick(let now):
@@ -203,6 +218,7 @@ public struct IndicatorStateMachine: Sendable, Equatable {
             // by spec §4), so this input is authoritative for the transition.
             startedAt = nil
             micSilence = false
+            captureDown = false
             paused = PausedMeeting(title: title, accumulatedSeconds: seconds)
         case .meetingResumed:
             // `.captureStarted` follows immediately.
@@ -251,7 +267,14 @@ public struct IndicatorStateMachine: Sendable, Equatable {
         let longSession =
             now.map { $0.timeIntervalSince(startedAt) > CaptureLimits.longSessionWarningSeconds }
             ?? isLongSessionShowing
-        if micSilence {
+        // Capture-down outranks every other warning: while the graph is down
+        // ZERO bytes reach either track, so this is the only state where the
+        // indicator would otherwise show a healthy green recording while
+        // nothing at all is being captured.
+        if captureDown {
+            return .warning(
+                startedAt: startedAt, message: "Audio device changed — recording is paused, retrying")
+        } else if micSilence {
             return .warning(startedAt: startedAt, message: "Mic appears silent — check input device")
         } else if longSession {
             return .warning(startedAt: startedAt, message: "Recording for over 6 hours")

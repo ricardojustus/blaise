@@ -15,6 +15,14 @@ public enum CaptureEngineEvent: Sendable, Equatable {
     /// Mic all-zero ≥ 60 s while system audio is active (true), or the mic
     /// signal returned (false).
     case micSilence(active: Bool)
+    /// B4 (audit): the capture graph has been DOWN through a route-change
+    /// rebuild for longer than `CaptureSession.captureDownAlarmSeconds`
+    /// (true), or a rebuild succeeded and capture resumed (false). Unlike
+    /// `writeFailure` this does NOT stop the recording — the retry ladder is
+    /// still working — but while it stands ZERO bytes reach either track, so
+    /// it must be VISIBLE rather than showing a healthy green indicator with
+    /// a running timer over a dead graph.
+    case captureDown(active: Bool)
     /// A CAF writer error — the one sanctioned automatic stop: continuing to
     /// record into a failing writer loses MORE. The controller stops,
     /// encodes whatever exists, and raises the loud indicator alarm.
@@ -188,6 +196,8 @@ public final class RecordingLifecycleObserverBox: RecordingLifecycleObserving, S
 public enum RecordingEvent: Sendable, Equatable {
     case started(meetingID: MeetingID, at: Date)
     case micSilence(active: Bool)
+    /// B4 (audit): capture graph down/up during a route-change rebuild.
+    case captureDown(active: Bool)
     /// The engine is down and the encode is running — emitted immediately
     /// at stop so the indicator reflects it before the encode finishes.
     case stopping(meetingID: MeetingID)
@@ -993,6 +1003,8 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         switch event {
         case .micSilence(let activeNow):
             emit(.micSilence(active: activeNow))
+        case .captureDown(let activeNow):
+            emit(.captureDown(active: activeNow))
         case .level(let you, let others):
             emit(.level(you: you, others: others))
         case .writeFailure(let message):

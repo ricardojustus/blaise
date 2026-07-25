@@ -78,8 +78,25 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     /// True when the pending rebuild MUST run (device identity changed).
     /// A rate-only pending is skipped if the aggregate's rate never moved.
     private var pendingForced = false
-    /// Position on the retry ladder; reset by success or a fresh route change.
+    /// Position on the retry ladder; reset by success, or by a fresh route
+    /// change only while a graph is live (see `scheduleRebuild`).
     private var rebuildAttempt = 0
+    /// Monotonic uptime of the FIRST trigger in the current debounce burst.
+    /// Bounds the trailing debounce so a fast-flapping device cannot starve
+    /// the rebuild forever. Cleared when the rebuild fires.
+    private var debounceFirstTriggerUptime: TimeInterval?
+    /// Rate-only rebuilds performed this session, against
+    /// `maxRateTriggeredRebuilds`. Guards the self-triggering loop that an
+    /// unsettled post-creation HAL rate reading would otherwise sustain.
+    private var rateTriggeredRebuilds = 0
+    /// One-shot latch for the ceiling log line.
+    private var rateCeilingReported = false
+    /// Monotonic uptime when the graph most recently went down, or nil while
+    /// it is up. Drives the visible capture-down warning.
+    private var captureDownSince: TimeInterval?
+    /// Whether the capture-down warning is currently raised (so it is emitted
+    /// and cleared exactly once per down-period).
+    private var captureDownReported = false
     /// Monotonic uptime when buffers were last accepted for writing — the
     /// gap-fill anchor. Uptime, never wall-clock: system sleep must not be
     /// back-filled as hours of silence (the silence watchdog pins the same
@@ -345,6 +362,34 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
     /// transient error must not kill a recording (Floor 2: dead air for
     /// seconds is recoverable, a stopped capture is not).
     static let rebuildRetryDelays: [TimeInterval] = [0.5, 1, 2, 4, 8]
+    /// B4 (audit): hard ceiling on the debounce. The window above is a
+    /// TRAILING debounce — every new trigger restarts it — so a device
+    /// flapping faster than 2 Hz would starve the rebuild indefinitely and
+    /// keep capturing through a graph whose converters no longer match the
+    /// hardware. The field log that motivated this fix recorded 6 rebuilds in
+    /// 5 s (~0.83 s apart), only 1.7x from that threshold. Past this age the
+    /// rebuild fires regardless of fresh triggers.
+    static let rebuildMaxWaitSeconds: TimeInterval = 3
+    /// B4 (audit): the graph must not stay DOWN silently. Retries are correct
+    /// (a transient HAL error mid-negotiation should not kill a recording),
+    /// but while the graph is nil ZERO bytes reach either track — and the
+    /// menu-bar indicator would otherwise stay green with the timer running,
+    /// so the user only discovers the loss post-meeting. Past this much
+    /// continuous downtime the session raises a VISIBLE alarm and keeps
+    /// retrying: honest degradation beats a silent green light.
+    static let captureDownAlarmSeconds: TimeInterval = 8
+    /// B4 (audit): ceiling on rate-only rebuilds per session. The nominal-rate
+    /// listener compares against the rate observed at build time; if the HAL
+    /// reports an unsettled rate immediately after aggregate creation (the
+    /// project's own B3 spec names this timing as a known, unresolved risk),
+    /// each rebuild re-arms the same comparison and the session shreds itself
+    /// into fragments — every rebuild excising 0.1-2.2 s of real speech, then
+    /// back-filled with silence so the file duration still looks correct.
+    /// Whether the HAL actually does this is UNVERIFIED (it needs a live
+    /// granted probe), so this bound makes the fix safe either way: genuine
+    /// rate changes are rare, and a device that legitimately renegotiates
+    /// more than this in one session has a bigger problem than pitch drift.
+    static let maxRateTriggeredRebuilds = 3
 
     /// The tap follows the default output for audio by itself, but the
     /// negotiated format can change with the route (48 kHz speakers →
@@ -386,21 +431,38 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
         guard !stopped else { return }
         pendingForced = pendingForced || forced
         // A fresh route change means the device world CHANGED — whatever
-        // failed before may work now, so the retry ladder starts over.
-        if forced { rebuildAttempt = 0 }
+        // failed before may work now, so the retry ladder gets ONE reset per
+        // down-period. It is deliberately NOT reset on every forced trigger:
+        // a flapping device produces them faster than the ladder can run out,
+        // so the ladder would never exhaust, `.writeFailure` would never fire,
+        // and the recording would stay green while capturing nothing.
+        if forced, graph != nil { rebuildAttempt = 0 }
         enqueueRebuild(after: Self.rebuildDebounceSeconds)
     }
 
     private func enqueueRebuild(after delay: TimeInterval) {
+        // Trailing debounce with a hard ceiling: the first trigger of a burst
+        // stamps the deadline, and once `rebuildMaxWaitSeconds` has elapsed the
+        // rebuild fires no matter how fast triggers keep arriving. Without the
+        // ceiling a device flapping faster than the window starves the rebuild
+        // forever (see `rebuildMaxWaitSeconds`).
+        let now = ProcessInfo.processInfo.systemUptime
+        if debounceFirstTriggerUptime == nil { debounceFirstTriggerUptime = now }
+        var effective = delay
+        if let first = debounceFirstTriggerUptime {
+            let waited = now - first
+            effective = min(delay, max(0, Self.rebuildMaxWaitSeconds - waited))
+        }
         pendingRebuild?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.performPendingRebuild() }
         pendingRebuild = item
-        processingQueue.asyncAfter(deadline: .now() + delay, execute: item)
+        processingQueue.asyncAfter(deadline: .now() + effective, execute: item)
     }
 
     private func performPendingRebuild() {
         guard !stopped else { return }
         pendingRebuild = nil
+        debounceFirstTriggerUptime = nil
         let forced = pendingForced
         pendingForced = false
         // Rate-only trigger: skip when the aggregate's reported rate never
@@ -412,11 +474,33 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 current: Self.aggregateNominalSampleRate(graph.aggregateID),
                 observedAtBuild: graph.observedRateAtBuild)
         { return }
+        // Rate-only rebuilds are CEILINGED per session. Each one destroys the
+        // graph and excises 0.1-2.2 s of real speech (back-filled with silence,
+        // so the damage is invisible in the file's duration). If the HAL
+        // reports an unsettled rate right after aggregate creation, the
+        // build-time observation is re-armed identically every time and the
+        // session would shred itself into fragments. Past the ceiling we keep
+        // the current graph and accept possible pitch drift — recoverable by
+        // resampling, unlike excised audio (the same trade the graph builder
+        // already makes: "a drifted recording is recoverable, no recording is
+        // not").
+        if !forced {
+            guard rateTriggeredRebuilds < Self.maxRateTriggeredRebuilds else {
+                if !rateCeilingReported {
+                    rateCeilingReported = true
+                    logger.error(
+                        "rate-triggered rebuild ceiling (\(Self.maxRateTriggeredRebuilds)) reached — keeping the current graph; further rate changes ignored for this session")
+                }
+                return
+            }
+            rateTriggeredRebuilds += 1
+        }
         logger.notice("default device or delivered rate changed — rebuilding capture graph")
         teardownGraph()
         do {
             try buildGraph()
             rebuildAttempt = 0
+            clearCaptureDownAlarm()
             fillCaptureGap()
         } catch {
             guard rebuildAttempt < Self.rebuildRetryDelays.count else {
@@ -433,9 +517,39 @@ public final class CaptureSession: AudioCapturing, @unchecked Sendable {
                 "capture graph rebuild failed (attempt \(self.rebuildAttempt)): \(error) — retrying in \(delay)s")
             // The dead air accumulating during retries is back-filled by the
             // next successful rebuild's gap fill.
+            raiseCaptureDownIfOverdue()
             pendingForced = true
             enqueueRebuild(after: delay)
         }
+    }
+
+    /// B4 (audit): raise the VISIBLE capture-down warning once the graph has
+    /// been down past `captureDownAlarmSeconds`. The recording is NOT stopped —
+    /// the retry ladder is still working and a transient failure recovers — but
+    /// while the graph is nil `processCopiedBuffers` short-circuits and zero
+    /// bytes reach either track, so a silent green indicator would let the user
+    /// finish a meeting believing it recorded. Honest degradation instead.
+    private func raiseCaptureDownIfOverdue() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if captureDownSince == nil { captureDownSince = now }
+        guard let since = captureDownSince, !captureDownReported,
+            now - since >= Self.captureDownAlarmSeconds
+        else { return }
+        captureDownReported = true
+        logger.error(
+            "capture graph has been down for \(Int(now - since))s while rebuilding — surfacing the indicator warning")
+        onEvent?(.captureDown(active: true))
+    }
+
+    /// Clear the capture-down warning after a successful rebuild. Emits the
+    /// clearing event ONLY if the warning was actually raised, so a normal
+    /// sub-threshold rebuild produces no UI churn at all.
+    private func clearCaptureDownAlarm() {
+        captureDownSince = nil
+        guard captureDownReported else { return }
+        captureDownReported = false
+        logger.notice("capture graph rebuilt — clearing the indicator warning")
+        onEvent?(.captureDown(active: false))
     }
 
     /// B4: rebuild only when the aggregate's reported nominal rate MOVED
