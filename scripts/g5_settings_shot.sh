@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/env.sh"
 APP="$ROOT/dist/Blaise.app/Contents/MacOS/Blaise"
 RUNNER="$ROOT/app/.build/debug/CrashRunner"
-OUT="$ROOT/audits/g5"
+OUT="$ROOT/dist/shots/g5"
 mkdir -p "$OUT"
 
 DATA_ROOT="/tmp/blaise-g5-settings-shot"

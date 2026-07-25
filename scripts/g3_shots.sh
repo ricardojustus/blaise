@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/env.sh
 source "$ROOT/scripts/env.sh"
 APP="$ROOT/dist/Blaise.app/Contents/MacOS/Blaise"
-OUT="$ROOT/audits/g3/shots"
+OUT="$ROOT/dist/shots/g3"
 mkdir -p "$OUT"
 
 caffeinate -u -t 180 &
