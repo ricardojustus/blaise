@@ -473,6 +473,41 @@ private func selectLocalFolder(_ database: BlaiseDatabase, _ folder: URL, sideca
         }
     }
 
+    /// R3-C1: the local half of the destination-instance identity is the chosen
+    /// folder's RESOURCE (volume + file id), never its pathname. Both directions
+    /// are load-bearing: a folder that MOVES keeps its identity — the whole
+    /// point of the security-scoped bookmark, and path-keying would strand every
+    /// payload already delivered there — while the volume the folder lives on is
+    /// part of the string, so a different volume mounted at the same mountpoint
+    /// (the silent remount, with no Settings interaction to bump the epoch)
+    /// cannot match a row delivered to the previous one.
+    @Test func localIdentityFollowsTheResourceNotThePath() throws {
+        let parent = try tempFolder()
+        let folder = parent.appendingPathComponent("Evidence", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let identity = HandoffDestination.localFolder(url: folder, markdownSidecar: false)
+            .endpointIdentity(epoch: 3)
+        #expect(identity.hasPrefix("e3:local:"))
+        #expect(!identity.contains(folder.path), "the path is not what authorizes a deletion")
+
+        let volumeUUID = try #require(
+            try folder.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString)
+        #expect(identity.contains(volumeUUID), "a replacement volume reads as a different store")
+
+        let moved = parent.appendingPathComponent("Evidence renamed", isDirectory: true)
+        try FileManager.default.moveItem(at: folder, to: moved)
+        #expect(
+            HandoffDestination.localFolder(url: moved, markdownSidecar: false)
+                .endpointIdentity(epoch: 3) == identity,
+            "the bookmark follows a move, and so does cleanup continuity")
+
+        let other = try tempFolder()
+        #expect(
+            HandoffDestination.localFolder(url: other, markdownSidecar: false)
+                .endpointIdentity(epoch: 3) != identity,
+            "a different folder is a different store")
+    }
+
     /// The Settings view-model load + save round-trips the destination kind and
     /// sidecar toggle (AC5 round-trip through the model the UI binds).
     @MainActor @Test func settingsModelRoundTripsDestination() async throws {

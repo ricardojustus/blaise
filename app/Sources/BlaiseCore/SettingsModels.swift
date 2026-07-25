@@ -257,6 +257,10 @@ public final class HandoffSettingsModel {
                 options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
             try? await settings.set(HandoffDestination.Key.localBookmark, to: bookmark.base64EncodedString())
             try? await settings.set(HandoffDestination.Key.localPath, to: url.path)
+            // G5 v1.6: a folder pick is a destination change — bump the instance
+            // epoch so payloads delivered to the previous folder authorize no
+            // deletion here, even if the user re-picked the same pathname.
+            await HandoffDestination.bumpEpoch(in: settings)
             localFolderPath = url.path
             validationError = nil
             return true
@@ -277,6 +281,16 @@ public final class HandoffSettingsModel {
     /// Returns whether validation passed.
     @discardableResult
     public func save() async -> Bool {
+        // G5 v1.6: a destination change — the kind, or any SSH field, including
+        // the identity file (the "this machine was re-provisioned, here is its
+        // new key" edit) — bumps the destination-instance epoch, so rows
+        // delivered to the previous instance stop authorizing deletion. Read
+        // BEFORE the writes below; the destination-independent toggles
+        // (sidecar/audio/cleanup) are deliberately NOT triggers.
+        let previousKind =
+            (try? await settings.get(HandoffDestination.Key.kind, as: HandoffDestination.Kind.self))
+            ?? nil ?? .ssh
+        let previousSSH = await HandoffSettings.load(from: settings)
         // Persist the active destination kind (G5). SSH fields are always
         // persisted (so switching back keeps them); the sidecar toggle is
         // persisted for the local folder.
@@ -301,6 +315,9 @@ public final class HandoffSettingsModel {
         try? await settings.set(HandoffSettings.Key.identityFile, to: candidate.identityFile)
         try? await settings.set(HandoffSettings.Key.hosts, to: candidate.hosts)
         try? await settings.set(HandoffSettings.Key.remoteRoot, to: candidate.remoteRoot)
+        if previousKind != destinationKind || previousSSH != candidate {
+            await HandoffDestination.bumpEpoch(in: settings)
+        }
 
         switch destinationKind {
         case .ssh:

@@ -64,6 +64,72 @@ public enum HandoffDestination: Sendable, Equatable {
         /// destination (iCloud/network) then means audio leaves the machine. The
         /// payload bytes are unchanged (no audio field).
         public static let deliverAudio = "handoff.deliverAudio"
+        /// G5 v1.6: the destination INSTANCE counter (absent ⇒ 0). Bumped on
+        /// every destination change — kind switch, folder re-pick, SSH settings
+        /// edit — and stamped into `delivered_endpoint` through
+        /// `endpointIdentity(epoch:)`. Monotonic: it only ever counts up, so a
+        /// row from a previous instance can never match the active one again.
+        public static let destinationEpoch = "handoff.destinationEpoch"
+    }
+
+    /// The active destination epoch (absent ⇒ 0).
+    public static func epoch(from store: SettingsStore) async -> Int {
+        (try? await store.get(Key.destinationEpoch, as: Int.self)) ?? nil ?? 0
+    }
+
+    /// Records that the destination changed: the next delivery stamps a new
+    /// identity, and every row stamped before this call stops authorizing
+    /// deletion. Called from the Settings model on a kind switch, a folder
+    /// re-pick, or an SSH settings edit.
+    public static func bumpEpoch(in store: SettingsStore) async {
+        let next = await epoch(from: store) + 1
+        try? await store.set(Key.destinationEpoch, to: next)
+    }
+
+    /// The destination-INSTANCE identity stamped on every delivered row and
+    /// required to match before a payload here may be deleted (G5 v1.6). Two
+    /// components, both load-bearing:
+    ///
+    /// - the destination EPOCH: what makes a REPLACED destination a different
+    ///   instance even when its configuration is spelled identically — the
+    ///   volume swapped at the same mount point, the re-provisioned host at the
+    ///   same address. Rows stamped under a previous epoch never match again.
+    /// - the destination CONFIGURATION, deliberately NOT the host that answered
+    ///   (`handoff.hosts` is an ordered list of routes to ONE machine — C8 — so
+    ///   a Tailscale→LAN failover must not read as a destination switch). For a
+    ///   local folder it is the resolved RESOURCE identity (volume UUID + file
+    ///   id), not the path: the security-scoped bookmark exists so a folder MOVE
+    ///   keeps delivering, and the resource id follows the same folder, while a
+    ///   different volume mounted at the same path reads as what it is —
+    ///   somebody else's store. Unresolvable ⇒ empty, and the epoch alone
+    ///   carries the instance distinction.
+    ///
+    /// Every mismatch fails toward UNDER-deletion: a row whose identity is not
+    /// exactly this string is left alone.
+    public func endpointIdentity(epoch: Int) -> String {
+        switch self {
+        case .ssh(let settings, _):
+            return "e\(epoch):ssh:\(settings.user)@\(settings.hosts.joined(separator: ","))"
+                + ":\(settings.remoteRoot)"
+        case .localFolder(let url, _):
+            return "e\(epoch):local:\(Self.localResourceIdentity(of: url))"
+        }
+    }
+
+    /// Volume UUID + file id of the chosen folder — the pair that survives a
+    /// move and distinguishes a replacement resource at the same path. Empty
+    /// when the file system does not answer (an unplugged volume, a file system
+    /// with no persistent UUID); the epoch then carries the distinction alone.
+    static func localResourceIdentity(of url: URL) -> String {
+        // Same security-scope discipline the worker uses around every other
+        // access to this URL; balanced immediately.
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard let values = try? url.resourceValues(
+            forKeys: [.volumeUUIDStringKey, .fileIdentifierKey]),
+            let volume = values.volumeUUIDString, let fileID = values.fileIdentifier
+        else { return "" }
+        return "\(volume)/\(fileID)"
     }
 
     /// Destination-independent (G5 v1.3): whether to REMOVE superseded payloads

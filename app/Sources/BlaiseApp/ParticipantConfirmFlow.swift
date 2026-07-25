@@ -69,9 +69,10 @@ final class ParticipantConfirmModel {
     func confirm() async -> Bool {
         working = true
         let ok = await env.confirmParticipants(meetingID: meeting.id, names: enteredNames)
-        errorMessage = ok ? nil : "Couldn't save the participants. Try again."
+        let outcome = await resolve(ok: ok, retry: "Couldn't save the participants. Try again.")
+        errorMessage = outcome.message
         working = false
-        return ok
+        return outcome.dismiss
     }
 
     /// Returns whether the sheet may dismiss.
@@ -79,9 +80,40 @@ final class ParticipantConfirmModel {
         working = true
         let ok = await env.skipParticipantConfirmation(
             meetingID: meeting.id, dontAskAgain: dontAskAgain)
-        errorMessage = ok ? nil : "Couldn't skip right now. Try again."
+        let outcome = await resolve(ok: ok, retry: "Couldn't skip right now. Try again.")
+        errorMessage = outcome.message
         working = false
-        return ok
+        return outcome.dismiss
+    }
+
+    private func resolve(ok: Bool, retry: String) async -> AnswerOutcome {
+        Self.outcome(
+            succeeded: ok,
+            notesAlreadyWritten: ok ? false : await env.meetingHasNotes(meeting.id),
+            retry: retry)
+    }
+
+    struct AnswerOutcome: Equatable {
+        var dismiss: Bool
+        var message: String?
+    }
+
+    /// R3-F3: what the sheet does with the pipeline's answer. A refusal against
+    /// a meeting whose notes are ALREADY written is not a retryable failure —
+    /// the opt-in auto-skip took the answer's place after the five-minute window
+    /// (G15 §2c) and §3 refuses a post-notes confirmation — so the sheet states
+    /// that plainly and closes instead of telling the user to retry something
+    /// that can never succeed. Every other refusal keeps the sheet open with its
+    /// retry message; the Cancel button is the exit there.
+    static func outcome(
+        succeeded: Bool, notesAlreadyWritten: Bool, retry: String
+    ) -> AnswerOutcome {
+        if succeeded { return AnswerOutcome(dismiss: true, message: nil) }
+        if notesAlreadyWritten {
+            return AnswerOutcome(
+                dismiss: true, message: "Notes were generated without attendees.")
+        }
+        return AnswerOutcome(dismiss: false, message: retry)
     }
 }
 
@@ -159,6 +191,12 @@ struct ParticipantConfirmSheet: View {
                     .toggleStyle(.checkbox)
                     .font(.callout)
                 Spacer()
+                // R3-F3: the dismissal control every other sheet in the app has.
+                // Closing answers nothing — the question stays on the meeting's
+                // row (and its notification) until it is answered or auto-skipped.
+                Button("Cancel") { isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(model.working)
                 Button("Skip") {
                     Task {
                         if await model.skip(dontAskAgain: dontAskAgain) { isPresented = false }

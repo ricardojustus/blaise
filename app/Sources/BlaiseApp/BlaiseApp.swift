@@ -292,10 +292,10 @@ struct MainWindow: View {
                     }
                 }
             }
-            // G15 §2/§3: the confirm sheet raised OUTSIDE the detail view — at a
-            // recording stop with Blaise frontmost, or from the notification.
-            // Window-level because at stop time the meeting has no pending
-            // banner yet (the detail view keeps its own banner-opened sheet).
+            // G15 §2/§3: the confirm sheet raised OUTSIDE the detail view — at
+            // the run-entry ask with Blaise frontmost, or from the notification.
+            // Window-level because at the ask the meeting has no pending banner
+            // yet (the detail view keeps its own banner-opened sheet).
             .sheet(
                 isPresented: Binding(
                     get: { uiState.participantConfirmMeeting != nil },

@@ -402,6 +402,89 @@ private func audioNames(_ dir: URL) -> [String] {
             "v1 was delivered to the OLD root: no candidate here, so no remote rm command")
     }
 
+    /// R3-C1 (Critical), local half — Codex's same-path replacement, literally:
+    /// deliver to a folder/volume at `<path>`, lose it, put a DIFFERENT store at
+    /// the same `<path>`, and re-pick it in Settings. Every visible part of the
+    /// configuration is identical, so a path-keyed identity handed the
+    /// replacement the old store's deletion authority. The re-pick bumps the
+    /// destination epoch, so v1's delivered row belongs to the previous
+    /// instance and the same-named file here — somebody else's — survives.
+    @MainActor @Test func localSamePathReplacementNeverDeletesTheNewResourcesFile() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Replaced at the same path")
+        let parent = try g5TempFolder()
+        let path = parent.appendingPathComponent("Evidence", isDirectory: true)
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        try await selectLocalDest(database, path, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        #expect(jsonNames(path.appendingPathComponent(v1.meetingID))
+            == ["\(v1.versionHash).json"], "v1 landed at the original store")
+
+        // The store at `<path>` is replaced, and the user re-picks the folder
+        // they have always had — through the real Settings path, which is where
+        // the destination-instance epoch is bumped.
+        let store = SettingsStore(database: database)
+        #expect(await HandoffDestination.epoch(from: store) == 0)
+        try FileManager.default.removeItem(at: path)
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        let model = HandoffSettingsModel(settings: store, kicker: NoopHandoffKicker())
+        await model.load()
+        #expect(await model.chooseLocalFolder(path))
+        #expect(await HandoffDestination.epoch(from: store) == 1, "the re-pick is a new instance")
+
+        // A file with v1's name at the new store: another producer's, not ours.
+        let dest = path.appendingPathComponent(v1.meetingID, isDirectory: true)
+        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+        let foreign = Data("not Blaise's payload".utf8)
+        try foreign.write(to: dest.appendingPathComponent("\(v1.versionHash).json"))
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        let worker = makeWorker(database)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(dest) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
+            "a version delivered to the resource that WAS here authorizes nothing at this one")
+        #expect(
+            try Data(contentsOf: dest.appendingPathComponent("\(v1.versionHash).json")) == foreign,
+            "the foreign file is untouched, byte for byte")
+    }
+
+    /// R3-C1 (Critical), SSH half: the endpoint spelling (user, host list, root)
+    /// is unchanged — the machine behind it was re-provisioned, and the user's
+    /// only trace of that is a Settings edit (here the identity file, the new
+    /// key). That edit bumps the destination epoch, so v1's delivery to the OLD
+    /// machine stops being authority and no remote rm is sent.
+    @MainActor @Test func sshSettingsEditRetiresThePreviousMachinesAuthority() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Reprovisioned host")
+        let store = SettingsStore(database: database)
+        try await store.set(HandoffDestination.Key.removeSupersededPayloads, to: true)
+        let first = makeWorker(database)
+        await first.kick()
+        await first.waitUntilSettled()
+
+        let model = HandoffSettingsModel(settings: store, kicker: NoopHandoffKicker())
+        await model.load()
+        model.identityFile = "~/.ssh/id_ed25519_reprovisioned"
+        #expect(await model.save())
+        #expect(await HandoffDestination.epoch(from: store) == 1, "the edit is a destination change")
+
+        _ = try await enqueueSecondVersion(database, v1.meetingID)
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            transport.calls.count == 1,
+            "v1 was delivered to the previous instance: no candidate here, so no remote rm command")
+    }
+
     /// The other half of R2-C1: a version that only ever sat in the queue
     /// (pending / failed / damaged — never delivered anywhere) is not authority
     /// either. The pre-fix `any state` query made it one.

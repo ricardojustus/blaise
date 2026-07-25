@@ -544,8 +544,8 @@ final class AppEnvironment {
                 }
             case .participantConfirm(let meetingID):
                 // G15: open Blaise, select the meeting, and raise the confirm
-                // sheet itself. The notification is posted at the recording stop
-                // (§2), when the meeting has no pending banner yet — routing to
+                // sheet itself. The notification is posted at the run-entry ask
+                // (§2a), when the meeting has no pending banner yet — routing to
                 // the banner alone would be a dead end.
                 let meeting = try? await MeetingRepository(database: self.database)
                     .fetch(meetingID)
@@ -1089,15 +1089,39 @@ final class AppEnvironment {
     /// answering before the run reaches its notes stage means it never parks.
     /// The pipeline records the ask, so a later park does not notify twice.
     func raiseParticipantAsk(meetingID: MeetingID, title: String) async {
-        if NSApp.isActive {
+        switch Self.participantAskSurface(
+            appIsActive: NSApp.isActive, sheetPresenting: uiState.participantConfirmMeeting?.id)
+        {
+        case .sheet:
             let meeting = try? await MeetingRepository(database: database).fetch(meetingID)
             guard let meeting else { return }
             uiState.participantConfirmMeeting = meeting
             uiState.openMainWindowRequest += 1
-        } else {
+        case .notification:
             await notificationAdapter.postParticipantConfirmation(
                 meetingID: meetingID, title: title)
         }
+    }
+
+    /// The two designed surfaces for a run-entry ask (G15 §2a).
+    enum ParticipantAskSurface: Equatable {
+        case sheet
+        case notification
+    }
+
+    /// Which surface this ask may use. Blaise frontmost ⇒ the sheet, EXCEPT
+    /// while a confirm sheet is already presented: a second ask must never
+    /// overwrite the meeting the standing sheet is answering (R3-F4). The
+    /// presented sheet captured its subject at init, so overwriting the state
+    /// leaves the first sheet answering the first meeting and loses the second
+    /// question entirely — through both of its surfaces, since the pipeline
+    /// latch already counts it as asked. The notification is the designed
+    /// surface for "the sheet cannot be shown now"; it survives, and the user
+    /// reaches the second meeting from it.
+    static func participantAskSurface(
+        appIsActive: Bool, sheetPresenting: MeetingID?
+    ) -> ParticipantAskSurface {
+        appIsActive && sheetPresenting == nil ? .sheet : .notification
     }
 
     /// Confirm-sheet pre-fill names (§3), in the spec's order: calendar
@@ -1124,6 +1148,14 @@ final class AppEnvironment {
         names.append(contentsOf: await pipeline.groundedPersonNames(meetingID: meeting.id))
         // Fold-dedup, order-preserving (surface preserved), empties dropped.
         return ProcessingPipeline.foldedDedupedAttendees(names).map(\.name)
+    }
+
+    /// Whether this meeting's notes are already written — the state in which a
+    /// confirm/skip answer is moot (G15 §3 refuses it, and the auto-skip that
+    /// minted them already took the answer's place). The sheet reads it to tell
+    /// a refusal that can never succeed from one worth retrying (R3-F3).
+    func meetingHasNotes(_ meetingID: MeetingID) async -> Bool {
+        ((try? await NotesRepository(database: database).fetch(meetingID: meetingID)) ?? nil) != nil
     }
 
     /// Confirm-sheet caption count (§3): "Blaise heard N distinct voices".

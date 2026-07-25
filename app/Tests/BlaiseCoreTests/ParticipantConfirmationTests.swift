@@ -507,6 +507,36 @@ import Testing
         #expect(stored.attendees.isEmpty, "skip writes no attendees")
     }
 
+    /// R3-H1 (High): the run-entry ask suspends (settings + notes reads) in the
+    /// window that `.runStarted` has already opened the Cancel button in, and
+    /// the actor is reentrant there. A click landing in that window must cancel
+    /// the run. With the ask evaluated BEFORE the cancel token was installed,
+    /// `cancel` found no token, returned false — the UI discards the value — and
+    /// the run went on to write notes as if nothing had been clicked.
+    @Test func cancelDuringTheRunEntryAskActuallyCancelsTheRun() async throws {
+        let signalled = Mutex(false)
+        let box = Mutex<ProcessingPipeline?>(nil)
+        let harness = try await makePipelineHarness(duringRunEntryAsk: { meetingID in
+            guard let pipeline = box.withLock({ $0 }) else { return }
+            let didCancel = await pipeline.cancel(meetingID: meetingID)
+            signalled.withLock { $0 = didCancel }
+        })
+        box.withLock { $0 = harness.pipeline }
+        try await enableGate(harness)
+        let meeting = try await harness.importTestMeeting(attendees: [])
+
+        await #expect(throws: (any Error).self) {
+            _ = try await harness.pipeline.process(meetingID: meeting.id)
+        }
+        #expect(signalled.withLock { $0 }, "a visible Cancel must never no-op against a nil token")
+        let stored = try #require(try await harness.meeting(meeting.id))
+        #expect(stored.status == .cancelled, "the click stopped the run")
+        #expect(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id)
+                == nil,
+            "a cancelled run mints no notes")
+    }
+
     // MARK: - AC2c: the LATE answer — after the gate decided, before the marker
 
     /// R2-H1 (Confirm half). The gate has already decided to park and the run is

@@ -256,6 +256,11 @@ public actor ProcessingPipeline {
     /// notes-pending path); a test uses it to answer at exactly that moment
     /// instead of hoping a concurrent task lands there.
     private let duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)?
+    /// G15 R3-H1 pin: a suspension point INSIDE the run-entry ask, i.e. in the
+    /// window between `.runStarted` (which makes Cancel visible) and the ask's
+    /// return. nil in production (one nil check per run entry); a test uses it
+    /// to click Cancel at exactly that moment instead of racing it.
+    private let duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)?
     private let chain = EngineTaskChain()
     private let logger = Logger(subsystem: BlaiseBundle.identifier, category: "pipeline")
     private var eventContinuations: [UUID: AsyncStream<PipelineEvent>.Continuation] = [:]
@@ -319,7 +324,8 @@ public actor ProcessingPipeline {
         meetEventsSweeper: any MeetEventsSweeping = NoopMeetEventsSweeper(),
         tempDirectory: URL = FileManager.default.temporaryDirectory,
         now: @escaping @Sendable () -> Date = { Date() },
-        duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil
+        duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
+        duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil
     ) {
         self.database = database
         self.registry = registry
@@ -332,6 +338,7 @@ public actor ProcessingPipeline {
         self.tempDirectory = tempDirectory
         self.now = now
         self.duringParticipantParkCommit = duringParticipantParkCommit
+        self.duringRunEntryAsk = duringRunEntryAsk
     }
 
     /// Convenience overload for a CONSTANT vocabulary stack (tests, regression
@@ -345,7 +352,8 @@ public actor ProcessingPipeline {
         meetEventsSweeper: any MeetEventsSweeping = NoopMeetEventsSweeper(),
         tempDirectory: URL = FileManager.default.temporaryDirectory,
         now: @escaping @Sendable () -> Date = { Date() },
-        duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil
+        duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
+        duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil
     ) {
         self.init(
             database: database, registry: registry, diarizer: diarizer,
@@ -355,7 +363,8 @@ public actor ProcessingPipeline {
             },
             handoffKicker: handoffKicker,
             meetEventsSweeper: meetEventsSweeper, tempDirectory: tempDirectory, now: now,
-            duringParticipantParkCommit: duringParticipantParkCommit)
+            duringParticipantParkCommit: duringParticipantParkCommit,
+            duringRunEntryAsk: duringRunEntryAsk)
     }
 
     // MARK: - Progress
@@ -1191,19 +1200,27 @@ public actor ProcessingPipeline {
         // to .processing. Throws (unrecorded) if the meeting is gone.
         let meeting = try await writeRunEntry(meetingID: meetingID, regeneration: regeneration)
         emit(.runStarted(meetingID, regeneration: regeneration))
+
+        // G10 §1: install this run's cancel token. statusSilent mirrors the
+        // status-write discipline — a regeneration never writes a `cancelled`
+        // status (C1 no-regress), so its cancel is status-silent. Removed on
+        // every exit path below.
+        //
+        // ORDER IS LOAD-BEARING (round-3 R3-H1): the token is installed before
+        // ANY await in this function. `.runStarted` is what makes the Cancel
+        // button visible, `cancel` defines "in flight" as "a token is
+        // installed", and the actor is reentrant at every suspension — so a
+        // click landing while the run is suspended below (the ask's settings /
+        // notes reads) would otherwise no-op silently against a nil token.
+        let cancelToken = installCancelToken(meetingID: meetingID, statusSilent: regeneration)
+        defer { removeCancelToken(meetingID: meetingID, token: cancelToken) }
+
         // G15 §2a: ask who was there NOW — the run has just claimed the meeting
         // and `writeRunEntry` has absorbed any pending Meet/Slack roster, so
         // this is the earliest moment the question is honest. Nothing waits on
         // the answer: the stages below run concurrently with the sheet, and an
         // answer that lands before the notes stage means the meeting never parks.
         await raiseParticipantAskAtRunEntry(meeting: meeting, regeneration: regeneration)
-
-        // G10 §1: install this run's cancel token. statusSilent mirrors the
-        // status-write discipline — a regeneration never writes a `cancelled`
-        // status (C1 no-regress), so its cancel is status-silent. Removed on
-        // every exit path below.
-        let cancelToken = installCancelToken(meetingID: meetingID, statusSilent: regeneration)
-        defer { removeCancelToken(meetingID: meetingID, token: cancelToken) }
 
         let context = RunContext(meetingID: meetingID, regeneration: regeneration)
         context.cancelToken = cancelToken
@@ -1350,7 +1367,7 @@ public actor ProcessingPipeline {
                 audioDuration: audioDuration, eventNames: eventNames)
         }
 
-        // G15 §2 (ask-at-stop): pick up an answer that landed while this run
+        // G15 §2 (the run-entry ask): pick up an answer that landed while this run
         // was transcribing. Confirm writes attendees and nothing else, so the
         // fresh names are merged in without disturbing any other column of the
         // run's snapshot — the gate below then simply does not fire, and the
@@ -2036,6 +2053,7 @@ public actor ProcessingPipeline {
     /// notification (one ask per run, never one per park) and starts the
     /// auto-skip window.
     private func raiseParticipantAskAtRunEntry(meeting: Meeting, regeneration: Bool) async {
+        if let duringRunEntryAsk { await duringRunEntryAsk(meeting.id) }
         guard !regeneration, meeting.attendees.isEmpty,
             !NotesPendingClass.isPending(meeting.lastProcessingError),
             await AutomationSettings.confirmParticipants(from: settings),

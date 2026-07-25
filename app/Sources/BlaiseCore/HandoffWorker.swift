@@ -348,23 +348,18 @@ public actor HandoffWorker: HandoffKicking {
             // immediately before each cleanup, after the transport await.)
             let deliverAudio = await HandoffDestination.deliverAudio(from: settingsStore)
 
-            // G5 v1.5: the identity of the destination this drain writes to,
-            // recorded on every delivered row and required to match before a
-            // payload here may be deleted. It is the destination CONFIGURATION,
-            // deliberately not the host that answered: `handoff.hosts` is an
-            // ordered list of routes to ONE machine (C8 §"handoff.hosts":
-            // Tailscale-first, LAN-second), so a failover between them must not
-            // read as a destination switch. Changing the folder, the remote root,
-            // the user or the host list DOES change it — and then nothing here is
-            // provably ours.
-            let identity: String
-            switch destination {
-            case .ssh(let settings, _):
-                identity = "ssh:\(settings.user)@\(settings.hosts.joined(separator: ","))"
-                    + ":\(settings.remoteRoot)"
-            case .localFolder(let url, _):
-                identity = "local:\(url.path)"
-            }
+            // G5 v1.6: the identity of the destination INSTANCE this drain
+            // writes to, recorded on every delivered row and required to match
+            // before a payload here may be deleted — the destination epoch plus
+            // the destination CONFIGURATION (never the host that answered, so a
+            // Tailscale→LAN failover is not a destination switch; never the
+            // folder path, so a replacement volume at the same mount point is
+            // not the same store). `endpointIdentity(epoch:)` carries the WHY of
+            // each half. Changing the folder, the remote root, the user or the
+            // host list — or replacing the resource behind an unchanged
+            // configuration — changes it, and then nothing here is provably ours.
+            let identity = destination.endpointIdentity(
+                epoch: await HandoffDestination.epoch(from: settingsStore))
 
             switch destination {
             case .ssh(let settings, let sidecar):
