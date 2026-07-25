@@ -229,6 +229,23 @@ final class SlackHuddlesModel {
             connected = true
             enabled = true
             lastError = nil
+            // Tear the OLD socket down FIRST, before any suspension point in
+            // this method. Its tokens were just superseded by the writes above,
+            // so it must not survive under any interleaving — and doing it here
+            // is the only ordering that is correct in both directions:
+            //
+            //   * Later than this (after an await), a superseding toggle can
+            //     return us early and strand the old-token socket alive. The
+            //     toggle cannot clean it up either: its own startSocket() no-ops
+            //     while `socketTask` is occupied.
+            //   * Later than this and UNGUARDED, we can instead cancel a socket
+            //     a NEWER enable legitimately started, and then decline to
+            //     restart it — leaving enabled + connected with no socket.
+            //
+            // Stopping before we suspend removes both hazards: the stale socket
+            // is always gone, and any socket a newer decision starts afterwards
+            // is created after our teardown, so we can never cancel it.
+            await stopSocket()
             // connect() is an ENABLING path, so it joins the lifecycle epoch:
             // without this a disable task suspended in stopSocket() would
             // resume after the reconnect, pass its stale guard, and clear the
@@ -239,16 +256,9 @@ final class SlackHuddlesModel {
             await tracker.setSelfUserID(memberID)
             guard lifecycleGeneration == lifecycleEpoch else { return }
             await saveSettings()
-            // Reconnect with rotated tokens: tear the old socket down (awaited)
-            // before starting fresh, or it would keep streaming the old
-            // workspace forever (startSocket no-ops while a task exists).
-            // This teardown is deliberately NOT epoch-guarded: stopping is
-            // always safe, and skipping it strands a socket authenticated with
-            // the PREVIOUS tokens while the Keychain and settings describe the
-            // new ones — a superseding toggle's own startSocket() then no-ops
-            // because `socketTask` is still occupied, so nothing else would
-            // ever tear it down.
-            await stopSocket()
+            // Only STARTING is epoch-gated: if a newer decision landed while we
+            // were suspended, it owns the socket state and `socketTask` is nil
+            // for it to act on.
             guard lifecycleGeneration == lifecycleEpoch else { return }
             startSocket()
         } catch is CancellationError {

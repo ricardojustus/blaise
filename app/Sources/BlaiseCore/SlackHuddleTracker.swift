@@ -89,7 +89,19 @@ public actor SlackHuddleTracker {
     private var lastSelfEventAt: Date?
     /// One-shot latch so the liveness-belief-stale notice logs once per call,
     /// not every 5 s tick. Reset wherever `lastSelfEventAt` is set or cleared.
+    /// LOG LIFETIME ONLY — do not reuse it as a revival signal: it is cleared
+    /// the instant a self event arrives, which is BEFORE the tick that would
+    /// act on the revival.
     private var livenessBeliefStale = false
+    /// Set whenever staleness SUPPRESSED an emission (a skipped heartbeat or a
+    /// withheld roster flush); cleared only once an emission carrying a
+    /// lifecycle KIND has gone out. Distinct from `livenessBeliefStale` because
+    /// the lifetimes differ: the log latch dies with the self event, this debt
+    /// must survive into the tick that actually flushes. Downstream resumes a
+    /// grace window only on a kind-carrying batch, so a revival whose first
+    /// emission is a bare roster batch would consume the 60 s heartbeat window
+    /// and delay the automatic resume by up to a minute of a live meeting.
+    private var owesRevivalHeartbeat = false
 
     private var lastRosterFlushAt: Date?
     private var rosterDirty = false
@@ -138,6 +150,7 @@ public actor SlackHuddleTracker {
         expirationTs = nil
         lastSelfEventAt = nil
         livenessBeliefStale = false
+        owesRevivalHeartbeat = false
         lastRosterFlushAt = nil
         lastHeartbeatAt = nil
         rosterDirty = false
@@ -209,9 +222,9 @@ public actor SlackHuddleTracker {
             // meeting. Emitting two batches at the same instant is not the
             // alternative: the downstream monotonic guard drops the second
             // (the same-millisecond collision C15 v1.1 item 4 closed).
-            let reviving = livenessBeliefStale
+            let reviving = owesRevivalHeartbeat
             await flushRoster(at: clock, withHeartbeat: reviving)
-            if reviving { livenessBeliefStale = false }
+            if reviving { owesRevivalHeartbeat = false }
         }
 
         // Expiration ADVISORY: `now > huddle_state_expiration_ts + 120 s` with
@@ -241,6 +254,9 @@ public actor SlackHuddleTracker {
                 logger.notice(
                     "no genuine self event for \(callID, privacy: .public) in \(Int(Self.livenessBeliefMaxAgeSeconds), privacy: .public)s — all manufactured liveness stops; the recording watchdog now owns the end")
             }
+            // A heartbeat was due but suppressed: the revival owes a
+            // kind-carrying batch so the grace-resume path recognises it.
+            owesRevivalHeartbeat = true
             return
         }
 
@@ -264,6 +280,11 @@ public actor SlackHuddleTracker {
                 expirationTs = event.expirationTs
                 lastSelfEventAt = at
                 livenessBeliefStale = false
+                // `owesRevivalHeartbeat` is deliberately NOT cleared here. This
+                // event is what makes the belief fresh again, but the revival's
+                // kind-carrying batch has not gone out yet — the next tick
+                // sends it. Clearing the debt at the event site is precisely
+                // what made an earlier version of this fix dead code.
                 return
             }
             // Self joins a NEW call id (nil or different). A different id means
@@ -286,6 +307,7 @@ public actor SlackHuddleTracker {
         self.expirationTs = expirationTs
         lastSelfEventAt = at
         livenessBeliefStale = false
+        owesRevivalHeartbeat = false
         participants = [selfUserID: Participant(name: nil, joinedAt: at)]
         lastRosterFlushAt = at
         rosterDirty = false
@@ -322,6 +344,7 @@ public actor SlackHuddleTracker {
         expirationTs = nil
         lastSelfEventAt = nil
         livenessBeliefStale = false
+        owesRevivalHeartbeat = false
         lastRosterFlushAt = nil
         lastHeartbeatAt = nil
         rosterDirty = false
@@ -387,6 +410,7 @@ public actor SlackHuddleTracker {
         // an attendee of the recording that exists.
         guard !beliefIsStale(at: at) else {
             rosterDirty = true
+            owesRevivalHeartbeat = true
             return
         }
         let elapsed = lastRosterFlushAt.map { at.timeIntervalSince($0) } ?? .infinity
@@ -416,6 +440,9 @@ public actor SlackHuddleTracker {
 
     private func emitHeartbeat(at: Date) async {
         guard let callID = currentCallID else { return }
+        // A normal heartbeat satisfies the revival debt too — it is exactly the
+        // kind-carrying batch the debt exists to guarantee.
+        owesRevivalHeartbeat = false
         await emitBatch(
             callID: callID, roster: [],
             lifecycle: MeetWireLifecycle(kind: .heartbeat, atMs: ms(at)), at: at)

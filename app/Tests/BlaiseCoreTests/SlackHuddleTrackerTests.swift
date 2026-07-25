@@ -204,6 +204,39 @@ struct SlackHuddleTrackerTests {
         #expect(
             rec.all.last?.roster.contains { $0.displayName == "Alice" } == true,
             "the roster change buffered while stale is flushed on revival, not dropped")
+        // The revival batch MUST carry a lifecycle kind. Downstream resumes a
+        // grace window only on callStarted/heartbeat — a bare roster batch is
+        // plain liveness, which deliberately does not resurrect a recording,
+        // AND it resets the 60 s heartbeat window, so the next kind-carrying
+        // batch would be up to a minute away: a minute of a live meeting not
+        // captured. Asserting only "a roster appeared" let a previous version
+        // of this fix ship as dead code.
+        #expect(
+            rec.all.last?.lifecycle?.kind == .heartbeat,
+            "the revival flush must carry the heartbeat lifecycle in the SAME batch")
+    }
+
+    @Test("revival heartbeat survives the self event that clears the log latch")
+    func revivalHeartbeatOutlivesTheLogLatch() async {
+        let rec = BatchRecorder()
+        let tracker = makeTracker(rec)
+        await tracker.handle(selfEvent(callID: "R1", inHuddle: true, ts: "1000.1"), at: t(0))
+        let bound = SlackHuddleTracker.livenessBeliefMaxAgeSeconds
+
+        // Go stale with NO buffered roster change, so the revival's first
+        // emission comes from the heartbeat path rather than the roster flush.
+        await tracker.tick(now: t(bound + 1))
+        let beforeRevival = rec.all.count
+
+        // The self event clears the STALE-LOG latch. The revival debt must not
+        // die with it: the next tick still owes a kind-carrying batch.
+        await tracker.handle(
+            selfEvent(callID: "R1", inHuddle: true, ts: "1000.2"), at: t(bound + 10))
+        await tracker.tick(now: t(bound + 15))
+        #expect(rec.all.count > beforeRevival, "revival must emit")
+        #expect(
+            rec.all.last?.lifecycle?.kind == .heartbeat,
+            "revival emission carries a lifecycle kind even with no buffered roster")
     }
 
     @Test("heartbeat emitted on cadence while in a call")

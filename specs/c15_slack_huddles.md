@@ -168,8 +168,11 @@ Transitions (all driven by `user_huddle_changed`):
    belief and refreshes `MeetCallTracker.lastSignalAt`, so an undelivered
    self-leave would suppress that 5-min watchdog forever and leave a recording
    running indefinitely. Going quiet instead lets the watchdog stop the recording
-   through its normal path (user-visible notification + Resume + grace window),
-   so a false trigger costs one click rather than a lost meeting. A fresh self event revives the belief;
+   through its normal path: with a resume window configured (the default) that is
+   a user-visible notification WITH Resume and a grace window, so a false trigger
+   costs one click rather than a lost meeting; with "Resume window: Off" the stop
+   finalizes immediately and the notification is informational, per C14 §3. Audio
+   is retained either way. A fresh self event revives the belief;
    the roster change buffered while stale is NOT lost — it flushes on the next
    tick, carrying the heartbeat lifecycle in the same batch so the revival is
    recognised by the kind-gated grace-resume path. The constant is generous
