@@ -83,6 +83,12 @@ public actor HandoffWorker: HandoffKicking {
     /// orphaned post-crash ssh and a relaunch redelivery must never share a
     /// temp file. Injectable for the command goldens.
     private let nonce: @Sendable () -> String
+    /// Round-2 R2-C2 pin: a suspension point INSIDE the deletion-candidate
+    /// acquisition, so a test can flip the destructive toggle exactly there and
+    /// assert the post-acquisition re-read wins. nil in production (one nil
+    /// check on the cleanup path, no suspension) — the `HandoffCrashHooks`
+    /// precedent in this file, minus the process kill.
+    private let duringCandidateAcquisition: (@Sendable () async -> Void)?
     private let logger = Logger(subsystem: BlaiseBundle.identifier, category: "handoff")
 
     private struct HostState {
@@ -123,7 +129,8 @@ public actor HandoffWorker: HandoffKicking {
         now: @escaping @Sendable () -> Date = { Date() },
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
         jitter: @escaping @Sendable (TimeInterval) -> TimeInterval = { TimeInterval.random(in: 0...$0) },
-        nonce: @escaping @Sendable () -> String = { HandoffCommand.makeNonce() }
+        nonce: @escaping @Sendable () -> String = { HandoffCommand.makeNonce() },
+        duringCandidateAcquisition: (@Sendable () async -> Void)? = nil
     ) {
         self.database = database
         self.settingsStore = SettingsStore(database: database)
@@ -136,6 +143,7 @@ public actor HandoffWorker: HandoffKicking {
         self.sleep = sleep
         self.jitter = jitter
         self.nonce = nonce
+        self.duringCandidateAcquisition = duringCandidateAcquisition
     }
 
     // MARK: - Wakes
@@ -334,6 +342,20 @@ public actor HandoffWorker: HandoffKicking {
                 return
             }
 
+            // G5 v1.3 destination-independent toggle, read fresh each drain so a
+            // Settings change takes effect on the next delivery. (The DESTRUCTIVE
+            // cleanup toggle is deliberately NOT cached here — it is re-read
+            // immediately before each cleanup, after the transport await.)
+            let deliverAudio = await HandoffDestination.deliverAudio(from: settingsStore)
+
+            // The identity of the destination this drain writes to, recorded on
+            // every delivered row and required to match before a payload here
+            // may be deleted — the destination CONFIGURATION, never the host
+            // that answered (a Tailscale→LAN failover is not a destination
+            // switch). Changing the folder, the remote root, the user or the
+            // host list changes it, and then nothing here is provably ours.
+            let identity = destination.endpointIdentity()
+
             switch destination {
             case .ssh(let settings, let sidecar):
                 guard let host = await pickHost(settings.hosts) else {
@@ -374,14 +396,39 @@ public actor HandoffWorker: HandoffKicking {
                         message: "spawn failed: \(error)")
                     continue
                 }
-                if outcome.exitStatus == 0, sidecar {
+                if outcome.exitStatus == 0 {
                     // JSON delivered; upload the convenience Markdown sidecar
                     // (failure ISOLATED — never fails the queue item; retried on
                     // this meeting's next delivery), mirroring the local path.
-                    await uploadSidecar(
-                        item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                    if sidecar {
+                        await uploadSidecar(
+                            item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                    }
+                    // G5 v1.3: audio delivery AFTER the sidecar step (opt-in,
+                    // failure-isolated exactly like the sidecar).
+                    if deliverAudio {
+                        await deliverAudioSSH(
+                            item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                    }
                 }
-                await recordOutcome(outcome, item: claimed, endpoint: host)
+                await recordOutcome(
+                    outcome, item: claimed, endpoint: host, identity: identity)
+                // G5 v1.3: superseded-payload cleanup AFTER delivery + supersession
+                // (OPT-IN, default OFF; failure-isolated). Never touches the local
+                // `handoff/` snapshots — the destination is a delivery target.
+                // ORDER IS LOAD-BEARING (round-2 R2-C2): acquire the candidate set
+                // FIRST, then re-read the destructive toggle, then enter cleanup
+                // with NO suspension in between. The actor is reentrant at every
+                // await, so any authorization read BEFORE a further await can be
+                // stale by the time it is used — and the user's OFF must win.
+                if outcome.exitStatus == 0 {
+                    let hashes = await supersededCandidates(item: claimed, endpoint: identity)
+                    if await HandoffDestination.removeSupersededPayloads(from: settingsStore) {
+                        await cleanupSupersededSSH(
+                            item: claimed, settings: settings, host: host, remoteDir: remoteDir,
+                            hashes: hashes)
+                    }
+                }
 
             case .localFolder(let url, let sidecar):
                 // No host to pick — the folder IS the single endpoint. The
@@ -416,20 +463,39 @@ public actor HandoffWorker: HandoffKicking {
                     if sidecar {
                         await writeSidecar(item: claimed, root: url)
                     }
+                    // G5 v1.3: audio delivery AFTER the sidecar step (opt-in,
+                    // failure-isolated). Runs inside the still-open security scope.
+                    if deliverAudio {
+                        await deliverAudioLocal(item: claimed, root: url)
+                    }
                 }
-                await recordOutcome(outcome, item: claimed, endpoint: endpoint)
+                await recordOutcome(
+                    outcome, item: claimed, endpoint: endpoint, identity: identity)
+                // G5 v1.3: superseded-payload cleanup AFTER delivery + supersession
+                // (OPT-IN, default OFF; failure-isolated). `.tmp-*` and the sidecar/audio
+                // files are untouched — only THIS meeting's payloads PROVED delivered
+                // here are removed. Same candidates-then-re-read order as the SSH
+                // path (R2-C2), for the same actor-reentrancy reason.
+                if outcome.exitStatus == 0 {
+                    let hashes = await supersededCandidates(item: claimed, endpoint: identity)
+                    if await HandoffDestination.removeSupersededPayloads(from: settingsStore) {
+                        await cleanupSupersededLocal(item: claimed, root: url, hashes: hashes)
+                    }
+                }
             }
         }
     }
 
     /// Shared success/failure recording for both destinations: exit 0 →
     /// delivered (+ supersession sweep); else classify and floor/strike per
-    /// the existing taxonomy.
+    /// the existing taxonomy. `endpoint` is the route that answered (the host
+    /// breaker's key and the observable's "active endpoint"); `identity` is the
+    /// destination it belongs to, recorded as the delivery provenance.
     private func recordOutcome(
-        _ outcome: HandoffTransportOutcome, item: HandoffItem, endpoint: String
+        _ outcome: HandoffTransportOutcome, item: HandoffItem, endpoint: String, identity: String
     ) async {
         if outcome.exitStatus == 0 {
-            await recordDelivery(item: item, host: endpoint)
+            await recordDelivery(item: item, host: endpoint, identity: identity)
             return
         }
         let failureClass = outcome.failureClass
@@ -511,14 +577,248 @@ public actor HandoffWorker: HandoffKicking {
         }
     }
 
+    // MARK: - G5 v1.3: superseded-payload cleanup (failure-isolated)
+
+    /// The explicit deletion-candidate set for a destination cleanup: the OTHER
+    /// payload versions of THIS meeting that Blaise PROVED it delivered to THIS
+    /// destination (`endpoint` — the identity recorded on the delivered row),
+    /// excluding the just-delivered one and each re-validated 64-hex before it
+    /// can reach a path or a remote command. Deletion authority comes from
+    /// Blaise's own delivery provenance, never from a `.json` suffix and never
+    /// from queue membership alone: a non-payload file, a hash-shaped name
+    /// Blaise never wrote, another producer's JSON, a version that was only ever
+    /// enqueued (pending / failed / damaged / superseded), and a version
+    /// delivered to a PREVIOUS destination are all excluded — the last of these
+    /// is what makes a destination switch safe (round-2 R2-C1).
+    private func supersededCandidates(item: HandoffItem, endpoint: String) async -> [String] {
+        let hashes = (try? await repository.deliveredVersionHashes(
+            meetingID: item.meetingID, endpoint: endpoint)) ?? []
+        if let duringCandidateAcquisition { await duringCandidateAcquisition() }
+        return hashes
+            .filter { $0 != item.versionHash && MeetingPaths.isValidVersionHash($0) }
+            .sorted()
+    }
+
+    /// Removes THIS meeting's KNOWN older `<hash>.json` (the `hashes` candidate
+    /// set) from the LOCAL destination meeting dir after a successful delivery +
+    /// supersession (opt-in, default OFF). Anything not in the set is left
+    /// alone — non-payload JSON, a directory, `.tmp-*`, the sidecar `.md` and any
+    /// delivered audio included. FAILURE-ISOLATED: never fails or retries the
+    /// JSON queue item — logged and retried on this meeting's next delivery.
+    ///
+    /// VERIFY BEFORE DELETE (G5 v1.7, round-4 R4-F2): the candidate set names a
+    /// file; the file's own BYTES decide. A candidate is removed only when its
+    /// SHA-256 equals its filename stem — the store is content-addressed, so
+    /// that is the constructive proof that these bytes ARE the payload Blaise's
+    /// records authorize. A resource swapped at this pathname between the
+    /// candidate query and this call then fails toward under-deletion: a
+    /// foreign file either does not hash to the name and survives, or is
+    /// byte-identical to what Blaise delivered here, in which case removing it
+    /// destroys nothing unique.
+    private func cleanupSupersededLocal(item: HandoffItem, root: URL, hashes: [String]) async {
+        let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
+        let candidates = Set(hashes.map { "\($0).json" })
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else {
+            logger.warning(
+                "payload cleanup: could not read the destination dir for \(item.meetingID, privacy: .public) — nothing removed; retried next delivery"
+            )
+            return
+        }
+        for name in names where candidates.contains(name) {
+            let url = dir.appendingPathComponent(name)
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue
+            else { continue }
+            // The content check. Unreadable is a SKIP, never a delete: bytes
+            // that cannot be read cannot be proved to be Blaise's.
+            guard let data = try? Data(contentsOf: url) else {
+                logger.warning(
+                    "payload cleanup: could not read \(name, privacy: .public) for \(item.meetingID, privacy: .public) — not removed (unverified); retried next delivery"
+                )
+                continue
+            }
+            let stem = String(name.dropLast(".json".count))
+            guard EvidencePayloadBuilder.sha256Hex(data) == stem else {
+                logger.notice(
+                    "payload cleanup: \(name, privacy: .public) does not hash to its own name — not Blaise's payload here; skipped"
+                )
+                continue
+            }
+            do {
+                try fm.removeItem(at: url)
+                logger.notice(
+                    "payload cleanup: removed \(name, privacy: .public) for \(item.meetingID, privacy: .public)"
+                )
+            } catch {
+                logger.warning(
+                    "payload cleanup: could not remove \(name, privacy: .public) for \(item.meetingID, privacy: .public): \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
+                )
+            }
+        }
+    }
+
+    /// Removes THIS meeting's KNOWN older `<hash>.json` (the `hashes` candidate
+    /// set, named EXACTLY in the remote command) from the SSH destination
+    /// meeting dir via a second ssh invocation (`cleanupArgv`), the sidecar's
+    /// argv/quoting discipline. FAILURE-ISOLATED exactly like `uploadSidecar`.
+    private func cleanupSupersededSSH(
+        item: HandoffItem, settings: HandoffSettings, host: String, remoteDir: String,
+        hashes: [String]
+    ) async {
+        // Nothing known to be superseded ⇒ no remote command at all (an empty
+        // name list would not even be a valid `for` loop).
+        guard !hashes.isEmpty else { return }
+        let argv = HandoffCommand.cleanupArgv(
+            user: settings.user, host: host, identityFile: settings.identityFile,
+            remoteDir: remoteDir, hashes: hashes)
+        do {
+            let outcome = try await transport.deliver(
+                argv: argv, payload: Data(),
+                timeout: HandoffCommand.watchdogTimeout(payloadByteCount: 0))
+            if outcome.exitStatus != 0 {
+                logger.warning(
+                    "payload cleanup (ssh) for \(item.meetingID, privacy: .public) exit=\(outcome.exitLabel, privacy: .public) — JSON already delivered; retried next delivery"
+                )
+            } else {
+                // The remote command echoes `removed <name>` / `skipped <name>`
+                // (the hash-verification outcome) per candidate; log it so a
+                // remote deletion — and a remote SKIP — is diagnosable after
+                // the fact.
+                let result = String(decoding: outcome.stdout, as: UTF8.self)
+                    .split(whereSeparator: \.isNewline).joined(separator: " ")
+                if !result.isEmpty {
+                    logger.notice(
+                        "payload cleanup (ssh): \(result, privacy: .public) for \(item.meetingID, privacy: .public)"
+                    )
+                }
+            }
+        } catch {
+            logger.warning(
+                "payload cleanup (ssh) for \(item.meetingID, privacy: .public) errored: \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
+            )
+        }
+    }
+
+    // MARK: - G5 v1.3: audio delivery (opt-in, failure-isolated, size-idempotent)
+
+    /// Delivers the meeting's retained `audio*.m4a` set to the LOCAL destination
+    /// meeting dir under their canonical names (opt-in). Retained audio is
+    /// immutable post-encode, so a destination file whose byte length already
+    /// matches is skipped (`stat`); otherwise a temp write + `rename(2)`.
+    /// FAILURE-ISOLATED per file: never fails or retries the JSON queue item.
+    private func deliverAudioLocal(item: HandoffItem, root: URL) async {
+        let sources = database.paths.retainedAudioURLs(item.meetingID)
+        guard !sources.isEmpty else { return }
+        let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            logger.warning(
+                "audio delivery: could not create dir for \(item.meetingID, privacy: .public): \(String(describing: error), privacy: .public)"
+            )
+            return
+        }
+        for source in sources {
+            let name = source.lastPathComponent
+            let dest = dir.appendingPathComponent(name)
+            let localSize = (try? source.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+            // Size-match idempotent skip (audio is immutable post-encode).
+            if let localSize,
+                let destSize = (try? dest.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+                destSize == localSize
+            {
+                continue
+            }
+            // The `.tmp-` prefix (M2) makes the existing 24h stale-temp sweep in
+            // LocalFolderTransport reclaim a crash orphan between copy and rename;
+            // the *.json cleanup glob never touches it.
+            let temp = dir.appendingPathComponent(".tmp-audio-\(item.versionHash)-\(nonce())-\(name)")
+            do {
+                if fm.fileExists(atPath: temp.path) { try fm.removeItem(at: temp) }
+                try fm.copyItem(at: source, to: temp)
+                try LocalFolderTransport.atomicReplace(temp: temp, final: dest)
+            } catch {
+                try? fm.removeItem(at: temp)
+                logger.warning(
+                    "audio delivery: \(name, privacy: .public) for \(item.meetingID, privacy: .public) failed: \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
+                )
+            }
+        }
+    }
+
+    /// Delivers the meeting's retained `audio*.m4a` set to the SSH destination
+    /// meeting dir under their canonical names (opt-in). One `wc -c` pre-check
+    /// per file skips an already-delivered file of matching byte length;
+    /// otherwise the bytes stream via `cat > '<dir>/<name>'` (the sidecar's
+    /// argv/quoting pattern). FAILURE-ISOLATED per file.
+    private func deliverAudioSSH(
+        item: HandoffItem, settings: HandoffSettings, host: String, remoteDir: String
+    ) async {
+        let sources = database.paths.retainedAudioURLs(item.meetingID)
+        guard !sources.isEmpty else { return }
+        for source in sources {
+            let name = source.lastPathComponent
+            // Injection-safety assert: canonical names are `audio[a-z0-9_]*.m4a`,
+            // so they can never break out of the single-quoted remote command.
+            // SKIP rather than emit an unsafe command (the sidecar-slug rule).
+            guard HandoffCommand.isSafeAudioName(name) else {
+                logger.error(
+                    "audio name '\(name, privacy: .public)' is not audio[a-z0-9_]*.m4a; skipping (JSON already delivered)"
+                )
+                continue
+            }
+            // wc -c pre-check: skip when the remote file already matches by size
+            // (retained audio is immutable post-encode). The local size is read
+            // WITHOUT loading the (potentially large) file into memory.
+            let localSize = (try? source.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+            let sizeArgv = HandoffCommand.audioSizeCheckArgv(
+                user: settings.user, host: host, identityFile: settings.identityFile,
+                remoteDir: remoteDir, name: name)
+            if let localSize,
+                let sizeOutcome = try? await transport.deliver(
+                    argv: sizeArgv, payload: Data(),
+                    timeout: HandoffCommand.watchdogTimeout(payloadByteCount: 0)),
+                sizeOutcome.exitStatus == 0,
+                let remoteSize = Int(
+                    String(decoding: sizeOutcome.stdout, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)),
+                remoteSize == localSize
+            {
+                continue
+            }
+            guard let bytes = try? Data(contentsOf: source) else { continue }
+            let writeArgv = HandoffCommand.audioWriteArgv(
+                user: settings.user, host: host, identityFile: settings.identityFile,
+                remoteDir: remoteDir, name: name, byteCount: bytes.count)
+            do {
+                let outcome = try await transport.deliver(
+                    argv: writeArgv, payload: bytes,
+                    timeout: HandoffCommand.watchdogTimeout(payloadByteCount: bytes.count))
+                if outcome.exitStatus != 0 {
+                    logger.warning(
+                        "audio delivery (ssh) \(name, privacy: .public) for \(item.meetingID, privacy: .public) exit=\(outcome.exitLabel, privacy: .public) — JSON already delivered; retried next delivery"
+                    )
+                }
+            } catch {
+                logger.warning(
+                    "audio delivery (ssh) \(name, privacy: .public) for \(item.meetingID, privacy: .public) errored: \(String(describing: error), privacy: .public) — JSON already delivered; retried next delivery"
+                )
+            }
+        }
+    }
+
     // MARK: - Success path
 
-    private func recordDelivery(item: HandoffItem, host: String) async {
-        // The `.delivered` transition and the D12 supersession sweep (older
-        // undelivered versions of this meeting terminally closed —
-        // content-superseded, visible, never silent) run in ONE write
-        // transaction: no crash window between them (impl-audit M-1).
-        guard let (delivered, superseded) = try? await repository.markDelivered(item.id) else { return }
+    private func recordDelivery(item: HandoffItem, host: String, identity: String) async {
+        // The `.delivered` transition (with its destination provenance) and the
+        // D12 supersession sweep (older undelivered versions of this meeting
+        // terminally closed — content-superseded, visible, never silent) run in
+        // ONE write transaction: no crash window between them (impl-audit M-1).
+        guard let (delivered, superseded) = try? await repository.markDelivered(
+            item.id, endpoint: identity)
+        else { return }
         itemFloors[item.id] = nil
         hostStates[host] = HostState()  // healthy again: strikes AND benchExponent reset
         let record = HandoffDeliveryRecord(

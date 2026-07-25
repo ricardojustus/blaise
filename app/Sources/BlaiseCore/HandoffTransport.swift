@@ -67,6 +67,120 @@ public enum HandoffCommand {
         ]
     }
 
+    // MARK: - G5 v1.3: superseded-payload cleanup + audio delivery
+
+    /// Superseded-payload cleanup remote command (G5 v1.3): remove the EXACT
+    /// `<hash>.json` names Blaise knows are OLDER payload versions of THIS
+    /// meeting — never a `*.json` glob, so a non-payload file, a hash-shaped
+    /// name Blaise never wrote, or another producer's JSON in the dir is not a
+    /// deletion candidate. The caller builds `hashes` from the meeting's own
+    /// queue records and re-validates each as 64-hex (`isValidVersionHash`)
+    /// before it reaches this interpolation; `remoteDir` is validated upstream
+    /// (`HandoffSettings.isValidRemoteRoot` + ULID). The single-quote model is
+    /// the whole injection defense, unchanged. Each name's outcome is echoed to
+    /// stdout so the sweep leaves an auditable record the worker logs. `[ -f ]`
+    /// skips an absent name and never removes a directory; `rm -f --` so a
+    /// dash-leading name is never parsed as options.
+    ///
+    /// VERIFY BEFORE DELETE (G5 v1.7, round-4 R4-F2): the remote file's
+    /// own bytes decide, using the same `shasum -a 256` the DELIVERY command
+    /// already trusts for verify-before-rename. `${f%.json}` is the name's own
+    /// stem — no new interpolated value, so the single-quote model is unchanged
+    /// (the hashes are 64-hex-validated upstream). A remote file that does not
+    /// hash to its own name is not the payload Blaise delivered here and is
+    /// echoed as `skipped`, never removed.
+    public static func cleanupRemoteCommand(remoteDir: String, hashes: [String]) -> String {
+        let names = hashes.map { "'\($0).json'" }.joined(separator: " ")
+        return "cd '\(remoteDir)' 2>/dev/null || exit 0; "
+            + "for f in \(names); do [ -f \"$f\" ] || continue; "
+            + "A=$(/usr/bin/shasum -a 256 \"$f\" | cut -d' ' -f1); "
+            + "if [ \"$A\" = \"${f%.json}\" ]; then echo \"removed $f\"; rm -f -- \"$f\"; "
+            + "else echo \"skipped $f\"; fi; done"
+    }
+
+    /// Full ssh argv for the superseded-payload cleanup — same option set +
+    /// identity handling as `argv`, empty stdin.
+    public static func cleanupArgv(
+        user: String, host: String, identityFile: String, remoteDir: String, hashes: [String]
+    ) -> [String] {
+        sshInvocation(
+            user: user, host: host, identityFile: identityFile,
+            remoteCommand: cleanupRemoteCommand(remoteDir: remoteDir, hashes: hashes))
+    }
+
+    /// Audio size pre-check remote command (G5 v1.3): the byte count of an
+    /// already-delivered audio file, or nothing when it is absent (its stdout is
+    /// read by the worker to skip an unchanged file). `name` is a canonical
+    /// `audio*.m4a` name asserted `isSafeAudioName` by the caller.
+    public static func audioSizeCheckRemoteCommand(remoteDir: String, name: String) -> String {
+        "wc -c < '\(remoteDir)/\(name)' 2>/dev/null"
+    }
+
+    /// Audio write remote command (G5 v1.3, M2): stream the audio bytes on stdin
+    /// to a REMOTE `.tmp-audio-<name>`, check the received byte count against the
+    /// locally known `byteCount`, and only THEN `mv` it into place — a died
+    /// stream (a watchdog kill whose channel closes cleanly enough for `cat` to
+    /// see EOF and exit 0) leaves a short temp that fails the check, never a
+    /// truncated file at the visible name. The `.tmp-` prefix lets the JSON
+    /// command's stale-temp sweep (`find … -name '.tmp-*' -mtime +1 -delete`)
+    /// reclaim the orphan. The sidecar's argv/quoting pattern; `name` is asserted
+    /// `isSafeAudioName` and `byteCount` is a decimal integer (no new
+    /// interpolated-value class).
+    public static func audioWriteRemoteCommand(remoteDir: String, name: String, byteCount: Int) -> String {
+        let temp = "\(remoteDir)/.tmp-audio-\(name)"
+        return "mkdir -p '\(remoteDir)' && cat > '\(temp)' && "
+            + "[ $(wc -c < '\(temp)') -eq \(byteCount) ] && "
+            + "mv '\(temp)' '\(remoteDir)/\(name)'"
+    }
+
+    public static func audioSizeCheckArgv(
+        user: String, host: String, identityFile: String, remoteDir: String, name: String
+    ) -> [String] {
+        sshInvocation(
+            user: user, host: host, identityFile: identityFile,
+            remoteCommand: audioSizeCheckRemoteCommand(remoteDir: remoteDir, name: name))
+    }
+
+    public static func audioWriteArgv(
+        user: String, host: String, identityFile: String, remoteDir: String, name: String,
+        byteCount: Int
+    ) -> [String] {
+        sshInvocation(
+            user: user, host: host, identityFile: identityFile,
+            remoteCommand: audioWriteRemoteCommand(
+                remoteDir: remoteDir, name: name, byteCount: byteCount))
+    }
+
+    /// A retained-audio canonical file name is injection-safe by construction
+    /// (`audio[a-z0-9_]*.m4a`): no `'`, so it can never break out of the
+    /// single-quoted remote command. The worker asserts this and SKIPS rather
+    /// than ever emit an unsafe command (the sidecar-slug discipline).
+    public static func isSafeAudioName(_ name: String) -> Bool {
+        guard name.hasPrefix("audio"), name.hasSuffix(".m4a") else { return false }
+        let middle = name.dropFirst("audio".count).dropLast(".m4a".count)
+        return middle.allSatisfy { $0 == "_" || ($0 >= "a" && $0 <= "z") || ($0 >= "0" && $0 <= "9") }
+    }
+
+    /// Shared ssh invocation (option set + identity + `user@host` + the trailing
+    /// remote command) for the G5 v1.3 cleanup/audio commands. Byte-identical
+    /// option set to `argv`/`sidecarArgv`.
+    private static func sshInvocation(
+        user: String, host: String, identityFile: String, remoteCommand: String
+    ) -> [String] {
+        [
+            "/usr/bin/ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=2",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "IdentitiesOnly=yes",
+            "-i", (identityFile as NSString).expandingTildeInPath,
+            "\(user)@\(host)",
+            remoteCommand,
+        ]
+    }
+
     /// 16 lowercase hex characters — inside the single-quote-safe charset
     /// every other interpolated value is validated against.
     public static func makeNonce() -> String {
@@ -154,16 +268,21 @@ public struct HandoffTransportOutcome: Sendable {
     /// `exitLabel` reads "local" rather than "timeout" (L-6): a missing folder
     /// or permission error is not a timeout.
     public var localFolder: Bool
+    /// Captured child stdout (G5 v1.3): the SSH audio size pre-check reads the
+    /// remote `wc -c` output from here. Empty for the JSON/sidecar deliveries
+    /// (their remote commands write nothing to stdout) and for local delivery.
+    public var stdout: Data
 
     public init(
         exitStatus: Int32?, stderrTail: String, timedOut: Bool, cancelled: Bool = false,
-        localFolder: Bool = false
+        localFolder: Bool = false, stdout: Data = Data()
     ) {
         self.exitStatus = exitStatus
         self.stderrTail = stderrTail
         self.timedOut = timedOut
         self.cancelled = cancelled
         self.localFolder = localFolder
+        self.stdout = stdout
     }
 
     public var failureClass: HandoffFailureClass {
@@ -204,7 +323,8 @@ public struct SSHHandoffTransport: HandoffTransporting {
             exitStatus: outcome.exitStatus,
             stderrTail: outcome.stderrTail,
             timedOut: outcome.timedOut,
-            cancelled: outcome.cancelled
+            cancelled: outcome.cancelled,
+            stdout: outcome.stdout
         )
     }
 }

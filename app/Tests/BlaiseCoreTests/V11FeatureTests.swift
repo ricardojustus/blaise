@@ -334,7 +334,7 @@ import Testing
 
         // D12: delivery of the new payload terminally supersedes the old row.
         let (_, superseded) = try await HandoffRepository(database: harness.database)
-            .markDelivered(newItem.id)
+            .markDelivered(newItem.id, endpoint: testDestinationIdentity)
         #expect(superseded == [firstItem.id])
         let oldRow = try #require(try await harness.database.pool.read { db in
             try HandoffItem.fetchOne(db, key: firstItem.id)

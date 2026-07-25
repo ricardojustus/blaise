@@ -309,6 +309,8 @@ private struct NotesPane: View {
     @State private var showSubstitutionReport = false
     /// G2 §5: the correct-name popover.
     @State private var showCorrectName = false
+    /// G15: the participant-confirmation sheet (opened from the pending banner).
+    @State private var showParticipantConfirm = false
 
     /// Anchor id for the user-action box ("My Action Items" opens the detail here).
     static let userActionBoxAnchor = "user-action-box"
@@ -341,6 +343,12 @@ private struct NotesPane: View {
                     if Design.direction == .fluido, isNew {
                         shineTick += 1
                     }
+                }
+                // G15: the participant-confirmation sheet (opened from the
+                // pending banner or the notification).
+                .sheet(isPresented: $showParticipantConfirm) {
+                    ParticipantConfirmSheet(
+                        meeting: meeting, env: appEnv, isPresented: $showParticipantConfirm)
                 }
         }
     }
@@ -391,7 +399,18 @@ private struct NotesPane: View {
                     }
                 }
                 if let error = meeting.lastProcessingError, !error.isEmpty {
-                    if NotesPendingClass.isPending(error) {
+                    if NotesPendingClass.isAwaitingParticipantConfirmation(error) {
+                        // G15: the participant-confirmation gate — calm banner
+                        // plus the action that opens the confirm sheet.
+                        HStack(spacing: 10) {
+                            QuietBanner(
+                                text: "Confirm the participants to finish the notes",
+                                systemImage: "person.2", tint: .secondary,
+                                accessibilityPrefix: "Confirm participants")
+                            Button("Confirm Participants…") { showParticipantConfirm = true }
+                                .buttonStyle(.borderless)
+                        }
+                    } else if NotesPendingClass.isPending(error) {
                         // D17: calm, distinct from failed — keyed on the
                         // reserved prefix, never on free-form text.
                         QuietBanner(
@@ -418,6 +437,9 @@ private struct NotesPane: View {
                         isEnabled: Design.direction == .fluido && !reduceMotion)
                 } else if meeting.status == .processing || meeting.status == .recording {
                     Text("Notes will appear here when processing finishes.")
+                        .foregroundStyle(.secondary)
+                } else if NotesPendingClass.isAwaitingParticipantConfirmation(meeting.lastProcessingError) {
+                    Text("The transcript is ready. Confirm the participants above and the notes are written automatically.")
                         .foregroundStyle(.secondary)
                 } else if NotesPendingClass.isPending(meeting.lastProcessingError) {
                     Text("The transcript is ready. Notes will complete automatically when the notes engine becomes available.")
@@ -1297,7 +1319,10 @@ private struct TranscriptRow: View {
 
     @ViewBuilder
     private var speakerLabelView: some View {
-        let isStale = rename?.stale ?? false
+        // NH-E: an `unattributed` rename is label-literal and always applied, so
+        // it NEVER renders the re-confirmation badge — even a legacy stale row.
+        let isStale = (rename?.stale ?? false)
+            && !SpeakerRename.isAnchorless(segment.speakerLabel)
         HStack(spacing: 5) {
             Button {
                 if renameable { showRename = true }

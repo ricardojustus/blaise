@@ -197,6 +197,17 @@ public final class HandoffSettingsModel {
     public private(set) var localFolderPath = ""
     /// Markdown sidecar toggle for the local folder (default ON).
     public var markdownSidecar = true
+    /// G5 v1.3: REMOVE superseded payloads at the destination. Default OFF ⇒
+    /// delivered payloads accumulate, preserving the published "older versions
+    /// are not deleted" contract. ON ⇒ a correction/regeneration replaces the
+    /// delivered evidence (one current payload per meeting).
+    /// Destination-independent. Default-OFF is operator-ratified: deleted
+    /// evidence is unrecoverable, an untidy folder is not.
+    public var removeSupersededPayloads = false
+    /// G5 v1.3: deliver the meeting's retained audio to the destination. Default
+    /// OFF (the privacy default). ON copies `audio*.m4a` — a syncing destination
+    /// then means audio leaves the machine. Destination-independent.
+    public var deliverAudio = false
     /// G14: "Include memory digest" — the second machine-facing render that
     /// the knowledge graph's graph extractor reads. Default ON. OFF ⇒ no second synthesis
     /// call and no `memory_digest` on the payload (absent ⇒ skip to the knowledge graph).
@@ -228,6 +239,8 @@ public final class HandoffSettingsModel {
             ?? nil ?? ""
         markdownSidecar = (try? await settings.get(HandoffDestination.Key.localMarkdownSidecar, as: Bool.self))
             ?? nil ?? true
+        removeSupersededPayloads = await HandoffDestination.removeSupersededPayloads(from: settings)
+        deliverAudio = await HandoffDestination.deliverAudio(from: settings)
         includeMemoryDigest = await MemoryDigestSettings.isEnabled(in: settings)
         verifyMemoryDigest = await MemoryDigestSettings.isVerifyEnabled(in: settings)
         validationError = validationMessage(of: current)
@@ -264,22 +277,26 @@ public final class HandoffSettingsModel {
     /// Returns whether validation passed.
     @discardableResult
     public func save() async -> Bool {
+        let candidate = HandoffSettings(
+            user: user.trimmingCharacters(in: .whitespaces),
+            identityFile: identityFile.trimmingCharacters(in: .whitespaces),
+            hosts: hosts,
+            remoteRoot: remoteRoot.trimmingCharacters(in: .whitespaces))
         // Persist the active destination kind (G5). SSH fields are always
         // persisted (so switching back keeps them); the sidecar toggle is
         // persisted for the local folder.
         try? await settings.set(HandoffDestination.Key.kind, to: destinationKind)
         try? await settings.set(HandoffDestination.Key.localMarkdownSidecar, to: markdownSidecar)
+        // G5 v1.3 destination-independent toggles (forward deliveries only).
+        try? await settings.set(
+            HandoffDestination.Key.removeSupersededPayloads, to: removeSupersededPayloads)
+        try? await settings.set(HandoffDestination.Key.deliverAudio, to: deliverAudio)
         // G14: persist the memory-digest toggle (forward renders only — it
         // never rewrites already-minted payloads).
         try? await settings.set(MemoryDigestSettings.enabledKey, to: includeMemoryDigest)
         // Persist the verify/repair toggle (forward renders only). The dev env
         // override BLAISE_DIGEST_VERIFY=1 forces the pass on regardless of this.
         try? await settings.set(MemoryDigestSettings.verifyEnabledKey, to: verifyMemoryDigest)
-        let candidate = HandoffSettings(
-            user: user.trimmingCharacters(in: .whitespaces),
-            identityFile: identityFile.trimmingCharacters(in: .whitespaces),
-            hosts: hosts,
-            remoteRoot: remoteRoot.trimmingCharacters(in: .whitespaces))
         try? await settings.set(HandoffSettings.Key.user, to: candidate.user)
         try? await settings.set(HandoffSettings.Key.identityFile, to: candidate.identityFile)
         try? await settings.set(HandoffSettings.Key.hosts, to: candidate.hosts)

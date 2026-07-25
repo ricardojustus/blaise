@@ -63,6 +63,17 @@ public enum PipelineEvent: Sendable, Equatable {
     /// unified-logged). Lets Settings show what a run actually loaded, not just
     /// its own on-demand "Check now".
     case glossaryLoaded(MeetingID, GlossaryDiagnostics, loadedAt: Date)
+    /// G15: the participant-confirmation gate parked this meeting for the FIRST
+    /// time (a fresh park — NOT a self-heal re-park). The app posts the
+    /// "Confirm participants — <title>" notification once off this event, so the
+    /// notification fires once per park, never per resume re-park.
+    case participantConfirmationNeeded(MeetingID, title: String)
+    /// G15 §2a: the run just started and this meeting still has nobody in its
+    /// attendee list — put the question to the user NOW, while they are still at
+    /// the computer, instead of waiting for the notes stage to park. Raised at
+    /// most ONCE per meeting per session. The app answers it with the sheet when
+    /// Blaise is frontmost and the `participantConfirm` notification otherwise.
+    case participantAskRaised(MeetingID, title: String)
 }
 
 public struct PipelineError: Error, Sendable, CustomStringConvertible {
@@ -239,6 +250,17 @@ public actor ProcessingPipeline {
     private let meetEventsSweeper: any MeetEventsSweeping
     private let tempDirectory: URL
     private let now: @Sendable () -> Date
+    /// G15 R2-H1 pin: a suspension point in the window between the gate's
+    /// pending decision and the participant marker's commit — the window a
+    /// Confirm or Skip can land in. nil in production (one nil check on the
+    /// notes-pending path); a test uses it to answer at exactly that moment
+    /// instead of hoping a concurrent task lands there.
+    private let duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)?
+    /// G15 R3-H1 pin: a suspension point INSIDE the run-entry ask, i.e. in the
+    /// window between `.runStarted` (which makes Cancel visible) and the ask's
+    /// return. nil in production (one nil check per run entry); a test uses it
+    /// to click Cancel at exactly that moment instead of racing it.
+    private let duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)?
     private let chain = EngineTaskChain()
     private let logger = Logger(subsystem: BlaiseBundle.identifier, category: "pipeline")
     private var eventContinuations: [UUID: AsyncStream<PipelineEvent>.Continuation] = [:]
@@ -250,6 +272,22 @@ public actor ProcessingPipeline {
     /// IS the idleness key the §1 no-op rule needs: a meeting with no run in
     /// flight has no token, so its cancel is a no-op.
     private var cancelTokens: [MeetingID: RunCancelHandle] = [:]
+
+    /// G15 §2 ask bookkeeping, all consumed by the notes-stage gate.
+    /// `participantStopAsks`: the confirmation was already raised for this
+    /// meeting's run, so the park must not post a second notification (and it
+    /// is the single-ask latch — a second evaluation cannot raise it twice).
+    /// `participantStopSkips`: the user answered Skip before there was a
+    /// pending marker to carry the answer. `participantAskTimes`: when the
+    /// question was actually put to the user, which is what the auto-skip
+    /// window is measured from. All in-memory by construction — the ask and the
+    /// run that raised it live in one app session; a session that dies before
+    /// the notes stage re-asks (the meeting parks, visibly, on the next run),
+    /// and a restarted five-minute window fails toward asking, never toward
+    /// silently skipping.
+    private var participantStopAsks: Set<MeetingID> = []
+    private var participantStopSkips: Set<MeetingID> = []
+    private var participantAskTimes: [MeetingID: Date] = [:]
 
     /// The in-flight run's cancel token plus its CLASS (the status write is
     /// class-aware: process-class cancel writes `cancelled`; regeneration and
@@ -285,7 +323,9 @@ public actor ProcessingPipeline {
         handoffKicker: any HandoffKicking = NoopHandoffKicker(),
         meetEventsSweeper: any MeetEventsSweeping = NoopMeetEventsSweeper(),
         tempDirectory: URL = FileManager.default.temporaryDirectory,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
+        duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil
     ) {
         self.database = database
         self.registry = registry
@@ -297,6 +337,8 @@ public actor ProcessingPipeline {
         self.meetEventsSweeper = meetEventsSweeper
         self.tempDirectory = tempDirectory
         self.now = now
+        self.duringParticipantParkCommit = duringParticipantParkCommit
+        self.duringRunEntryAsk = duringRunEntryAsk
     }
 
     /// Convenience overload for a CONSTANT vocabulary stack (tests, regression
@@ -309,7 +351,9 @@ public actor ProcessingPipeline {
         handoffKicker: any HandoffKicking = NoopHandoffKicker(),
         meetEventsSweeper: any MeetEventsSweeping = NoopMeetEventsSweeper(),
         tempDirectory: URL = FileManager.default.temporaryDirectory,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
+        duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil
     ) {
         self.init(
             database: database, registry: registry, diarizer: diarizer,
@@ -318,7 +362,9 @@ public actor ProcessingPipeline {
                     vocabulary: vocabulary, diagnostics: GlossaryDiagnostics(), loadedAt: now())
             },
             handoffKicker: handoffKicker,
-            meetEventsSweeper: meetEventsSweeper, tempDirectory: tempDirectory, now: now)
+            meetEventsSweeper: meetEventsSweeper, tempDirectory: tempDirectory, now: now,
+            duringParticipantParkCommit: duringParticipantParkCommit,
+            duringRunEntryAsk: duringRunEntryAsk)
     }
 
     // MARK: - Progress
@@ -781,22 +827,31 @@ public actor ProcessingPipeline {
             let timestamp = self.now()
             let diarization = await self.loadPersistedDiarization(meetingID: meetingID)
                 ?? DiarizationOutput(segments: [], speakerCount: 0)
-            try await self.database.pool.write { db in
-                try SpeakerRenameStore.upsert(
-                    db, meetingID: meetingID, speakerLabel: speakerLabel, name: name,
-                    diarization: diarization, now: timestamp)
-            }
+            // M1: build the rename row ONCE and commit it ATOMICALLY with the
+            // transcript it is applied to (a separate upfront upsert opened a
+            // crash window: row committed but the transcript still old, which the
+            // live rename-render in MeetingDetailView then showed while the notes
+            // lagged). The row is applied to the segments in memory below and
+            // saved inside `persistTranscript`'s transaction.
+            let renameRow = SpeakerRenameStore.makeRow(
+                meetingID: meetingID, speakerLabel: speakerLabel, name: name,
+                diarization: diarization, now: timestamp)
 
             guard let meeting = try await MeetingRepository(database: self.database)
                 .fetch(meetingID), meeting.status == .ready,
                 !NotesPendingClass.isPending(meeting.lastProcessingError),
                 var notes = try await NotesRepository(database: self.database)
                     .fetch(meetingID: meetingID)
-            else { return false }
+            else {
+                // Non-ready / pending: no transcript to re-mint — record the row
+                // alone; the next content run applies it.
+                try await self.database.pool.write { db in try renameRow.save(db) }
+                return false
+            }
 
             // Re-apply all rename rows over the persisted transcript and
             // re-persist (content mutation → updatedAt bumps before the mint).
-            let renames = try await self.database.pool.read { db in
+            let existing = try await self.database.pool.read { db in
                 try SpeakerRenameStore.all(db, meetingID: meetingID)
             }
             let segments = try await TranscriptRepository(database: self.database)
@@ -814,17 +869,25 @@ public actor ProcessingPipeline {
                 notes.memoryDigest = NameSubstitution.applyTextCorrection(
                     text: digest, original: priorName, replacement: name).text
             }
-            let renamed = SpeakerRenameStore.applyRenames(renames, to: segments)
+            // Effective rename set = existing rows (this label's prior row dropped)
+            // plus the new row, matching what the store would hold post-upsert.
+            let effective = existing.filter { $0.speakerLabel != speakerLabel } + [renameRow]
+            let renamed = SpeakerRenameStore.applyRenames(effective, to: segments)
             if renamed != segments,
                 let asrProvenance = meeting.asrProvenance,
                 let dominantLanguage = meeting.dominantLanguage
             {
                 _ = try await self.database.persistTranscript(
                     meetingID: meetingID, segments: renamed, asrProvenance: asrProvenance,
-                    dominantLanguage: dominantLanguage, updatedAt: timestamp)
+                    dominantLanguage: dominantLanguage, updatedAt: timestamp,
+                    additionalWrites: { db in try renameRow.save(db) })
                 try await self.exportTranscriptJSON(
                     meetingID: meetingID, segments: renamed,
                     provenance: asrProvenance, dominantLanguage: dominantLanguage)
+            } else {
+                // No transcript change (stale row / same name): record the row
+                // alone — there is no transcript re-persist to fold it into.
+                try await self.database.pool.write { db in try renameRow.save(db) }
             }
 
             // Deterministic re-mint (the renameMeeting pattern): re-render the
@@ -903,6 +966,7 @@ public actor ProcessingPipeline {
         let clean = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return 0 }
         return try await chain.run {
+            let timestamp = self.now()
             guard let meeting = try await MeetingRepository(database: self.database)
                 .fetch(meetingID), meeting.status == .ready,
                 !NotesPendingClass.isPending(meeting.lastProcessingError),
@@ -910,8 +974,22 @@ public actor ProcessingPipeline {
                     .fetch(meetingID: meetingID)
             else { return 0 }
 
+            // ONE effective replacement for EVERY layer this correction touches
+            // (notes, digest, rename rows, transcript, payload), resolved ONCE
+            // before anything is mutated: the §4 store rule-1/3 normalization can
+            // map the typed surface onto a different name (a `Marsa → Dana Marsh`
+            // store row), and applying it to the speaker layer alone would leave
+            // the re-minted payload's notes and transcript disagreeing about the
+            // person just corrected. M-3 still stands: the rename-input X-(Y)
+            // parenthetical heuristic is rename-input only, so a surface that no
+            // store/polish rule resolves is used verbatim in all layers.
+            let renameContext = await self.renameNormalizationContext()
+            let resolved = NameSubstitution.normalizeRename(clean, context: renameContext)
+            let effective =
+                resolved == NameSubstitution.normalizeRenameInput(clean) ? clean : resolved
+
             let (edited, count) = NameSubstitution.applyNoteCorrection(
-                notes: notes.structured, original: original, replacement: clean,
+                notes: notes.structured, original: original, replacement: effective,
                 allOccurrences: allOccurrences, occurrenceIndex: occurrenceIndex)
             guard count > 0 else { return 0 }
             // M3: a name correction also rewrites the STORED digest string
@@ -920,13 +998,96 @@ public actor ProcessingPipeline {
             // lockstep with the notes. A non-name edit never reaches here.
             if let digest = notes.memoryDigest {
                 notes.memoryDigest = NameSubstitution.applyTextCorrection(
-                    text: digest, original: original, replacement: clean).text
+                    text: digest, original: original, replacement: effective).text
             }
             let user = await self.userIdentity()
-            let segments = try await TranscriptRepository(database: self.database)
+            var segments = try await TranscriptRepository(database: self.database)
                 .segments(meetingID: meetingID)
+
+            // G2 §5 speaker-layer unification (NH-D): when the ORIGINAL surface
+            // fold-equals the CURRENT FULL display name of one or more resolved
+            // speaker labels, the same confirmed correction ALSO corrects the
+            // speaker layer — a §4 rename row per matching label (replacement
+            // normalized through store rule-1/3, anchor per §4), re-applied to the
+            // persisted transcript + the exported transcript JSON in THIS same
+            // re-mint. Invariant: the re-minted payload's transcript speaker names
+            // and its notes can never disagree about a person the user just
+            // corrected. Fold-equality is against the FULL name (a bare-surname
+            // prose correction never touches a "Dana Rosso" label); the notes
+            // occurrence/apply-to-all scoping governs NOTES fields only — a label
+            // is a single value and always updates wholly.
+            let originalFold = VocabNormalization.canonicalMode(original)
+            let matchingLabels = Set(segments.compactMap { segment -> String? in
+                // The reserved `user` mic-track label is EXCLUDED: it is
+                // non-renameable in the UI, so a rename row keyed to it could
+                // never be re-confirmed and would render a permanent
+                // "needs re-confirmation" badge. The owner's naming flows from
+                // UserIdentity, not from rename rows, so skipping is correct.
+                guard segment.speakerLabel != TranscriptSegment.userLabel,
+                    let name = segment.speakerName, !name.isEmpty,
+                    VocabNormalization.canonicalMode(name) == originalFold
+                else { return nil }
+                return segment.speakerLabel
+            })
+            if !matchingLabels.isEmpty,
+                let asrProvenance = meeting.asrProvenance,
+                let dominantLanguage = meeting.dominantLanguage
+            {
+                if !effective.isEmpty {
+                    let diarization = await self.loadPersistedDiarization(meetingID: meetingID)
+                        ?? DiarizationOutput(segments: [], speakerCount: 0)
+                    // M1: build the rename rows ONCE, apply them to segments in
+                    // memory, and commit them ATOMICALLY with the transcript
+                    // persist (no window where the rows exist but the transcript
+                    // and notes still show the old name).
+                    let existing = try await self.database.pool.read { db in
+                        try SpeakerRenameStore.all(db, meetingID: meetingID)
+                    }
+                    let newRows = matchingLabels.sorted().map { label in
+                        SpeakerRenameStore.makeRow(
+                            meetingID: meetingID, speakerLabel: label, name: effective,
+                            diarization: diarization, now: timestamp)
+                    }
+                    let newLabels = Set(newRows.map(\.speakerLabel))
+                    let effective = existing.filter { !newLabels.contains($0.speakerLabel) } + newRows
+                    let renamed = SpeakerRenameStore.applyRenames(effective, to: segments)
+                    if renamed != segments {
+                        _ = try await self.database.persistTranscript(
+                            meetingID: meetingID, segments: renamed, asrProvenance: asrProvenance,
+                            dominantLanguage: dominantLanguage, updatedAt: timestamp,
+                            additionalWrites: { db in for row in newRows { try row.save(db) } })
+                        try await self.exportTranscriptJSON(
+                            meetingID: meetingID, segments: renamed,
+                            provenance: asrProvenance, dominantLanguage: dominantLanguage)
+                        segments = renamed
+                    } else {
+                        // No transcript change (stale rows / already renamed):
+                        // record the rows alone — nothing to fold into.
+                        try await self.database.pool.write { db in
+                            for row in newRows { try row.save(db) }
+                        }
+                    }
+                }
+            } else if !matchingLabels.isEmpty {
+                // L3: persistTranscript is the SOLE writer of transcript_segment and
+                // sets both provenance fields in the same transaction, so a
+                // resolved-speaker meeting ALWAYS has them — a nil here is
+                // unreachable. If it ever occurs, silently skipping the transcript
+                // persist while still writing rename rows would reintroduce the
+                // exact notes/transcript divergence NH-D exists to kill, so fail
+                // loudly and skip the speaker layer ENTIRELY (no rename rows). The
+                // notes correction below still applies.
+                assertionFailure(
+                    "NH-D: resolved speaker labels but nil asrProvenance/dominantLanguage — persistTranscript writes both atomically with the segments; unreachable")
+                self.logger.error(
+                    "NH-D skipped for \(meetingID, privacy: .public): matching labels but nil provenance; speaker layer left unchanged, no rename rows written"
+                )
+            }
+
             // G13: neutralize S-labels as the LAST write to notes.structured
-            // before the render (the corrected value flows through it).
+            // before the render (the corrected value flows through it). The
+            // label map reads the just-written rename rows, so a NH-D correction
+            // renders the corrected speaker name into notes owners too.
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: edited, labelMap: labelMap, language: notes.language).notes
@@ -937,7 +1098,6 @@ public actor ProcessingPipeline {
                 to: self.database.paths.notesURL(meetingID), options: .atomic)
 
             // Bump updatedAt (content mutation) before the mint, then re-mint.
-            let timestamp = self.now()
             let finalMeeting = try await self.database.pool.write { db -> Meeting in
                 guard var m = try Meeting.fetchOne(db, key: meetingID) else {
                     throw BlaiseDatabaseError.meetingNotFound(meetingID)
@@ -1045,8 +1205,23 @@ public actor ProcessingPipeline {
         // status-write discipline — a regeneration never writes a `cancelled`
         // status (C1 no-regress), so its cancel is status-silent. Removed on
         // every exit path below.
+        //
+        // ORDER IS LOAD-BEARING (round-3 R3-H1): the token is installed before
+        // ANY await in this function. `.runStarted` is what makes the Cancel
+        // button visible, `cancel` defines "in flight" as "a token is
+        // installed", and the actor is reentrant at every suspension — so a
+        // click landing while the run is suspended below (the ask's settings /
+        // notes reads) would otherwise no-op silently against a nil token.
         let cancelToken = installCancelToken(meetingID: meetingID, statusSilent: regeneration)
         defer { removeCancelToken(meetingID: meetingID, token: cancelToken) }
+
+        // G15 §2a: ask who was there NOW — the run has just claimed the meeting
+        // and `writeRunEntry` has absorbed any pending Meet/Slack roster, so
+        // this is the earliest moment the question is honest. Nothing waits on
+        // the answer: the stages below run concurrently with the sheet, and an
+        // answer that lands before the notes stage means the meeting never parks.
+        await raiseParticipantAskAtRunEntry(
+            meeting: meeting, regeneration: regeneration, token: cancelToken)
 
         let context = RunContext(meetingID: meetingID, regeneration: regeneration)
         context.cancelToken = cancelToken
@@ -1116,9 +1291,14 @@ public actor ProcessingPipeline {
     }
 
     private func runStages(
-        meeting: Meeting, sourceWAV: URL?, tempWAV: URL, tempMicWAV: URL, captured: Bool,
-        context: RunContext, vocabulary: PipelineVocabulary
+        meeting meetingAtEntry: Meeting, sourceWAV: URL?, tempWAV: URL, tempMicWAV: URL,
+        captured: Bool, context: RunContext, vocabulary: PipelineVocabulary
     ) async throws -> PipelineRunRecord {
+        // G15 §2a: the participant confirmation is raised at run entry,
+        // so the user's answer can land while this run is still transcribing —
+        // the attendees are re-read at the notes stage below (the only field
+        // that answer writes).
+        var meeting = meetingAtEntry
         let meetingID = meeting.id
         let user = await userIdentity()
 
@@ -1188,6 +1368,18 @@ public actor ProcessingPipeline {
                 audioDuration: audioDuration, eventNames: eventNames)
         }
 
+        // G15 §2 (the run-entry ask): pick up an answer that landed while this run
+        // was transcribing. Confirm writes attendees and nothing else, so the
+        // fresh names are merged in without disturbing any other column of the
+        // run's snapshot — the gate below then simply does not fire, and the
+        // notes request carries the confirmed names.
+        if meeting.attendees.isEmpty,
+            let fresh = try? await MeetingRepository(database: database).fetch(meetingID),
+            !fresh.attendees.isEmpty
+        {
+            meeting.attendees = fresh.attendees
+        }
+
         // 9. notes — NO availability pre-gate (C2 amendment for this slot):
         // ceiling/budget/config conditions arrive as THROWN triggers so the
         // one-hop fallback can fire (lightweight engines only — D17; a
@@ -1203,8 +1395,26 @@ public actor ProcessingPipeline {
             // the resume request stays byte-equal to this stage-9 request.
             groundedPersonHints: GroundedPersonHints.groundedPersonHints(
                 vocabulary: vocabulary, attendees: meeting.attendees, segments: segments))
+        // G15: the participant-confirmation gate is evaluated ONCE here, at
+        // notes-stage entry (transcript + diarization already produced and about
+        // to persist). When it fires, the run resolves to notes-pending with the
+        // reserved reason WITHOUT calling the notes engine — transcript still
+        // persists (stage 11 below), audio is retained, no handoff is enqueued —
+        // and the app posts the confirm notification once off the emitted event.
+        let hasNotesBeforeStage9 = await hasPersistedNotes(meetingID)
         let notesOutcome = try await stage(.notes, context, meetingID) {
-            try await self.generateNotesWithFallback(notesRequest, context: context)
+            if await self.shouldGateForParticipants(
+                meeting: meeting, hasExistingNotes: hasNotesBeforeStage9)
+            {
+                if !NotesPendingClass.isAwaitingParticipantConfirmation(meeting.lastProcessingError),
+                    !self.participantAskWasRaised(meetingID)
+                {
+                    self.emit(.participantConfirmationNeeded(meetingID, title: meeting.title))
+                }
+                return NotesStageOutcome.pending(
+                    reason: NotesPendingClass.awaitingParticipantConfirmation)
+            }
+            return try await self.generateNotesWithFallback(notesRequest, context: context)
         }
         var producedNotes: NotesResult?
         if case .produced(let result) = notesOutcome {
@@ -1277,8 +1487,17 @@ public actor ProcessingPipeline {
         guard let notesResult = producedNotes else {
             if case .pending(let reason) = notesOutcome {
                 context.record.notesPending = reason
-                await writeNotesPending(
+                if reason == NotesPendingClass.awaitingParticipantConfirmation,
+                    let duringParticipantParkCommit
+                {
+                    await duringParticipantParkCommit(meetingID)
+                }
+                let attendeesWritten = await writeNotesPending(
                     meetingID: meetingID, regeneration: context.record.regeneration, reason: reason)
+                if reason == NotesPendingClass.awaitingParticipantConfirmation {
+                    resumeIfParticipantsWereAnsweredLate(
+                        meetingID: meetingID, attendeesWritten: attendeesWritten)
+                }
             }
             await writeTerminalNote(
                 meetingID: meetingID, fallback: nil,
@@ -1766,6 +1985,254 @@ public actor ProcessingPipeline {
         encoder.outputFormatting = [.sortedKeys]
         guard let data = try? encoder.encode(output) else { return }
         try? data.write(to: database.paths.diarizationURL(meetingID), options: .atomic)
+    }
+
+    // MARK: - G15 participant-confirmation gate
+
+    /// The G15 gate predicate, evaluated ONCE at notes-stage entry. Fires iff:
+    /// the opt-in preference is ON; the meeting's attendees are empty (attendees
+    /// from ANY source — calendar merge, import, Meet/Slack roster absorption —
+    /// satisfy the gate, so a rostered/calendar-merged meeting never gates); the
+    /// meeting has no persisted notes yet (regeneration of a noted meeting never
+    /// gates — corrections and G2 renames are the tool there); AND the meeting is
+    /// not already parked on a DIFFERENT notes-pending reason. That last clause
+    /// is what makes a Skip durable with no new column (§3/AC5): a skipped
+    /// meeting that then engine-parks carries the engine marker, so the next
+    /// self-heal proceeds to the engine check instead of re-gating it — while a
+    /// meeting parked on the participant marker itself DOES re-gate (AC5).
+    ///
+    /// Two §2 answers can already stand by the time this runs, because the ask
+    /// is raised at RUN ENTRY: a Skip answered before this run reached the notes
+    /// stage (consumed here — there is no pending marker to hang it on yet), and
+    /// the auto-skip deadline of the opt-in sub-toggle.
+    private func shouldGateForParticipants(meeting: Meeting, hasExistingNotes: Bool) async -> Bool {
+        guard !hasExistingNotes, meeting.attendees.isEmpty else { return false }
+        let lpe = meeting.lastProcessingError
+        guard !NotesPendingClass.isPending(lpe)
+            || NotesPendingClass.isAwaitingParticipantConfirmation(lpe)
+        else { return false }
+        guard await AutomationSettings.confirmParticipants(from: settings) else { return false }
+        if participantStopSkips.remove(meeting.id) != nil { return false }
+        if await AutomationSettings.confirmParticipantsAutoSkip(from: settings),
+            now() >= participantAutoSkipDeadline(meetingID: meeting.id)
+        {
+            logger.notice(
+                "participant confirmation auto-skipped (past the \(Int(AutomationSettings.confirmParticipantsAutoSkipSeconds / 60)) min window): \(meeting.id, privacy: .public)"
+            )
+            return false
+        }
+        return true
+    }
+
+    /// The auto-skip deadline for a meeting: the moment the QUESTION was put to
+    /// the user, plus the pinned window. "Five minutes" is five minutes of the
+    /// user not answering — so it starts when the ask was raised (§2a, at run
+    /// entry) and, for a meeting nobody asked in this session, at the FIRST gate
+    /// evaluation that consults it (stamped here, on demand). It is deliberately
+    /// NOT `endedAt`: an imported recording dated last week has an `endedAt`
+    /// that expired before Blaise ever saw the file, which would silently skip
+    /// the very question the user opted into being asked.
+    private func participantAutoSkipDeadline(meetingID: MeetingID) -> Date {
+        let asked = participantAskTimes[meetingID] ?? now()
+        participantAskTimes[meetingID] = asked
+        return asked.addingTimeInterval(AutomationSettings.confirmParticipantsAutoSkipSeconds)
+    }
+
+    /// G15 §2a: raise the confirmation for a run that is just starting, if this
+    /// meeting is one nobody can name yet. Evaluated at RUN ENTRY — after
+    /// `writeRunEntry` has absorbed the pending Meet/Slack roster into
+    /// `attendees` — so the question is asked only about a meeting whose roster
+    /// Blaise genuinely does not have. Asking earlier (at the stop event, before
+    /// absorption) is confirmation theater over names Blaise is about to learn,
+    /// and the user's answer to it is then refused (§2b).
+    ///
+    /// Idempotent and park-aware by construction: the `insert` result is the
+    /// single-ask latch, an already-parked meeting is left to its standing park
+    /// surface, and a run over a meeting that already has notes (a regeneration)
+    /// is never asked — those are exactly the states whose answer would be
+    /// refused. Recording the ask also suppresses the notes-stage park's second
+    /// notification (one ask per run, never one per park) and starts the
+    /// auto-skip window.
+    private func raiseParticipantAskAtRunEntry(
+        meeting: Meeting, regeneration: Bool, token: CancellationToken
+    ) async {
+        if let duringRunEntryAsk { await duringRunEntryAsk(meeting.id) }
+        guard !regeneration, meeting.attendees.isEmpty,
+            !NotesPendingClass.isPending(meeting.lastProcessingError),
+            await AutomationSettings.confirmParticipants(from: settings),
+            !(await hasPersistedNotes(meeting.id))
+        else { return }
+        // R4-F5: every read above is a suspension the user's Cancel can land in
+        // (G10 §1 installs the token before this call for exactly that reason).
+        // A cancelled run has no question to ask — asking would raise a sheet
+        // for a meeting that will never mint notes, and burn the single-ask
+        // latch. Checked here, after the reads and before anything is recorded
+        // or emitted.
+        guard !token.isCancelled else { return }
+        guard participantStopAsks.insert(meeting.id).inserted else { return }
+        participantAskTimes[meeting.id] = now()
+        emit(.participantAskRaised(meeting.id, title: meeting.title))
+    }
+
+    /// Whether this meeting's ask was already raised in this session. True = the
+    /// park must NOT post the confirm notification: the user has already been
+    /// asked, and the park's own list-row state is the standing surface from
+    /// here on. Deliberately NON-consuming: the token is also what tells a late
+    /// Skip that there is a live question to answer, and the gate reaches this
+    /// point BEFORE the pending marker exists — spending the token here is what
+    /// made an answer landing in that window refuse (R2-H1).
+    private func participantAskWasRaised(_ meetingID: MeetingID) -> Bool {
+        participantStopAsks.contains(meetingID)
+    }
+
+    /// Whether the meeting already has a persisted notes row (the gate's
+    /// regeneration-never-gates clause).
+    private func hasPersistedNotes(_ meetingID: MeetingID) async -> Bool {
+        (try? await database.pool.read { db in
+            try MeetingNotes.filter(key: meetingID).fetchCount(db) > 0
+        }) ?? false
+    }
+
+    /// The confirm sheet's attendee normalization (§3): trim, drop empties, and
+    /// fold-dedup (C5 canonical) preserving first-seen display surface + order.
+    /// No glossary/alias rows are created — these are attendee DISPLAY names.
+    public static func foldedDedupedAttendees(_ names: [String]) -> [Attendee] {
+        var seen = Set<String>()
+        var out: [Attendee] = []
+        for raw in names {
+            let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { continue }
+            let key = VocabNormalization.canonicalMode(name)
+            guard !key.isEmpty, seen.insert(key).inserted else { continue }
+            out.append(Attendee(name: name, source: .manual))
+        }
+        return out
+    }
+
+    /// G15 Confirm (§3): write the folded-deduped attendee names (a CONTENT
+    /// mutation — attendees are a payload-builder input, so `updatedAt` bumps),
+    /// then dispatch the notes-only resume that BYPASSES the gate. The pending
+    /// marker is left in place so the resume runs (it requires it) and its
+    /// finalize clears the marker — exactly like every other pending self-heal.
+    ///
+    /// Two windows are answerable, because the ask is raised at the recording
+    /// STOP (§2): the meeting is already PARKED on the participant marker (write
+    /// + resume, as above), or its run is still in flight and has no notes yet
+    /// (write only — the run's notes stage re-reads the attendees and therefore
+    /// never parks). A meeting that already HAS notes is refused: editing
+    /// attendees after the notes exist belongs to the notes-editing arc, not
+    /// here. Returns whether attendees were written.
+    @discardableResult
+    public func confirmParticipants(meetingID: MeetingID, names: [String]) async throws -> Bool {
+        let attendees = Self.foldedDedupedAttendees(names)
+        // L2: an all-empty/whitespace confirm writes nothing and dispatches
+        // nothing (server-side guard — the sheet's Confirm button disable is only
+        // the client-side half). A user with no names to give uses Skip.
+        guard !attendees.isEmpty else { return false }
+        let timestamp = now()
+        // The write does NOT join the single-flight chain: the pre-park answer
+        // has to land WHILE the run it answers is still transcribing, and a run
+        // holds the chain end to end. Its own guarded transaction is what makes
+        // it race-safe (nothing is written unless the meeting is still in one of
+        // the two answerable windows); the resume below joins the chain itself.
+        // nil = nothing written; true = the meeting was PARKED (resume below);
+        // false = written inside the pre-park window (the run finishes itself).
+        let wasParked = try await database.pool.write { db -> Bool? in
+            guard var meeting = try Meeting.fetchOne(db, key: meetingID) else { return nil }
+            let parked = NotesPendingClass.isAwaitingParticipantConfirmation(
+                meeting.lastProcessingError)
+            let preParkWindow =
+                try MeetingNotes.filter(key: meetingID).fetchCount(db) == 0
+                && meeting.attendees.isEmpty
+            guard parked || preParkWindow else { return nil }
+            meeting.attendees = attendees
+            meeting.updatedAt = timestamp
+            try meeting.update(db)
+            return parked
+        }
+        guard let wasParked else { return false }
+        // Pre-park: the in-flight run picks the names up at its notes stage —
+        // dispatching a resume here would collide with it.
+        guard wasParked else { return true }
+        do {
+            _ = try await processNotesOnly(meetingID: meetingID, confirmingParticipants: true)
+        } catch {
+            // The attendees ARE written (that is what `true` reports); the resume
+            // is retried by the ordinary pending self-heal. Never swallow the
+            // reason it failed.
+            logger.error(
+                "participant confirm resume failed for \(meetingID, privacy: .public): \(String(describing: error), privacy: .public) — attendees written; pending self-heal retries"
+            )
+        }
+        return true
+    }
+
+    /// G15 Skip (§3): proceed WITHOUT attendees for this meeting — nothing is
+    /// written; the gate-bypassing resume mints notes and its finalize clears the
+    /// marker. A subsequent engine-park (no notes) carries the engine marker, so
+    /// the skip is durable (a later self-heal does not re-gate). No-op when the
+    /// meeting is no longer participant-pending.
+    @discardableResult
+    public func skipParticipantConfirmation(meetingID: MeetingID) async throws -> Bool {
+        // L1: no-op unless the meeting is STILL parked on the participant marker
+        // (mirrors confirmParticipants' guard). Without this, a Skip from a stale
+        // sheet — the meeting has since moved to engine-pending or ready — would
+        // dispatch a gate-bypassing resume and fire an out-of-cadence engine
+        // retry / re-mint. `processNotesOnly` no-ops for a non-pending meeting,
+        // but an engine-pending one would run; this guard stops that.
+        guard let meeting = try await MeetingRepository(database: database).fetch(meetingID)
+        else { return false }
+        guard NotesPendingClass.isAwaitingParticipantConfirmation(meeting.lastProcessingError) else {
+            // §2a: a Skip answered while the run is still in flight, before
+            // there is a marker to hang it on. Record it for this run's
+            // notes-stage gate — nothing is written and no resume is dispatched
+            // (the run is already producing the notes). Only for a meeting whose
+            // run actually raised the ask AND has not yet produced notes: a
+            // sheet left standing over a finished meeting stays the no-op L1
+            // made it.
+            guard participantAskWasRaised(meetingID), !(await hasPersistedNotes(meetingID))
+            else { return false }
+            participantStopSkips.insert(meetingID)
+            // The fetch above is a snapshot: the run may have committed its park
+            // while this answer was in flight, and the gate does not consult the
+            // skip set again. If the marker is here NOW, carry the skip through
+            // the parked path instead — `remove` is the single-winner claim
+            // shared with the park's own reconciliation, so exactly one side
+            // dispatches the resume.
+            if let fresh = try? await MeetingRepository(database: database).fetch(meetingID),
+                NotesPendingClass.isAwaitingParticipantConfirmation(fresh.lastProcessingError),
+                participantStopSkips.remove(meetingID) != nil
+            {
+                return try await processNotesOnly(
+                    meetingID: meetingID, confirmingParticipants: true) != nil
+            }
+            return true
+        }
+        let record = try await processNotesOnly(
+            meetingID: meetingID, confirmingParticipants: true)
+        return record != nil
+    }
+
+    /// Confirm-sheet pre-fill (§3): the grounded person-hint canonicals for a
+    /// meeting — curated glossary person names whose everyday mis-transcription
+    /// surfaces actually appear in this meeting's transcript. Read-only,
+    /// best-effort (empty when there is no transcript or no grounded hint).
+    public func groundedPersonNames(meetingID: MeetingID) async -> [String] {
+        guard
+            let meeting = try? await MeetingRepository(database: database).fetch(meetingID),
+            let segments = try? await TranscriptRepository(database: database)
+                .segments(meetingID: meetingID)
+        else { return [] }
+        let vocabulary = vocabularyProvider().vocabulary
+        return GroundedPersonHints.groundedPersonHints(
+            vocabulary: vocabulary, attendees: meeting.attendees, segments: segments
+        ).map(\.canonical)
+    }
+
+    /// Confirm-sheet caption (§3): the diarization cluster count ("Blaise heard N
+    /// distinct voices") from the persisted diarization artifact. 0 when absent.
+    public func diarizationClusterCount(meetingID: MeetingID) async -> Int {
+        loadPersistedDiarization(meetingID: meetingID)?.speakerCount ?? 0
     }
 
     // MARK: - Stage 9: notes with the ONE-hop runtime fallback (D17 policy)
@@ -2514,9 +2981,19 @@ public actor ProcessingPipeline {
     /// Failure KEEPS the meeting pending (marker refreshed with the new
     /// reason): the durable state is still transcript-persisted/notes-absent
     /// and the next self-heal trigger retries.
+    ///
+    /// G15: `confirmingParticipants` is set ONLY when the user acted on the
+    /// participant-confirmation sheet (Confirm or Skip) — that resume BYPASSES
+    /// the participant gate. Every other trigger (launch/key-save self-heal)
+    /// leaves it false so an unconfirmed gated meeting re-parks (§2/AC5).
     @discardableResult
-    public func processNotesOnly(meetingID: MeetingID) async throws -> PipelineRunRecord? {
-        try await chain.run { try await self.notesOnlyBody(meetingID: meetingID) }
+    public func processNotesOnly(
+        meetingID: MeetingID, confirmingParticipants: Bool = false
+    ) async throws -> PipelineRunRecord? {
+        try await chain.run {
+            try await self.notesOnlyBody(
+                meetingID: meetingID, confirmingParticipants: confirmingParticipants)
+        }
     }
 
     /// Self-heal trigger entry (app launch / API-key save in Settings /
@@ -2552,7 +3029,9 @@ public actor ProcessingPipeline {
         }
     }
 
-    private func notesOnlyBody(meetingID: MeetingID) async throws -> PipelineRunRecord? {
+    private func notesOnlyBody(
+        meetingID: MeetingID, confirmingParticipants: Bool = false
+    ) async throws -> PipelineRunRecord? {
         // Absorb Meet roster rows queued while the meeting sat pending
         // (C10's absorption point is the full run's entry, which the resume
         // bypasses): the resume is a sanctioned content write followed by a
@@ -2639,15 +3118,39 @@ public actor ProcessingPipeline {
         let vocabulary = userLoad.vocabulary
         return try await notesOnlyStages(
             meeting: meeting, segments: segments, dominantLanguage: dominantLanguage,
-            asrProvenance: asrProvenance, context: context, vocabulary: vocabulary)
+            asrProvenance: asrProvenance, context: context, vocabulary: vocabulary,
+            confirmingParticipants: confirmingParticipants, hadNotesBefore: hadNotesBefore)
     }
 
     private func notesOnlyStages(
         meeting: Meeting, segments: [TranscriptSegment], dominantLanguage: String,
-        asrProvenance: ASRProvenance, context: RunContext, vocabulary: PipelineVocabulary
+        asrProvenance: ASRProvenance, context: RunContext, vocabulary: PipelineVocabulary,
+        confirmingParticipants: Bool = false, hadNotesBefore: Bool = false
     ) async throws -> PipelineRunRecord {
         let meetingID = meeting.id
         let user = await userIdentity()
+
+        // G15: re-evaluate the participant-confirmation gate on a self-heal
+        // resume. A resume the user triggered by Confirm/Skip BYPASSES it
+        // (`confirmingParticipants`); any other trigger (launch/key-save)
+        // re-parks an unconfirmed gated meeting rather than silently proceeding
+        // (§2/AC5). Confirm writes attendees, so the emptiness condition alone
+        // already lets it through; the bypass is what carries a Skip (attendees
+        // stay empty) past the gate for this one resume.
+        if !confirmingParticipants,
+            await shouldGateForParticipants(meeting: meeting, hasExistingNotes: hadNotesBefore)
+        {
+            let reason = NotesPendingClass.awaitingParticipantConfirmation
+            context.record.notesPending = reason
+            if !NotesPendingClass.isAwaitingParticipantConfirmation(meeting.lastProcessingError),
+                !participantAskWasRaised(meetingID)
+            {
+                emit(.participantConfirmationNeeded(meetingID, title: meeting.title))
+            }
+            await writeNotesPending(meetingID: meetingID, regeneration: true, reason: reason)
+            emit(.runCompleted(meetingID))
+            return context.record
+        }
         // Same prompt inputs as the pending run's stage 9: the persisted
         // segments ARE that run's stage-9 transcript (a pending run applies
         // no LLM names — there were no proposals), and the prompt reads only
@@ -2771,15 +3274,22 @@ public actor ProcessingPipeline {
     /// regeneration-class runs keep their status (C1 no-regress: an
     /// already-ready meeting keeps its previous notes, the marker surfacing
     /// the mixed transcript/notes generation until the resume heals it).
-    private func writeNotesPending(meetingID: MeetingID, regeneration: Bool, reason: String) async {
-        try? await database.pool.write { db in
-            guard var meeting = try Meeting.fetchOne(db, key: meetingID) else { return }
+    /// Returns whether the meeting had attendees AT THE MOMENT the marker
+    /// committed — read inside the same transaction as the marker write, so a
+    /// Confirm racing this write cannot slip between the two: whichever
+    /// transaction commits second observes the other's result (G15 §2a).
+    @discardableResult
+    private func writeNotesPending(
+        meetingID: MeetingID, regeneration: Bool, reason: String
+    ) async -> Bool {
+        let attendeesPresent = (try? await database.pool.write { db -> Bool in
+            guard var meeting = try Meeting.fetchOne(db, key: meetingID) else { return false }
             // G10 §1: a committed `cancelled` is NEVER overwritten — the user's
             // cancel commits the status first and the terminal write must
             // preserve it (read-check in the same write transaction). Only a
             // process-class run reaches this `failed` flip anyway; this guard
             // keeps it from flipping a meeting the user just cancelled.
-            guard meeting.status != .cancelled else { return }
+            guard meeting.status != .cancelled else { return false }
             meeting.lastProcessingError = NotesPendingClass.marker(reason)
             if !regeneration {
                 meeting.status = .failed
@@ -2788,10 +3298,44 @@ public actor ProcessingPipeline {
             // (C1 v6.7 — updatedAt tracks content mutations only; every
             // failed resume retry refreshes this marker).
             try meeting.update(db)
-        }
+            return !meeting.attendees.isEmpty
+        }) ?? false
         logger.notice(
             "notes pending for \(meetingID, privacy: .public): \(reason, privacy: .public) — transcript persisted, no handoff; self-heals on launch/key-save/network"
         )
+        return attendeesPresent
+    }
+
+    /// G15 §2a / AC2c: close the window between the gate's decision and the
+    /// marker commit. An answer that landed in it reported success and
+    /// dispatched nothing — the run was already committed to parking, and the
+    /// answer path had no marker to hang a resume on. The marker exists now,
+    /// which is exactly what the notes-only resume requires, so the answered
+    /// meeting is resumed here instead of sitting on a question the user has
+    /// already answered. `attendeesWritten` comes from the marker's own
+    /// transaction (a late Confirm); the skip set carries a late Skip, and
+    /// `remove` is the single-winner claim it shares with
+    /// `skipParticipantConfirmation` — exactly one side ever dispatches.
+    /// Detached because `processNotesOnly` joins the single-flight chain that
+    /// THIS run still holds.
+    private func resumeIfParticipantsWereAnsweredLate(
+        meetingID: MeetingID, attendeesWritten: Bool
+    ) {
+        let skippedLate = participantStopSkips.remove(meetingID) != nil
+        guard attendeesWritten || skippedLate else { return }
+        logger.notice(
+            "participant answer landed while \(meetingID, privacy: .public) was committing its park — resuming notes instead of waiting"
+        )
+        Task {
+            do {
+                _ = try await self.processNotesOnly(
+                    meetingID: meetingID, confirmingParticipants: true)
+            } catch {
+                self.logger.error(
+                    "late participant answer resume failed for \(meetingID, privacy: .public): \(String(describing: error), privacy: .public) — the park stands; pending self-heal retries"
+                )
+            }
+        }
     }
 
     // MARK: - Digest-only resume (G14 H1 self-heal)

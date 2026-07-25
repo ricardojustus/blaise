@@ -43,6 +43,8 @@ struct SettingsRootView: View {
 struct AutomationTab: View {
     @Environment(AppEnvironment.self) private var appEnv
     @State private var enabled = true
+    @State private var confirmParticipants = false
+    @State private var confirmParticipantsAutoSkip = false
     @State private var resumeWindowMinutes = AutomationSettings.defaultResumeWindowSeconds / 60
     @State private var silenceAutoPauseEnabled = SilenceAutoPauseSettings.defaultEnabled
     @State private var silenceThresholdMinutes = Int(SilenceAutoPauseSettings.defaultThresholdSeconds / 60)
@@ -54,6 +56,7 @@ struct AutomationTab: View {
 
     var body: some View {
         @Bindable var google = appEnv.googleCalendar
+        @Bindable var slack = appEnv.slackHuddles
         Form {
             Section("Meeting automation") {
                 Toggle("Meeting automation (notifications, auto-stop)", isOn: $enabled)
@@ -69,6 +72,48 @@ struct AutomationTab: View {
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+                // G15: opt-in participant-confirmation gate.
+                Toggle(
+                    "Ask me to confirm participants before notes are written",
+                    isOn: $confirmParticipants
+                )
+                .onChange(of: confirmParticipants) { _, newValue in
+                    guard loaded else { return }
+                    Task {
+                        try? await appEnv.settings.set(
+                            AutomationSettings.confirmParticipantsKey, to: newValue)
+                    }
+                }
+                Text(
+                    "When a meeting's participants couldn't be learned from your calendar or the Meet roster, Blaise still transcribes and keeps the audio, but holds the notes until you confirm the names (or skip). Blaise asks as soon as processing starts, and the meeting stays marked in the list until you answer. Off by default."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                // G15: the auto-skip sub-toggle (opt-in, default OFF). Indented
+                // under its parent — visual subordination is what makes it read
+                // as a sub-toggle rather than a second independent preference.
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(
+                        "Write the notes anyway if I haven't answered in 5 minutes",
+                        isOn: $confirmParticipantsAutoSkip
+                    )
+                    .disabled(!confirmParticipants)
+                    .onChange(of: confirmParticipantsAutoSkip) { _, newValue in
+                        guard loaded else { return }
+                        Task {
+                            try? await appEnv.settings.set(
+                                AutomationSettings.confirmParticipantsAutoSkipKey, to: newValue)
+                        }
+                    }
+                    Text(
+                        "Five minutes after Blaise asks, an unanswered meeting gets its notes without the names instead of waiting. Off by default: the meeting waits for you, however long that takes."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.leading, 18)
             }
             Section("Notifications & connection") {
                 LabeledContent("Notifications") {
@@ -275,6 +320,66 @@ struct AutomationTab: View {
                     }
                 }
             }
+            Section("Slack Huddles") {
+                Toggle(
+                    "Slack Huddles",
+                    isOn: Binding(get: { slack.enabled }, set: { slack.setEnabled($0) }))
+                Text(
+                    "While you're in a Slack huddle, Blaise learns the participants and call lifecycle over Slack's own API — presence only, never messages or audio — and feeds them into the same speaker-naming and auto-record flow as Meet."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                // Credentials are frozen while a connect is validating.
+                SecureField("App-level token (xapp-…)", text: $slack.appToken)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(slack.connecting)
+                SecureField("Bot token (xoxb-…)", text: $slack.botToken)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(slack.connecting)
+                TextField("Your Slack member ID (U…)", text: $slack.memberID)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(slack.connecting)
+                HStack {
+                    Button(slack.connected ? "Reconnect" : "Connect") {
+                        Task { await slack.connect() }
+                    }
+                    .disabled(slack.connecting)
+                    if slack.connecting {
+                        Button("Cancel") { slack.cancelConnect() }
+                    }
+                    if slack.connected {
+                        Button("Disconnect") { Task { await slack.disconnect() } }
+                    }
+                    if slack.connecting {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                LabeledContent("Status") {
+                    Label(
+                        slack.statusTitle,
+                        systemImage: slack.connected ? "checkmark.circle" : "circle.dashed"
+                    )
+                    .foregroundStyle(slack.connected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(.secondary))
+                }
+                if let workspace = slack.workspaceName {
+                    LabeledContent("Workspace") { Text(workspace) }
+                }
+                if let error = slack.lastError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+                if let error = slack.settingsError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+                Text(
+                    "Setup: create a personal Slack app from the manifest in docs/slack_huddles_contract.md, install it to your workspace, then paste its app-level and bot tokens and your member ID."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
             if appEnv.captureStatus.notificationHealth.needsAttention && !deniedBannerDismissed {
                 Section {
                     QuietBanner(
@@ -295,8 +400,12 @@ struct AutomationTab: View {
             await appEnv.refreshAutomationSurfaceStatus()
             await appEnv.googleCalendar.load()
             await appEnv.googleCalendar.listCalendars()
+            await appEnv.slackHuddles.load()
             await appEnv.calendarSuggestions.load()
             enabled = await AutomationSettings.enabled(from: appEnv.settings)
+            confirmParticipants = await AutomationSettings.confirmParticipants(from: appEnv.settings)
+            confirmParticipantsAutoSkip =
+                await AutomationSettings.confirmParticipantsAutoSkip(from: appEnv.settings)
             resumeWindowMinutes =
                 await AutomationSettings.resumeWindowSeconds(from: appEnv.settings) / 60
             silenceAutoPauseEnabled = await SilenceAutoPauseSettings.enabled(from: appEnv.settings)
@@ -758,6 +867,28 @@ private struct HandoffSection: View {
             // the JSON. (Mirrors the memory-digest toggle's placement.)
             Toggle("Write Markdown sidecar (Obsidian-ready)", isOn: $model.markdownSidecar)
                 .accessibilityLabel("Write Markdown sidecar alongside the evidence payload")
+
+            // G5 v1.3: superseded-payload REMOVAL. Default OFF ⇒ delivered
+            // payloads accumulate, preserving the published immutable-history
+            // contract. Named for the ACTION it performs: "Keep …" defaulting
+            // to off is a double negative the reader must resolve before
+            // learning that files get deleted.
+            Toggle(
+                "Remove superseded payloads at the destination",
+                isOn: $model.removeSupersededPayloads
+            )
+            .accessibilityLabel("Remove superseded payloads at the destination")
+            Text("Off (default): every delivered version is kept, so anything referencing an older payload can still find it. On: a correction or regeneration deletes the previous payload at the destination, leaving one current file per meeting.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            // G5 v1.3: audio delivery. Default OFF (the privacy default) — the
+            // headline is stated plainly here and in the README/contract doc.
+            Toggle("Include audio recordings", isOn: $model.deliverAudio)
+                .accessibilityLabel("Include audio recordings in the destination")
+            Text("Off by default. On copies each meeting's recordings to the destination; a destination that syncs (iCloud/network) means audio leaves this machine. Applies to each meeting's NEXT delivery — there is no retroactive sweep.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             // G14: the memory-digest toggle is destination-independent — it
             // gates the second machine-facing render on the knowledge graph payload.

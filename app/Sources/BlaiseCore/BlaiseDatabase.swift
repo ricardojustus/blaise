@@ -509,6 +509,81 @@ public final class BlaiseDatabase: Sendable {
                 t.add(column: "scoped_alias_bindings", .text) // nullable; JSON [AliasPair]
             }
         }
+        // C15: widen `meeting.source` to accept new `MeetingSource` cases
+        // (Slack huddles). Migration v1 baked `CHECK(source IN (…))` with the
+        // rawValues present WHEN v1 RAN, and SQLite never updates a column
+        // CHECK when a new enum case is added later — a `slack`-source INSERT
+        // would fail the frozen v1 CHECK on any migrated DB (a fresh DB at v1
+        // already gets the wide list from `allCases`). SQLite cannot
+        // ALTER…DROP CONSTRAINT, so this is the standard table rebuild (same
+        // shape as v14's `cloud_spend_receipt` CHECK rebuild). The rebuilt
+        // table drops the source CHECK entirely: the `MeetingSource` enum is
+        // the validity boundary (the same stance v1 took for `status`, whose
+        // vocabulary is likewise expected to evolve), so a future source
+        // addition never needs another rebuild. `meeting` is referenced by
+        // child FKs with ON DELETE CASCADE; what makes the drop safe is that
+        // GRDB's default `.deferred` mode runs `PRAGMA foreign_keys = OFF`
+        // around the migration — with FKs off, DROP TABLE fires no cascade
+        // actions, so child rows (transcripts, notes, queue jobs) survive and
+        // re-attach to the renamed table. (Deferring FK *checks* alone would
+        // NOT be enough: deferral postpones violation reporting, not cascade
+        // actions.) Pinned by MigrationTests with populated children — do not
+        // switch this migration to `.immediate`.
+        migrator.registerMigration("v18") { db in
+            try db.create(table: "meeting_new") { t in
+                t.primaryKey("id", .text)
+                t.column("title", .text).notNull()
+                t.column("started_at", .datetime).notNull()
+                t.column("ended_at", .datetime)
+                t.column("source", .text).notNull() // no CHECK — enum is the boundary
+                t.column("status", .text).notNull()
+                t.column("attendees", .text).notNull() // JSON
+                t.column("dominant_language", .text)
+                t.column("asr_provenance", .text) // JSON
+                t.column("last_processing_error", .text)
+                t.column("created_at", .datetime).notNull()
+                t.column("updated_at", .datetime).notNull()
+                t.column("processing_note", .text)
+                t.column("meeting_code", .text)
+                t.column("captured", .boolean).notNull().defaults(to: false)
+                t.column("calendar_event_id", .text)
+                t.column("scheduled_end_ms", .integer)
+                t.column("grace_until_ms", .integer)
+                t.column("title_source", .text).notNull().defaults(to: "default")
+            }
+            try db.execute(sql: """
+                INSERT INTO meeting_new
+                  (id, title, started_at, ended_at, source, status, attendees,
+                   dominant_language, asr_provenance, last_processing_error,
+                   created_at, updated_at, processing_note, meeting_code, captured,
+                   calendar_event_id, scheduled_end_ms, grace_until_ms, title_source)
+                SELECT
+                  id, title, started_at, ended_at, source, status, attendees,
+                  dominant_language, asr_provenance, last_processing_error,
+                  created_at, updated_at, processing_note, meeting_code, captured,
+                  calendar_event_id, scheduled_end_ms, grace_until_ms, title_source
+                FROM meeting
+                """)
+            try db.drop(table: "meeting")
+            try db.rename(table: "meeting_new", to: "meeting")
+            // Recreate the v1 indexes (dropped with the old table) under their
+            // canonical GRDB names.
+            try db.execute(sql: #"CREATE INDEX "index_meeting_on_started_at" ON "meeting"("started_at")"#)
+            try db.execute(sql: #"CREATE INDEX "index_meeting_on_status" ON "meeting"("status")"#)
+        }
+        // G5 v1.5: delivery PROVENANCE — which destination a row's payload was
+        // actually written to. Destination cleanup's deletion authority is keyed
+        // on it (only hashes proved delivered to the CURRENTLY ACTIVE
+        // destination are candidates), so a destination switch can never
+        // authorize deleting a same-named file this Blaise never wrote THERE.
+        // Additive, nullable (the v14/v17 precedent): rows delivered by an
+        // earlier binary carry NULL and are therefore never deletion
+        // candidates — the failure direction is under-deletion, by design.
+        migrator.registerMigration("v19") { db in
+            try db.alter(table: "handoff_queue") { t in
+                t.add(column: "delivered_endpoint", .text) // nullable; destination identity
+            }
+        }
         return migrator
     }
 
@@ -643,12 +718,19 @@ public final class BlaiseDatabase: Sendable {
     /// failed regeneration must never re-label the old transcript.
     /// `midTransactionHook` is the crash-test seam (C1 pattern).
     @discardableResult
+    ///
+    /// `additionalWrites` (G2 M1) runs INSIDE the same write transaction, after
+    /// the segment replace + meeting update, so a caller can commit a companion
+    /// row (e.g. a `speaker_rename` upsert) ATOMICALLY with the transcript it was
+    /// applied to — no crash window where the row exists but the persisted
+    /// transcript does not.
     public func persistTranscript(
         meetingID: MeetingID,
         segments: [TranscriptSegment],
         asrProvenance: ASRProvenance,
         dominantLanguage: String,
         updatedAt: Date = Date(),
+        additionalWrites: (@Sendable (Database) throws -> Void)? = nil,
         midTransactionHook: (@Sendable () throws -> Void)? = nil
     ) async throws -> [TranscriptSegment] {
         try await pool.write { db in
@@ -667,6 +749,7 @@ public final class BlaiseDatabase: Sendable {
             meeting.dominantLanguage = dominantLanguage
             meeting.updatedAt = updatedAt
             try meeting.update(db)
+            try additionalWrites?(db)
             try midTransactionHook?()
             return inserted
         }

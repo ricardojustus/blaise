@@ -35,6 +35,18 @@ public struct SpeakerRename: Codable, Sendable, Equatable, FetchableRecord, Pers
         case anchorMs = "anchor_ms"
         case createdAt = "created_at"
     }
+
+    /// NH-E: whether this row is keyed on the reserved `unattributed` label,
+    /// which has no diarization cluster to anchor to BY CONSTRUCTION. Such rows
+    /// are LABEL-LITERAL — written un-staled with no anchor, applied by direct
+    /// label match to every `unattributed` segment, and exempt from anchor
+    /// derivation, fallback re-mapping, and the stale lifecycle (a legacy stale
+    /// flag on one — written before this rule — is ignored at apply time).
+    public var isAnchorless: Bool { Self.isAnchorless(speakerLabel) }
+
+    public static func isAnchorless(_ speakerLabel: String) -> Bool {
+        speakerLabel == TranscriptSegment.unattributed
+    }
 }
 
 public enum SpeakerRenameStore {
@@ -74,11 +86,33 @@ public enum SpeakerRenameStore {
         _ db: Database, meetingID: MeetingID, speakerLabel: String, name: String,
         diarization: DiarizationOutput, now: Date
     ) throws {
+        try makeRow(
+            meetingID: meetingID, speakerLabel: speakerLabel, name: name,
+            diarization: diarization, now: now
+        ).save(db)
+    }
+
+    /// The row `upsert` would save, WITHOUT persisting it — so a caller can apply
+    /// it to segments in memory AND commit the identical row inside the
+    /// transcript-persist transaction (G2 M1 atomicity). Same anchor + stale
+    /// discipline as `upsert` (H-6: no derivable anchor ⇒ `stale = 1`, anchor 0).
+    public static func makeRow(
+        meetingID: MeetingID, speakerLabel: String, name: String,
+        diarization: DiarizationOutput, now: Date
+    ) -> SpeakerRename {
+        // NH-E: the reserved `unattributed` label has no cluster to anchor to, so
+        // it is written label-literal (un-staled, anchor 0) and applied by direct
+        // label match — never pre-staled by a failed anchor derivation (the
+        // field-reported dead-rename bug).
+        if SpeakerRename.isAnchorless(speakerLabel) {
+            return SpeakerRename(
+                meetingID: meetingID, speakerLabel: speakerLabel, anchorMs: 0,
+                stale: false, name: name, createdAt: now)
+        }
         let derived = anchorMs(for: speakerLabel, in: diarization)
-        let row = SpeakerRename(
+        return SpeakerRename(
             meetingID: meetingID, speakerLabel: speakerLabel, anchorMs: derived ?? 0,
             stale: derived == nil, name: name, createdAt: now)
-        try row.save(db)
     }
 
     public static func delete(_ db: Database, meetingID: MeetingID, speakerLabel: String) throws {
@@ -98,11 +132,16 @@ public enum SpeakerRenameStore {
         _ db: Database, meetingID: MeetingID, fresh: DiarizationOutput, now: Date
     ) throws {
         let allRows = try all(db, meetingID: meetingID)
-        let rows = allRows.filter { !$0.stale }
+        // NH-E: anchorless (`unattributed`) rows are LABEL-LITERAL — left
+        // completely untouched by the fallback (no re-map, no re-key, no stale
+        // flip). They are not in the re-map set and not deleted below.
+        let rows = allRows.filter { !$0.stale && !$0.isAnchorless }
         guard !rows.isEmpty else { return }
         // Pre-existing stale rows keep their original key untouched; a re-keyed
-        // row must NOT land on one of them.
-        let existingStaleKeys = Set(allRows.filter { $0.stale }.map(\.speakerLabel))
+        // row must NOT land on one of them. Anchorless rows are excluded — their
+        // reserved key is never a re-key target anyway.
+        let existingStaleKeys = Set(
+            allRows.filter { $0.stale && !$0.isAnchorless }.map(\.speakerLabel))
 
         // Which fresh cluster contains each row's anchor instant?
         func containingLabel(_ anchorMs: Int64) -> String? {
@@ -198,8 +237,14 @@ public enum SpeakerRenameStore {
     public static func applyRenames(
         _ renames: [SpeakerRename], to segments: [TranscriptSegment]
     ) -> [TranscriptSegment] {
+        // NH-E: anchorless (`unattributed`) rows apply by direct label match
+        // REGARDLESS of their stale flag — a legacy stale row (written before the
+        // rule) heals at apply time with no DB write; ordinary labels keep the
+        // stale-skip. PK (meeting_id, speaker_label) still guarantees one row per
+        // label, so the keys stay unique.
         let byLabel = Dictionary(
-            uniqueKeysWithValues: renames.filter { !$0.stale }.map { ($0.speakerLabel, $0.name) })
+            uniqueKeysWithValues: renames.filter { !$0.stale || $0.isAnchorless }
+                .map { ($0.speakerLabel, $0.name) })
         guard !byLabel.isEmpty else { return segments }
         return segments.map { segment in
             guard let name = byLabel[segment.speakerLabel] else { return segment }

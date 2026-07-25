@@ -8,7 +8,7 @@ import Testing
         let database = try makeDatabase()
         try database.pool.read { db in
             let applied = try BlaiseDatabase.migrator.appliedMigrations(db)
-            #expect(applied == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
+            #expect(applied == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19"])
 
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)")
             let structured = columns.first { $0["name"] == "structured" }
@@ -131,7 +131,7 @@ import Testing
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19"])
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)").map { $0["name"] as String }
             #expect(columns.contains("structured"))
             #expect(columns.contains("memory_digest"), "v14 adds the nullable memory_digest column")
@@ -141,6 +141,12 @@ import Testing
             let meetingColumns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting)").map { $0["name"] as String }
             #expect(meetingColumns.contains("processing_note"))
             #expect(meetingColumns.contains("title_source"))
+            // G5 v1.5 / migration v19: delivery provenance. Nullable by design —
+            // a row delivered by an earlier binary has no proof of WHERE, so it
+            // is never a deletion candidate.
+            let queueColumns = try Row.fetchAll(db, sql: "PRAGMA table_info(handoff_queue)")
+            let endpoint = try #require(queueColumns.first { $0["name"] == "delivered_endpoint" })
+            #expect(endpoint["notnull"] == 0, "delivered_endpoint must be nullable")
         }
     }
 
@@ -163,7 +169,7 @@ import Testing
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17"])
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19"])
             let note = try Row.fetchOne(db, sql: "SELECT processing_note, title, captured, title_source FROM meeting")
             #expect(note?["processing_note"] == nil)
             #expect(note?["title"] == "v2 meeting")
@@ -221,6 +227,95 @@ import Testing
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)").map { $0["name"] as String }
             #expect(!columns.contains("structured"))
             #expect(try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM meeting_notes") == 1)
+        }
+    }
+
+    /// C15 migration v18: the `meeting` rebuild that widens `source` for
+    /// `slack` (real users' old-binary DBs carry a `slack`-rejecting v1 CHECK;
+    /// the current binary's v1 already includes it, so this pins the rebuild's
+    /// MECHANICS — data preserved, indexes recreated, `slack` insertable —
+    /// which is what must never corrupt an upgraded database).
+    ///
+    /// The child rows are the load-bearing half: `meeting` is the FK parent of
+    /// the whole content model (transcript_segment, meeting_notes,
+    /// processing_queue, … all `ON DELETE CASCADE`). The rebuild drops the old
+    /// `meeting` table, which — were foreign keys enforced during migration —
+    /// would cascade-delete every child row in the database. GRDB's `.deferred`
+    /// mode disables FK enforcement (`PRAGMA foreign_keys = OFF`) around the
+    /// migration, which is what makes the drop safe. This test pins that with
+    /// populated children: a regression (a GRDB behavior change, or someone
+    /// switching the migration to `.immediate`) silently destroys every user's
+    /// transcripts, and ONLY a populated-children test catches it.
+    @Test func v18RebuildPreservesDataAndWidensSource() throws {
+        let url = try makeTempRoot().appendingPathComponent("v17-populated.sqlite")
+        let queue = try DatabaseQueue(path: url.path)
+        try BlaiseDatabase.migrator.migrate(queue, upTo: "v17")
+        try queue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting (id, title, started_at, source, status, attendees, created_at, updated_at, meeting_code)
+                    VALUES ('M1', 'kept', ?, 'meet', 'ready', '[]', ?, ?, 'abc-defg-hij')
+                    """,
+                arguments: [msDate(), msDate(), msDate()])
+            // CASCADE children of M1 — the rows the rebuild must not destroy.
+            try db.execute(
+                sql: """
+                    INSERT INTO transcript_segment (meeting_id, ord, start_seconds, end_seconds, speaker_label, text)
+                    VALUES ('M1', 0, 0.0, 2.5, 'S1', 'kept segment one'),
+                           ('M1', 1, 2.5, 4.0, 'S2', 'kept segment two')
+                    """)
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting_notes (meeting_id, markdown, language, generated_at, provenance, structured)
+                    VALUES ('M1', '# kept notes', 'en', ?, '{}', '{}')
+                    """,
+                arguments: [msDate()])
+            try db.execute(
+                sql: """
+                    INSERT INTO processing_queue (id, meeting_id, state, origin, enqueued_at, created_seq)
+                    VALUES ('J1', 'M1', 'pending', 'auto', ?, 1)
+                    """,
+                arguments: [msDate()])
+        }
+
+        try BlaiseDatabase.migrator.migrate(queue, upTo: "v18")
+
+        try queue.write { db in
+            // Existing row (and its non-default columns) preserved across the
+            // create-copy-drop-rename rebuild.
+            let kept = try Row.fetchOne(db, sql: "SELECT * FROM meeting WHERE id = 'M1'")
+            #expect(kept?["title"] == "kept")
+            #expect(kept?["meeting_code"] == "abc-defg-hij")
+            #expect(kept?["title_source"] == "default")
+            // Children survived the parent-table drop (FKs off during the
+            // migration; the drop must NOT have cascaded).
+            #expect(
+                try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM transcript_segment WHERE meeting_id = 'M1'") == 2)
+            #expect(
+                try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM meeting_notes WHERE meeting_id = 'M1'") == 1)
+            #expect(
+                try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM processing_queue WHERE meeting_id = 'M1'") == 1)
+            // And the FK relationship still holds after the rename: cascades
+            // work post-migration exactly as before.
+            #expect(try Bool.fetchOne(db, sql: "PRAGMA foreign_keys") == true)
+            // slack inserts.
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting (id, title, started_at, source, status, attendees, created_at, updated_at)
+                    VALUES ('M2', 'slack meeting', ?, 'slack', 'ready', '[]', ?, ?)
+                    """,
+                arguments: [msDate(), msDate(), msDate()])
+            #expect(try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM meeting WHERE source = 'slack'") == 1)
+            // Indexes recreated under their canonical names.
+            let indexes = try Set(
+                String.fetchAll(
+                    db,
+                    sql: "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'meeting'"))
+            #expect(indexes.contains("index_meeting_on_started_at"))
+            #expect(indexes.contains("index_meeting_on_status"))
         }
     }
 }

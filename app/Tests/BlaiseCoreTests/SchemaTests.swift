@@ -20,19 +20,22 @@ import Testing
         #expect(mode?.lowercased() == "wal")
     }
 
-    @Test func meetingSourceCheckRejectsUnknownValue() throws {
+    @Test func meetingSourceHasNoCheckConstraint() throws {
+        // C15 migration v18 dropped the `source` CHECK: like `status`, the
+        // source vocabulary evolves (it just gained `slack`), so the Swift
+        // enum is the validity boundary and a future addition needs no table
+        // rebuild. An unknown value therefore inserts at the SQL layer.
         let database = try makeDatabase()
-        #expect(throws: DatabaseError.self) {
-            try database.pool.write { db in
-                try db.execute(
-                    sql: """
-                        INSERT INTO meeting (id, title, started_at, source, status, attendees, created_at, updated_at)
-                        VALUES (?, 'bad', ?, 'skype', 'ready', '[]', ?, ?)
-                        """,
-                    arguments: [ULID.generate(), msDate(), msDate(), msDate()]
-                )
-            }
+        try database.pool.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO meeting (id, title, started_at, source, status, attendees, created_at, updated_at)
+                    VALUES (?, 'future source', ?, 'someFutureSource', 'ready', '[]', ?, ?)
+                    """,
+                arguments: [ULID.generate(), msDate(), msDate(), msDate()]
+            )
         }
+        #expect(try database.count("meeting") == 1)
     }
 
     @Test func meetingStatusHasNoCheckConstraint() throws {
@@ -162,8 +165,10 @@ import Testing
         // v11 (G10) + v12 (G11) + v13 (G12: meeting.title_source) + v14 (G14:
         // memory_digest column + the cloud_spend_receipt CHECK-rebuild) + v15
         // (F1: processing_queue substrate) + v16 (F2: notes_fts) + v17 (T3.1:
-        // scoped_alias_bindings column) = 17.
-        #expect(health.schemaVersion == 17)
+        // scoped_alias_bindings column) + v18 (C15: meeting source CHECK
+        // rebuild for slack) + v19 (G5 v1.5:
+        // handoff_queue.delivered_endpoint delivery provenance) = 19.
+        #expect(health.schemaVersion == 19)
         #expect(health.journalMode == "wal")
     }
 }

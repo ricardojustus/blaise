@@ -7,6 +7,8 @@ import Testing
 // persistence with diarization REUSE asserted; the fresh-diarize fallback
 // re-map + re-key persisting across TWO consecutive regenerates.
 
+private struct TestBoom: Error {}
+
 @Suite(.serialized) struct SpeakerRenamePipelineTests {
     private func renames(_ db: BlaiseDatabase, _ id: MeetingID) async throws -> [SpeakerRename] {
         try await db.pool.read { try SpeakerRenameStore.all($0, meetingID: id) }
@@ -121,6 +123,51 @@ import Testing
             !FileManager.default.fileExists(
                 atPath: harness.database.paths.diarizationURL(meeting.id).path),
             "a failed re-key must NOT persist the fresh artifact (M-1 ordering)")
+    }
+
+    // M1: the rename row commits ATOMICALLY with the transcript it is applied to
+    // (persistTranscript's additionalWrites runs in the SAME transaction) — no
+    // window where the row exists but the persisted transcript is still old.
+    @Test func persistTranscriptCommitsAdditionalWritesAtomically() async throws {
+        let harness = try await makePipelineHarness()
+        let meeting = try await harness.importTestMeeting()
+        try await harness.pipeline.process(meetingID: meeting.id)
+        let before = try await harness.segments(meeting.id)
+        let stored = try #require(try await harness.meeting(meeting.id))
+        let prov = try #require(stored.asrProvenance)
+        let lang = try #require(stored.dominantLanguage)
+
+        // A THROWING additionalWrites rolls the WHOLE transaction back: neither the
+        // mutated segments nor any companion row persist.
+        let mutated = before.map { seg -> TranscriptSegment in
+            var s = seg
+            s.speakerName = "SHOULD_NOT_PERSIST"
+            return s
+        }
+        await #expect(throws: TestBoom.self) {
+            _ = try await harness.database.persistTranscript(
+                meetingID: meeting.id, segments: mutated, asrProvenance: prov,
+                dominantLanguage: lang, additionalWrites: { _ in throw TestBoom() })
+        }
+        let afterRollback = try await harness.segments(meeting.id)
+        #expect(
+            afterRollback.map(\.speakerName) == before.map(\.speakerName),
+            "a throwing companion write rolls the transcript back too")
+
+        // A SUCCEEDING additionalWrites commits the rename row + renamed segments
+        // together.
+        let row = SpeakerRenameStore.makeRow(
+            meetingID: meeting.id, speakerLabel: "S0", name: "Atomic",
+            diarization: PipelineMockData.diarization, now: msDate())
+        _ = try await harness.database.persistTranscript(
+            meetingID: meeting.id,
+            segments: SpeakerRenameStore.applyRenames([row], to: before),
+            asrProvenance: prov, dominantLanguage: lang,
+            additionalWrites: { db in try row.save(db) })
+        let rows = try await renames(harness.database, meeting.id)
+        #expect(rows.contains { $0.speakerLabel == "S0" && $0.name == "Atomic" && !$0.stale })
+        let renamedSegs = try await harness.segments(meeting.id)
+        #expect(renamedSegs.filter { $0.speakerLabel == "S0" }.allSatisfy { $0.speakerName == "Atomic" })
     }
 
     @Test func fallbackStalePathInPipeline() async throws {

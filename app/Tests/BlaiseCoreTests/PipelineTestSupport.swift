@@ -352,7 +352,9 @@ func makePipelineHarness(
     fallbackLoadProfile: EngineLoadProfile = .lightweight,
     vocabularyProvider: (@Sendable () -> PipelineVocabulary.UserLoad)? = nil,
     handoffKicker: (any HandoffKicking)? = nil,
-    now: @escaping @Sendable () -> Date = { msDate() }
+    now: @escaping @Sendable () -> Date = { msDate() },
+    duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
+    duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil
 ) async throws -> PipelineHarness {
     let dataRoot = try makeTempRoot()
     let tempDir = dataRoot.appendingPathComponent("pipeline-tmp", isDirectory: true)
@@ -386,7 +388,9 @@ func makePipelineHarness(
             vocabularyProvider: vocabularyProvider,
             handoffKicker: kicker,
             tempDirectory: tempDir,
-            now: now)
+            now: now,
+            duringParticipantParkCommit: duringParticipantParkCommit,
+            duringRunEntryAsk: duringRunEntryAsk)
     } else {
         pipeline = ProcessingPipeline(
             database: database,
@@ -395,7 +399,9 @@ func makePipelineHarness(
             vocabulary: try VocabFixtures.pipelineVocabulary(),
             handoffKicker: kicker,
             tempDirectory: tempDir,
-            now: now)
+            now: now,
+            duringParticipantParkCommit: duringParticipantParkCommit,
+            duringRunEntryAsk: duringRunEntryAsk)
     }
     return PipelineHarness(
         dataRoot: dataRoot, tempDir: tempDir, database: database, pipeline: pipeline,

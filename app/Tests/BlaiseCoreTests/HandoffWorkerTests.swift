@@ -112,6 +112,10 @@ func seedDeliverable(
 /// Fixed per-attempt temp-name nonce for deterministic argv assertions.
 let testNonce = "00112233aabbccdd"
 
+/// A stand-in destination identity for tests that drive `markDelivered`
+/// directly (G5 v1.5 provenance) and never exercise cleanup.
+let testDestinationIdentity = "local:/dev/null/test-destination"
+
 /// A populated, valid example handoff endpoint — the shape a user enters in
 /// Settings on first run. The compiled `HandoffSettings.shippedDefault` is now
 /// EMPTY (the public app is Settings-configured on first run), so the worker
@@ -139,6 +143,14 @@ func seedHandoffConfig(
     // transport call counts on the JSON path; default it OFF here so each
     // delivery is one call, and seed it ON explicitly in the sidecar tests.
     try await store.set(HandoffDestination.Key.localMarkdownSidecar, to: markdownSidecar)
+    // Same rationale for the G5 v1.3 destination-independent toggles: seed them
+    // to their no-extra-call state so each delivery stays one JSON call. Both
+    // now MATCH the shipped defaults (removal OFF, audio OFF), so this seed no
+    // longer hides a default from the rest of the suite — the previous version
+    // set the OPPOSITE of the then-default, which left the riskiest behaviour
+    // (delete-by-default) asserted nowhere. The dedicated tests flip them ON.
+    try await store.set(HandoffDestination.Key.removeSupersededPayloads, to: false)
+    try await store.set(HandoffDestination.Key.deliverAudio, to: false)
 }
 
 /// A coordinated virtual clock for the retry/backoff tests. `now()` reads a
