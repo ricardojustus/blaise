@@ -473,6 +473,21 @@ private func selectLocalFolder(_ database: BlaiseDatabase, _ folder: URL, sideca
         }
     }
 
+    /// The identity stamped on a delivered row is the destination
+    /// CONFIGURATION as spelled — no counter, no fingerprint. A config change
+    /// is therefore what retires the previous destination's deletion authority.
+    @Test func endpointIdentityIsTheDestinationConfigurationSpelling() throws {
+        let folder = try tempFolder()
+        #expect(
+            HandoffDestination.localFolder(url: folder, markdownSidecar: false).endpointIdentity()
+                == "local:\(folder.path)")
+        #expect(
+            HandoffDestination.ssh(handoffValidExample, markdownSidecar: false).endpointIdentity()
+                == "ssh:\(handoffValidExample.user)@"
+                + "\(handoffValidExample.hosts.joined(separator: ","))"
+                + ":\(handoffValidExample.remoteRoot)")
+    }
+
     /// The Settings view-model load + save round-trips the destination kind and
     /// sidecar toggle (AC5 round-trip through the model the UI binds).
     @MainActor @Test func settingsModelRoundTripsDestination() async throws {

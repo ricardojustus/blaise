@@ -17,6 +17,15 @@ import Foundation
 public enum NotesPendingClass {
     public static let prefix = "notes-pending:"
 
+    /// G15: the ONE reserved notes-pending reason for the participant-
+    /// confirmation gate. A meeting parked with `marker(awaitingParticipantConfirmation)`
+    /// is holding the notes stage until the user confirms (or skips) the
+    /// participant names — the same D17 semantics apply verbatim (transcript
+    /// persisted and visible, audio retained, NO handoff, marker never bumps
+    /// updatedAt). Distinct from every engine/ceiling pending reason so the
+    /// self-heal, the UI banner, and the notification key off it precisely.
+    public static let awaitingParticipantConfirmation = "awaiting participant confirmation"
+
     /// `last_processing_error` value for a notes-pending meeting.
     public static func marker(_ reason: String) -> String {
         prefix + " " + reason
@@ -24,5 +33,13 @@ public enum NotesPendingClass {
 
     public static func isPending(_ lastProcessingError: String?) -> Bool {
         lastProcessingError?.hasPrefix(prefix) ?? false
+    }
+
+    /// True iff the meeting is parked on the G15 participant-confirmation gate
+    /// specifically (not an engine/ceiling pending reason). Keys the confirm
+    /// banner/sheet, the "once per park" notification suppression, and the
+    /// gate's own re-park-vs-fresh-park decision.
+    public static func isAwaitingParticipantConfirmation(_ lastProcessingError: String?) -> Bool {
+        lastProcessingError == marker(awaitingParticipantConfirmation)
     }
 }

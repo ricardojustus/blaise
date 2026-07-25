@@ -166,8 +166,9 @@ import Testing
         // memory_digest column + the cloud_spend_receipt CHECK-rebuild) + v15
         // (F1: processing_queue substrate) + v16 (F2: notes_fts) + v17 (T3.1:
         // scoped_alias_bindings column) + v18 (C15: meeting source CHECK
-        // rebuild for slack) = 18.
-        #expect(health.schemaVersion == 18)
+        // rebuild for slack) + v19 (G5 v1.5:
+        // handoff_queue.delivered_endpoint delivery provenance) = 19.
+        #expect(health.schemaVersion == 19)
         #expect(health.journalMode == "wal")
     }
 }

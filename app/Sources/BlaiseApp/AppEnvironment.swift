@@ -29,6 +29,11 @@ final class AppUIState {
     /// specific tab (and scroll to a segment).
     var detailRequest: DetailRequest?
     var importSourceURL: URL?
+    /// G15 §2/§3: the meeting whose participant-confirmation sheet the main
+    /// window should present — set when a recording stops while Blaise is
+    /// frontmost, and when the confirm notification is clicked (which can land
+    /// before the meeting has parked, so it cannot rely on the detail banner).
+    var participantConfirmMeeting: Meeting?
     /// F1 Inc2: set by the "Reprocess All Meetings…" menu item; presents the
     /// cost-cap confirmation sheet.
     var reprocessAllRequested = false
@@ -548,6 +553,25 @@ final class AppEnvironment {
                     self.uiState.openMainWindowRequest += 1
                     NSApp.activate(ignoringOtherApps: true)
                 }
+            case .participantConfirm(let meetingID):
+                // G15: open Blaise, select the meeting, and raise the confirm
+                // sheet itself. The notification is posted at the run-entry ask
+                // (§2a), when the meeting has no pending banner yet — routing to
+                // the banner alone would be a dead end.
+                let meeting = try? await MeetingRepository(database: self.database)
+                    .fetch(meetingID)
+                let outcome = await MainActor.run {
+                    let outcome = Self.routeParticipantConfirmClick(
+                        meetingID: meetingID, meeting: meeting, uiState: self.uiState)
+                    NSApp.activate(ignoringOtherApps: true)
+                    return outcome
+                }
+                // R4-F3: the standing sheet kept its meeting, so the clicked one
+                // needs its surface back — the click consumed the notification.
+                if outcome == .deferredToStandingSheet, let meeting {
+                    await self.notificationAdapter.postParticipantConfirmation(
+                        meetingID: meetingID, title: meeting.title)
+                }
             }
         }
         Task { [notificationAdapter, settings, captureStatus] in
@@ -716,6 +740,16 @@ final class AppEnvironment {
                         self.captureStatus.apply(.processingFinished)
                         self.refreshLastMeeting()
                     }
+                case .participantConfirmationNeeded(let id, let title):
+                    // G15: the gate parked this meeting for the FIRST time — post
+                    // the confirm notification once (the pipeline emits this event
+                    // once per park, never per resume re-park).
+                    let adapter = self.notificationAdapter
+                    Task { await adapter.postParticipantConfirmation(meetingID: id, title: title) }
+                case .participantAskRaised(let id, let title):
+                    // G15 §2a: the run just started and nobody is named yet —
+                    // raise the question now.
+                    Task { await self.raiseParticipantAsk(meetingID: id, title: title) }
                 default:
                     break
                 }
@@ -1077,6 +1111,146 @@ final class AppEnvironment {
     func sendNotificationTest() async {
         await notificationAdapter.postDiagnosticsTest()
         await refreshAutomationSurfaceStatus()
+    }
+
+    // MARK: - G15 participant confirmation (sheet backing)
+
+    /// G15 §2a: the pipeline raised the ask at its run entry (the earliest
+    /// point where "Blaise has no attendees" is a true statement — the Meet /
+    /// Slack roster absorbs there). Surface it: the sheet if Blaise is frontmost
+    /// (the user just pressed Stop, they are right here), otherwise the
+    /// `participantConfirm` notification. Processing continues either way;
+    /// answering before the run reaches its notes stage means it never parks.
+    /// The pipeline records the ask, so a later park does not notify twice.
+    func raiseParticipantAsk(meetingID: MeetingID, title: String) async {
+        switch Self.participantAskSurface(
+            appIsActive: NSApp.isActive, sheetPresenting: uiState.participantConfirmMeeting?.id)
+        {
+        case .sheet:
+            let meeting = try? await MeetingRepository(database: database).fetch(meetingID)
+            guard let meeting else { return }
+            uiState.participantConfirmMeeting = meeting
+            uiState.openMainWindowRequest += 1
+        case .notification:
+            await notificationAdapter.postParticipantConfirmation(
+                meetingID: meetingID, title: title)
+        }
+    }
+
+    /// The two designed surfaces for a run-entry ask (G15 §2a).
+    enum ParticipantAskSurface: Equatable {
+        case sheet
+        case notification
+    }
+
+    /// Which surface this ask may use. Blaise frontmost ⇒ the sheet, EXCEPT
+    /// while a confirm sheet is already presented: a second ask must never
+    /// overwrite the meeting the standing sheet is answering (R3-F4). The
+    /// presented sheet captured its subject at init, so overwriting the state
+    /// leaves the first sheet answering the first meeting and loses the second
+    /// question entirely — through both of its surfaces, since the pipeline
+    /// latch already counts it as asked. The notification is the designed
+    /// surface for "the sheet cannot be shown now"; it survives, and the user
+    /// reaches the second meeting from it.
+    static func participantAskSurface(
+        appIsActive: Bool, sheetPresenting: MeetingID?
+    ) -> ParticipantAskSurface {
+        appIsActive && sheetPresenting == nil ? .sheet : .notification
+    }
+
+    /// What a `participantConfirm` notification CLICK did with the shared sheet
+    /// state (R4-F3).
+    enum ParticipantClickOutcome: Equatable {
+        /// The clicked meeting is now the sheet's subject.
+        case presented
+        /// A DIFFERENT meeting's sheet was standing: it kept it, and the caller
+        /// owes the clicked meeting its notification back.
+        case deferredToStandingSheet
+    }
+
+    /// Routes a `participantConfirm` notification click under the SAME
+    /// presented-sheet rule as `participantAskSurface` (R4-F3). Installing the
+    /// clicked meeting over a standing sheet is exactly the overwrite that rule
+    /// exists to prevent: the presented sheet captured its own meeting at init,
+    /// so the write retargets nothing the user can see, and answering the
+    /// standing sheet then clears the clicked meeting's state — losing the
+    /// question through both of its surfaces. Deferring keeps the meeting
+    /// selected (its row and the parked banner are entry points) and tells the
+    /// caller to re-post the notification the click just consumed.
+    @MainActor
+    static func routeParticipantConfirmClick(
+        meetingID: MeetingID, meeting: Meeting?, uiState: AppUIState
+    ) -> ParticipantClickOutcome {
+        uiState.selectedMeetingID = meetingID
+        uiState.openMainWindowRequest += 1
+        let standing = uiState.participantConfirmMeeting
+        if let standing, standing.id != meetingID { return .deferredToStandingSheet }
+        uiState.participantConfirmMeeting = meeting
+        return .presented
+    }
+
+    /// Confirm-sheet pre-fill names (§3), in the spec's order: calendar
+    /// suggestions for the meeting's time window (attendees of the event the
+    /// start binds to), then grounded person-hint canonicals. Folded-deduped,
+    /// order-preserving. Empty when neither source has anything.
+    func participantPrefillNames(for meeting: Meeting) async -> [String] {
+        var names: [String] = []
+        // Calendar suggestions for the meeting's own time window.
+        let windowEnd = meeting.endedAt ?? meeting.startedAt
+        let snapshots = await calendarSuggestions.eventSnapshots(
+            from: meeting.startedAt.addingTimeInterval(-CalendarSuggestionBuilder.bindLeadSeconds),
+            to: windowEnd.addingTimeInterval(CalendarSuggestionBuilder.bindLeadSeconds))
+        if let event = CalendarSuggestionBuilder.bindingEvent(
+            for: meeting.startedAt, code: meeting.meetingCode, in: snapshots)
+        {
+            let userEmailFolded = userEmail.lowercased()
+            for attendee in event.attendees
+            where userEmailFolded.isEmpty || (attendee.email ?? "").lowercased() != userEmailFolded {
+                names.append(attendee.name)
+            }
+        }
+        // Grounded person hints (curated glossary names heard in this meeting).
+        names.append(contentsOf: await pipeline.groundedPersonNames(meetingID: meeting.id))
+        // Fold-dedup, order-preserving (surface preserved), empties dropped.
+        return ProcessingPipeline.foldedDedupedAttendees(names).map(\.name)
+    }
+
+    /// Whether this meeting's notes are already written — the state in which a
+    /// confirm/skip answer is moot (G15 §3 refuses it, and the auto-skip that
+    /// minted them already took the answer's place). The sheet reads it to tell
+    /// a refusal that can never succeed from one worth retrying (R3-F3).
+    func meetingHasNotes(_ meetingID: MeetingID) async -> Bool {
+        ((try? await NotesRepository(database: database).fetch(meetingID: meetingID)) ?? nil) != nil
+    }
+
+    /// Confirm-sheet caption count (§3): "Blaise heard N distinct voices".
+    func participantVoiceCount(for meetingID: MeetingID) async -> Int {
+        await pipeline.diarizationClusterCount(meetingID: meetingID)
+    }
+
+    /// Confirm (§3): write the confirmed attendee names and dispatch the
+    /// gate-bypassing notes-only resume. Returns whether it actually happened;
+    /// the notification is withdrawn ONLY on success, so a failure leaves every
+    /// recovery surface in place instead of looking like it worked.
+    @discardableResult
+    func confirmParticipants(meetingID: MeetingID, names: [String]) async -> Bool {
+        let confirmed =
+            (try? await pipeline.confirmParticipants(meetingID: meetingID, names: names)) ?? false
+        if confirmed { notificationAdapter.withdrawParticipantConfirmation(meetingID: meetingID) }
+        return confirmed
+    }
+
+    /// Skip (§3): proceed without attendees. "Don't ask again" flips the
+    /// preference off first. Same success contract as `confirmParticipants`.
+    @discardableResult
+    func skipParticipantConfirmation(meetingID: MeetingID, dontAskAgain: Bool) async -> Bool {
+        if dontAskAgain {
+            try? await settings.set(AutomationSettings.confirmParticipantsKey, to: false)
+        }
+        let skipped =
+            (try? await pipeline.skipParticipantConfirmation(meetingID: meetingID)) ?? false
+        if skipped { notificationAdapter.withdrawParticipantConfirmation(meetingID: meetingID) }
+        return skipped
     }
 
     /// The calendar Launch & Record action: open the Meet link in Google

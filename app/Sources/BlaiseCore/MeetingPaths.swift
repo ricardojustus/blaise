@@ -136,6 +136,22 @@ public struct MeetingPaths: Sendable {
         return meetingDirectory(meetingID).appendingPathComponent("audio_mic_\(part).m4a")
     }
 
+    /// The retained audio set of a meeting (G5 v1.3 audio delivery = exactly the
+    /// C1 retention set): every `audio*.m4a` in the meeting dir — the system
+    /// track (`audio.m4a`), the mic track (`audio_mic.m4a`), and any
+    /// part-suffixed files (`audio_2.m4a`, `audio_mic_2.m4a`, …). Sorted by name
+    /// for a stable delivery order. Empty when the dir has none or is absent. The
+    /// lossless `import.wav` is deliberately excluded (not an `*.m4a`).
+    public func retainedAudioURLs(_ meetingID: MeetingID) -> [URL] {
+        let dir = meetingDirectory(meetingID)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+        else { return [] }
+        return names
+            .filter { $0.hasPrefix("audio") && $0.hasSuffix(".m4a") }
+            .sorted()
+            .map { dir.appendingPathComponent($0) }
+    }
+
     public func rawASRURL(_ meetingID: MeetingID) -> URL {
         meetingDirectory(meetingID).appendingPathComponent("raw_asr.json")
     }

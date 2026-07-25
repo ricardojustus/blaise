@@ -42,6 +42,62 @@ public enum HandoffDestination: Sendable, Equatable {
         /// kept (`…localFolder.markdownSidecar`) so existing installs migrate
         /// with no settings loss.
         public static let localMarkdownSidecar = "handoff.localFolder.markdownSidecar"
+        /// Superseded-payload REMOVAL at the destination (G5 v1.3);
+        /// destination-independent. Absent ⇒ OFF ⇒ delivered payloads
+        /// ACCUMULATE, preserving the published "older versions are not
+        /// deleted" contract. `true` opts IN: after a delivery + D12
+        /// supersession this meeting's OTHER `<hash>.json` at the destination
+        /// are removed, so the destination holds exactly ONE current payload
+        /// per meeting.
+        ///
+        /// Default-OFF is deliberate and operator-ratified (24/07/2026). The
+        /// asymmetry decides it: an accumulating destination is trivially
+        /// tidied later, while deleted evidence cannot be recovered — and the
+        /// primary consumer is an Evidence Store whose defining property is
+        /// immutability, with downstream claims CITING the files by hash. A
+        /// destructive default would also have changed behaviour silently for
+        /// every existing install on upgrade, with nobody opting in.
+        public static let removeSupersededPayloads = "handoff.removeSupersededPayloads"
+        /// Audio delivery (G5 v1.3); destination-independent. Absent ⇒ OFF (the
+        /// privacy default). `true` copies the meeting's retained `audio*.m4a`
+        /// set into the destination meeting dir after the sidecar — a syncing
+        /// destination (iCloud/network) then means audio leaves the machine. The
+        /// payload bytes are unchanged (no audio field).
+        public static let deliverAudio = "handoff.deliverAudio"
+    }
+
+    /// The destination identity stamped on every delivered row and required to
+    /// match before a payload here may be deleted: the destination
+    /// CONFIGURATION as spelled, deliberately NOT the host that answered
+    /// (`handoff.hosts` is an ordered list of routes to ONE machine — C8 — so a
+    /// Tailscale→LAN failover must not read as a destination switch). A
+    /// configuration change therefore retires the previous destination's rows,
+    /// which is what makes a destination SWITCH safe (round-2 R2-C1).
+    ///
+    /// Every mismatch fails toward UNDER-deletion: a row whose identity is not
+    /// exactly this string is left alone. Whether a candidate is actually
+    /// deleted is decided by its BYTES, not by this string.
+    public func endpointIdentity() -> String {
+        switch self {
+        case .ssh(let settings, _):
+            return "ssh:\(settings.user)@\(settings.hosts.joined(separator: ","))"
+                + ":\(settings.remoteRoot)"
+        case .localFolder(let url, _):
+            return "local:\(url.path)"
+        }
+    }
+
+    /// Destination-independent (G5 v1.3): whether to REMOVE superseded payloads
+    /// at the destination. Absent ⇒ false ⇒ payloads accumulate (the default;
+    /// removal is the opt-in).
+    public static func removeSupersededPayloads(from store: SettingsStore) async -> Bool {
+        (try? await store.get(Key.removeSupersededPayloads, as: Bool.self)) ?? nil ?? false
+    }
+
+    /// Destination-independent (G5 v1.3): whether to deliver retained audio.
+    /// Absent ⇒ false ⇒ OFF (the privacy default).
+    public static func deliverAudio(from store: SettingsStore) async -> Bool {
+        (try? await store.get(Key.deliverAudio, as: Bool.self)) ?? nil ?? false
     }
 
     public var kind: Kind {

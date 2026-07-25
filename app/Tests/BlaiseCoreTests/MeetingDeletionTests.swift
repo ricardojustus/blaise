@@ -24,7 +24,7 @@ import Testing
         for item in items where item.meetingID == meeting.id {
             _ = try await HandoffRepository(database: harness.database)
                 .transition(item.id, to: .delivering)
-            _ = try await HandoffRepository(database: harness.database).markDelivered(item.id)
+            _ = try await HandoffRepository(database: harness.database).markDelivered(item.id, endpoint: testDestinationIdentity)
         }
         return (harness, meeting)
     }
@@ -266,7 +266,7 @@ import Testing
         // mark its claimed item delivered.
         try await harness.pipeline.deleteMeeting(meetingID: meeting.id)
         await #expect(throws: BlaiseDatabaseError.self) {
-            _ = try await HandoffRepository(database: harness.database).markDelivered(claimed.id)
+            _ = try await HandoffRepository(database: harness.database).markDelivered(claimed.id, endpoint: testDestinationIdentity)
         }
     }
 }

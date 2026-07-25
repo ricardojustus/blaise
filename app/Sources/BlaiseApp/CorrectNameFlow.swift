@@ -28,6 +28,19 @@ struct SpeakerRenamePopover: View {
     @State private var name: String = ""
     @State private var working = false
 
+    /// NH-E: the reserved `unattributed` label is renameable and its rename
+    /// applies IMMEDIATELY to every unattributed segment (no cluster to
+    /// mis-anchor, survives regeneration verbatim), so its copy states the true
+    /// scope and drops the no-diarization regenerate-deferral.
+    private var scopeCopy: String {
+        if SpeakerRename.isAnchorless(speakerLabel) {
+            return "Names every unattributed segment in this meeting and re-mints the record — no re-processing."
+        }
+        return hasDiarizationArtifact
+            ? "Renames the speaker everywhere in this meeting and re-mints the record — no re-processing."
+            : "This meeting has no saved diarization yet, so the rename is recorded but takes effect after the next Regenerate."
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Rename speaker")
@@ -37,9 +50,7 @@ struct SpeakerRenamePopover: View {
                 .foregroundStyle(.secondary)
             TextField("Name", text: $name)
                 .textFieldStyle(.roundedBorder)
-            Text(hasDiarizationArtifact
-                ? "Renames the speaker everywhere in this meeting and re-mints the record — no re-processing."
-                : "This meeting has no saved diarization yet, so the rename is recorded but takes effect after the next Regenerate.")
+            Text(scopeCopy)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             HStack {
