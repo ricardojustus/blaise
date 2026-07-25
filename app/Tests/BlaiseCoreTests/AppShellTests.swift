@@ -148,6 +148,39 @@ import Testing
         #expect(headers == [["Módulo", "Dono"], ["Risco", "Dono"]])
     }
 
+    /// A LEADING EMPTY CELL must not shift the row: values stay under their headers.
+    @Test func leadingEmptyCellKeepsColumnPlacement() {
+        let markdown = """
+            | Módulo | Dono | Status |
+            | --- | --- | --- |
+            |  | Quoll Harbor | pendente |
+            """
+        let blocks = MarkdownBlocks.parse(markdown)
+        guard case .table(_, let rows, _) = blocks[0].kind else {
+            Issue.record("expected a .table block, got \(blocks[0].kind)")
+            return
+        }
+        #expect(rows.map { $0.map { String($0.characters) } } == [["", "Quoll Harbor", "pendente"]])
+    }
+
+    /// A table FOLLOWED BY a paragraph keeps document order.
+    @Test func tableFollowedByParagraphKeepsOrder() {
+        let markdown = """
+            | Módulo | Dono |
+            | --- | --- |
+            | Warp core | Vexatron Labs |
+
+            Depois da tabela.
+            """
+        let blocks = MarkdownBlocks.parse(markdown)
+        #expect(blocks.count == 2)
+        if case .table = blocks[0].kind {} else {
+            Issue.record("expected a .table block first, got \(blocks[0].kind)")
+        }
+        #expect(blocks[1].kind == .paragraph)
+        #expect(String(blocks[1].text.characters) == "Depois da tabela.")
+    }
+
     @Test func emptyAndPlainInputs() {
         #expect(MarkdownBlocks.parse("").isEmpty)
         let plain = MarkdownBlocks.parse("só um parágrafo")
