@@ -291,6 +291,20 @@ public final class HandoffSettingsModel {
             (try? await settings.get(HandoffDestination.Key.kind, as: HandoffDestination.Kind.self))
             ?? nil ?? .ssh
         let previousSSH = await HandoffSettings.load(from: settings)
+        let candidate = HandoffSettings(
+            user: user.trimmingCharacters(in: .whitespaces),
+            identityFile: identityFile.trimmingCharacters(in: .whitespaces),
+            hosts: hosts,
+            remoteRoot: remoteRoot.trimmingCharacters(in: .whitespaces))
+        // ORDER IS LOAD-BEARING (round-4 R4-F1): the epoch bump goes FIRST,
+        // BEFORE the destination fields it retires authority for. Each `set` is
+        // an independent write; bump-then-edit means a partial failure leaves a
+        // BUMPED epoch against unchanged fields (nothing here authorizes a
+        // deletion — safe), where edit-then-bump left the NEW destination
+        // wearing the OLD instance's authority.
+        if previousKind != destinationKind || previousSSH != candidate {
+            await HandoffDestination.bumpEpoch(in: settings)
+        }
         // Persist the active destination kind (G5). SSH fields are always
         // persisted (so switching back keeps them); the sidecar toggle is
         // persisted for the local folder.
@@ -306,18 +320,10 @@ public final class HandoffSettingsModel {
         // Persist the verify/repair toggle (forward renders only). The dev env
         // override BLAISE_DIGEST_VERIFY=1 forces the pass on regardless of this.
         try? await settings.set(MemoryDigestSettings.verifyEnabledKey, to: verifyMemoryDigest)
-        let candidate = HandoffSettings(
-            user: user.trimmingCharacters(in: .whitespaces),
-            identityFile: identityFile.trimmingCharacters(in: .whitespaces),
-            hosts: hosts,
-            remoteRoot: remoteRoot.trimmingCharacters(in: .whitespaces))
         try? await settings.set(HandoffSettings.Key.user, to: candidate.user)
         try? await settings.set(HandoffSettings.Key.identityFile, to: candidate.identityFile)
         try? await settings.set(HandoffSettings.Key.hosts, to: candidate.hosts)
         try? await settings.set(HandoffSettings.Key.remoteRoot, to: candidate.remoteRoot)
-        if previousKind != destinationKind || previousSSH != candidate {
-            await HandoffDestination.bumpEpoch(in: settings)
-        }
 
         switch destinationKind {
         case .ssh:

@@ -525,6 +525,8 @@ import Testing
         try await enableGate(harness)
         let meeting = try await harness.importTestMeeting(attendees: [])
 
+        // R4-F5: the ask must not emit AFTER the cancel it suspended through.
+        let events = await harness.pipeline.events()
         await #expect(throws: (any Error).self) {
             _ = try await harness.pipeline.process(meetingID: meeting.id)
         }
@@ -535,6 +537,16 @@ import Testing
             try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id)
                 == nil,
             "a cancelled run mints no notes")
+
+        // R4-F5: a run that is already cancelled has no question to ask — the
+        // sheet it raised could only be a stale one over a meeting that will
+        // never mint notes, and raising it burns the single-ask latch.
+        var asks = 0
+        for await event in events {
+            if case .participantAskRaised = event { asks += 1 }
+            if case .runFailed = event { break }
+        }
+        #expect(asks == 0, "no ask is raised for a run the user already cancelled")
     }
 
     // MARK: - AC2c: the LATE answer — after the gate decided, before the marker

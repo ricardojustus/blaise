@@ -252,13 +252,27 @@ private func audioNames(_ dir: URL) -> [String] {
             user: handoffValidExample.user, host: handoffValidExample.hosts[0],
             identityFile: handoffValidExample.identityFile,
             remoteDir: remoteDir, hashes: [v1.versionHash]))
-        #expect(transport.calls[2].argv.last
-            == "cd '\(remoteDir)' 2>/dev/null || exit 0; "
+        let expectedCommand: String =
+            "cd '\(remoteDir)' 2>/dev/null || exit 0; "
             + "for f in '\(v1.versionHash).json'; do [ -f \"$f\" ] || continue; "
-            + "echo \"$f\"; rm -f -- \"$f\"; done")
+            + "A=$(/usr/bin/shasum -a 256 \"$f\" | cut -d' ' -f1); "
+            + "if [ \"$A\" = \"${f%.json}\" ]; then echo \"removed $f\"; rm -f -- \"$f\"; "
+            + "else echo \"skipped $f\"; fi; done"
+        #expect(transport.calls[2].argv.last == expectedCommand)
         let command = try #require(transport.calls[2].argv.last)
         #expect(!command.contains("*.json"), "no glob: only Blaise's own records authorize a delete")
         #expect(!command.contains(v2.versionHash), "the just-delivered payload is never named")
+        // G5 v1.7 (R4-F1/R4-F2), the remote half of verify-before-delete: the
+        // file's own bytes must hash to its own name — the same
+        // `shasum -a 256` the DELIVERY command already trusts — and the `rm`
+        // sits INSIDE that branch. A named-but-foreign remote file is echoed
+        // `skipped`, never removed.
+        let matchBranch = try #require(command.range(of: "if [ \"$A\" = \"${f%.json}\" ]"))
+        let removal = try #require(command.range(of: "rm -f -- "))
+        #expect(command.contains("A=$(/usr/bin/shasum -a 256 \"$f\" | cut -d' ' -f1)"))
+        #expect(
+            removal.lowerBound > matchBranch.lowerBound,
+            "the delete is inside the hash-match branch, never before it")
     }
 
     /// C-1: a destination dir holding a non-payload JSON, a DIRECTORY named
@@ -520,6 +534,151 @@ private func audioNames(_ dir: URL) -> [String] {
         #expect(
             transport.calls.count == 1,
             "v1 was delivered to the previous instance: no candidate here, so no remote rm command")
+    }
+
+    // MARK: - G5 v1.7 (R4-F1 / R4-F2): verify before delete
+
+    /// R4-F2 (Critical), Codex's trace at the seam that times it: the local
+    /// cleanup dereferences the destination PATHNAME long after the resource
+    /// identity was sampled, so a store swapped in at that pathname during the
+    /// drain is the one that receives the delete. The identity metadata cannot
+    /// see it. The BYTES can: a foreign file does not hash to the name it
+    /// wears, so it survives — and the drain's own delivery is untouched at the
+    /// store it actually went to.
+    @Test func localCleanupNeverDeletesAForeignFileAtAResourceSwappedMidDrain() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Swapped mid-drain")
+        let parent = try g5TempFolder()
+        let path = parent.appendingPathComponent("Evidence", isDirectory: true)
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        try await selectLocalDest(database, path, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        #expect(jsonNames(path.appendingPathComponent(v1.meetingID))
+            == ["\(v1.versionHash).json"], "v1 landed at the store that was here")
+
+        _ = try await enqueueSecondVersion(database, v1.meetingID)
+        let movedAside = parent.appendingPathComponent("Evidence-old", isDirectory: true)
+        let foreign = Data("another store's file, wearing the same name".utf8)
+        let worker = HandoffWorker(
+            database: database, prober: MockProber(), nonce: { testNonce },
+            duringCandidateAcquisition: {
+                // The sampled resource moves; a DIFFERENT store takes the
+                // pathname, holding a file with v1's name that it wrote itself.
+                try? FileManager.default.moveItem(at: path, to: movedAside)
+                let dir = path.appendingPathComponent(v1.meetingID, isDirectory: true)
+                try? FileManager.default.createDirectory(
+                    at: dir, withIntermediateDirectories: true)
+                try? foreign.write(to: dir.appendingPathComponent("\(v1.versionHash).json"))
+            })
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        let replacement = path.appendingPathComponent(v1.meetingID)
+        #expect(
+            jsonNames(replacement) == ["\(v1.versionHash).json"],
+            "the replacement store keeps its file: the name was authorized, the bytes were not")
+        #expect(
+            try Data(contentsOf: replacement.appendingPathComponent("\(v1.versionHash).json"))
+                == foreign,
+            "untouched, byte for byte")
+    }
+
+    /// The other half of the same rule, asserted explicitly so the pair
+    /// discriminates a CONTENT check from a blanket "never delete after a
+    /// swap": the file planted at the swapped-in store is BYTE-IDENTICAL to the
+    /// payload Blaise delivered, so it hashes to its own name and may go —
+    /// removing it destroys nothing unique, which is exactly why
+    /// verify-before-delete is safe rather than merely conservative.
+    @Test func localCleanupStillRemovesAByteIdenticalPayloadAtASwappedResource() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Identical mid-drain")
+        let parent = try g5TempFolder()
+        let path = parent.appendingPathComponent("Evidence", isDirectory: true)
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        try await selectLocalDest(database, path, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        let deliveredBytes = try Data(
+            contentsOf: path.appendingPathComponent(v1.meetingID)
+                .appendingPathComponent("\(v1.versionHash).json"))
+        #expect(
+            EvidencePayloadBuilder.sha256Hex(deliveredBytes) == v1.versionHash,
+            "the delivered payload hashes to its own name — the store is content-addressed")
+
+        _ = try await enqueueSecondVersion(database, v1.meetingID)
+        let movedAside = parent.appendingPathComponent("Evidence-old", isDirectory: true)
+        let worker = HandoffWorker(
+            database: database, prober: MockProber(), nonce: { testNonce },
+            duringCandidateAcquisition: {
+                try? FileManager.default.moveItem(at: path, to: movedAside)
+                let dir = path.appendingPathComponent(v1.meetingID, isDirectory: true)
+                try? FileManager.default.createDirectory(
+                    at: dir, withIntermediateDirectories: true)
+                try? deliveredBytes.write(to: dir.appendingPathComponent("\(v1.versionHash).json"))
+            })
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(path.appendingPathComponent(v1.meetingID)) == [],
+            "identical bytes ARE the payload the records authorize: removable")
+    }
+
+    /// R4-F1 (Critical): the destination-defining setting was written and the
+    /// epoch write beside it was not — the failure Codex's trace turns into
+    /// revived deletion authority. Here the epoch value is present but
+    /// UNREADABLE, which pre-fix read as `0`: the value that maximally matches
+    /// historical rows. It is not a value — no authority is derivable, so the
+    /// drain deletes nothing. The planted file is Blaise's OWN delivered
+    /// payload, so it hashes to its own name and the content check would let it
+    /// go; only the epoch fix saves it.
+    @Test func anUnreadableDestinationEpochDeletesNothingThisDrain() async throws {
+        let database = try makeDatabase()
+        let v1 = try await seedDeliverable(database, title: "Epoch unreadable")
+        let folder = try g5TempFolder()
+        try await selectLocalDest(database, folder, sidecar: false, removeSuperseded: true)
+
+        let first = makeWorker(database)
+        await first.start()
+        await first.waitUntilSettled()
+        let destDir = folder.appendingPathComponent(v1.meetingID)
+        #expect(jsonNames(destDir) == ["\(v1.versionHash).json"])
+        let deliveredBytes = try Data(
+            contentsOf: destDir.appendingPathComponent("\(v1.versionHash).json"))
+        #expect(
+            EvidencePayloadBuilder.sha256Hex(deliveredBytes) == v1.versionHash,
+            "the candidate hashes to its own name: the content check does not save it here")
+
+        // The destination edit landed; the epoch write beside it did not.
+        try await database.pool.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO app_setting (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                arguments: [HandoffDestination.Key.destinationEpoch, "not-an-int"])
+        }
+        #expect(
+            await HandoffDestination.epoch(from: SettingsStore(database: database)) == nil,
+            "an unreadable epoch is nil — distinct from the absent key's 0")
+
+        let v2 = try await enqueueSecondVersion(database, v1.meetingID)
+        let worker = makeWorker(database)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(
+            jsonNames(destDir) == ["\(v1.versionHash).json", "\(v2.versionHash).json"].sorted(),
+            "no readable epoch ⇒ no deletion authority ⇒ no cleanup this drain")
+        #expect(
+            try Data(contentsOf: destDir.appendingPathComponent("\(v1.versionHash).json"))
+                == deliveredBytes,
+            "untouched, byte for byte")
     }
 
     /// The other half of R2-C1: a version that only ever sat in the queue

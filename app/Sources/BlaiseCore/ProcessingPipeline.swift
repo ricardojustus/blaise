@@ -1220,7 +1220,8 @@ public actor ProcessingPipeline {
         // this is the earliest moment the question is honest. Nothing waits on
         // the answer: the stages below run concurrently with the sheet, and an
         // answer that lands before the notes stage means the meeting never parks.
-        await raiseParticipantAskAtRunEntry(meeting: meeting, regeneration: regeneration)
+        await raiseParticipantAskAtRunEntry(
+            meeting: meeting, regeneration: regeneration, token: cancelToken)
 
         let context = RunContext(meetingID: meetingID, regeneration: regeneration)
         context.cancelToken = cancelToken
@@ -1293,7 +1294,7 @@ public actor ProcessingPipeline {
         meeting meetingAtEntry: Meeting, sourceWAV: URL?, tempWAV: URL, tempMicWAV: URL,
         captured: Bool, context: RunContext, vocabulary: PipelineVocabulary
     ) async throws -> PipelineRunRecord {
-        // G15 §2: the participant confirmation is raised at the recording STOP,
+        // G15 §2a: the participant confirmation is raised at run entry,
         // so the user's answer can land while this run is still transcribing —
         // the attendees are re-read at the notes stage below (the only field
         // that answer writes).
@@ -2052,13 +2053,22 @@ public actor ProcessingPipeline {
     /// refused. Recording the ask also suppresses the notes-stage park's second
     /// notification (one ask per run, never one per park) and starts the
     /// auto-skip window.
-    private func raiseParticipantAskAtRunEntry(meeting: Meeting, regeneration: Bool) async {
+    private func raiseParticipantAskAtRunEntry(
+        meeting: Meeting, regeneration: Bool, token: CancellationToken
+    ) async {
         if let duringRunEntryAsk { await duringRunEntryAsk(meeting.id) }
         guard !regeneration, meeting.attendees.isEmpty,
             !NotesPendingClass.isPending(meeting.lastProcessingError),
             await AutomationSettings.confirmParticipants(from: settings),
             !(await hasPersistedNotes(meeting.id))
         else { return }
+        // R4-F5: every read above is a suspension the user's Cancel can land in
+        // (G10 §1 installs the token before this call for exactly that reason).
+        // A cancelled run has no question to ask — asking would raise a sheet
+        // for a meeting that will never mint notes, and burn the single-ask
+        // latch. Checked here, after the reads and before anything is recorded
+        // or emitted.
+        guard !token.isCancelled else { return }
         guard participantStopAsks.insert(meeting.id).inserted else { return }
         participantAskTimes[meeting.id] = now()
         emit(.participantAskRaised(meeting.id, title: meeting.title))

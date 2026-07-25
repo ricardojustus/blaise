@@ -77,15 +77,25 @@ public enum HandoffCommand {
     /// queue records and re-validates each as 64-hex (`isValidVersionHash`)
     /// before it reaches this interpolation; `remoteDir` is validated upstream
     /// (`HandoffSettings.isValidRemoteRoot` + ULID). The single-quote model is
-    /// the whole injection defense, unchanged. Each removed name is echoed to
+    /// the whole injection defense, unchanged. Each name's outcome is echoed to
     /// stdout so the sweep leaves an auditable record the worker logs. `[ -f ]`
     /// skips an absent name and never removes a directory; `rm -f --` so a
     /// dash-leading name is never parsed as options.
+    ///
+    /// VERIFY BEFORE DELETE (G5 v1.7, round-4 R4-F1/R4-F2): the remote file's
+    /// own bytes decide, using the same `shasum -a 256` the DELIVERY command
+    /// already trusts for verify-before-rename. `${f%.json}` is the name's own
+    /// stem — no new interpolated value, so the single-quote model is unchanged
+    /// (the hashes are 64-hex-validated upstream). A remote file that does not
+    /// hash to its own name is not the payload Blaise delivered here and is
+    /// echoed as `skipped`, never removed.
     public static func cleanupRemoteCommand(remoteDir: String, hashes: [String]) -> String {
         let names = hashes.map { "'\($0).json'" }.joined(separator: " ")
         return "cd '\(remoteDir)' 2>/dev/null || exit 0; "
             + "for f in \(names); do [ -f \"$f\" ] || continue; "
-            + "echo \"$f\"; rm -f -- \"$f\"; done"
+            + "A=$(/usr/bin/shasum -a 256 \"$f\" | cut -d' ' -f1); "
+            + "if [ \"$A\" = \"${f%.json}\" ]; then echo \"removed $f\"; rm -f -- \"$f\"; "
+            + "else echo \"skipped $f\"; fi; done"
     }
 
     /// Full ssh argv for the superseded-payload cleanup — same option set +

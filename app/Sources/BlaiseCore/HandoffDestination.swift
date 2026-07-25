@@ -72,18 +72,28 @@ public enum HandoffDestination: Sendable, Equatable {
         public static let destinationEpoch = "handoff.destinationEpoch"
     }
 
-    /// The active destination epoch (absent ⇒ 0).
-    public static func epoch(from store: SettingsStore) async -> Int {
-        (try? await store.get(Key.destinationEpoch, as: Int.self)) ?? nil ?? 0
+    /// The active destination epoch: `0` when the key is ABSENT (never bumped),
+    /// `nil` when the settings read FAILED. The distinction is load-bearing
+    /// (R4-F1): a failed read spelled `0` is the value that MAXIMALLY matches
+    /// historical rows, so it re-arms deletion authority for the epoch-0
+    /// instance. `nil` means "no authority is derivable this drain" — the
+    /// worker skips cleanup, and `bumpEpoch` declines to count down over a
+    /// value it could not read.
+    public static func epoch(from store: SettingsStore) async -> Int? {
+        do { return try await store.get(Key.destinationEpoch, as: Int.self) ?? 0 } catch {
+            return nil
+        }
     }
 
     /// Records that the destination changed: the next delivery stamps a new
     /// identity, and every row stamped before this call stops authorizing
     /// deletion. Called from the Settings model on a kind switch, a folder
-    /// re-pick, or an SSH settings edit.
+    /// re-pick, or an SSH settings edit. An unreadable current value is left
+    /// alone — writing `1` over an unread higher epoch would resurrect the
+    /// authority this call exists to retire.
     public static func bumpEpoch(in store: SettingsStore) async {
-        let next = await epoch(from: store) + 1
-        try? await store.set(Key.destinationEpoch, to: next)
+        guard let current = await epoch(from: store) else { return }
+        try? await store.set(Key.destinationEpoch, to: current + 1)
     }
 
     /// The destination-INSTANCE identity stamped on every delivered row and

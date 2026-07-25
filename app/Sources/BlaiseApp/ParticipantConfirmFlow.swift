@@ -26,6 +26,10 @@ final class ParticipantConfirmModel {
     /// Set when Confirm/Skip did not take effect: the sheet stays open with this
     /// message instead of dismissing as if it had worked.
     var errorMessage: String?
+    /// R4-F4: the answer can never succeed (the notes were already written), so
+    /// the sheet stays open showing WHY, with a single Close — nothing left to
+    /// retry, nothing left to answer.
+    var terminal = false
 
     init(meeting: Meeting, env: AppEnvironment) {
         self.meeting = meeting
@@ -71,6 +75,7 @@ final class ParticipantConfirmModel {
         let ok = await env.confirmParticipants(meetingID: meeting.id, names: enteredNames)
         let outcome = await resolve(ok: ok, retry: "Couldn't save the participants. Try again.")
         errorMessage = outcome.message
+        terminal = outcome.terminal
         working = false
         return outcome.dismiss
     }
@@ -82,6 +87,7 @@ final class ParticipantConfirmModel {
             meetingID: meeting.id, dontAskAgain: dontAskAgain)
         let outcome = await resolve(ok: ok, retry: "Couldn't skip right now. Try again.")
         errorMessage = outcome.message
+        terminal = outcome.terminal
         working = false
         return outcome.dismiss
     }
@@ -96,22 +102,32 @@ final class ParticipantConfirmModel {
     struct AnswerOutcome: Equatable {
         var dismiss: Bool
         var message: String?
+        /// The answer can never succeed — the sheet stays open on its message
+        /// with a single Close, and that Close is the dismissal (R4-F4).
+        var terminal = false
     }
 
     /// R3-F3: what the sheet does with the pipeline's answer. A refusal against
     /// a meeting whose notes are ALREADY written is not a retryable failure —
     /// the opt-in auto-skip took the answer's place after the five-minute window
     /// (G15 §2c) and §3 refuses a post-notes confirmation — so the sheet states
-    /// that plainly and closes instead of telling the user to retry something
-    /// that can never succeed. Every other refusal keeps the sheet open with its
-    /// retry message; the Cancel button is the exit there.
+    /// that plainly instead of telling the user to retry something that can
+    /// never succeed.
+    ///
+    /// R4-F4: it states it WHERE IT IS READ. Dismissing in the same turn as the
+    /// message was assigned removed the only view containing it before a render
+    /// pass — a silent close. The sheet therefore stays open (`dismiss: false`)
+    /// in the TERMINAL shape, whose only control is Close; the exit is still one
+    /// click and still cannot be retried into a dead end. Every other refusal
+    /// keeps the sheet open with its retry message; Cancel is the exit there.
     static func outcome(
         succeeded: Bool, notesAlreadyWritten: Bool, retry: String
     ) -> AnswerOutcome {
         if succeeded { return AnswerOutcome(dismiss: true, message: nil) }
         if notesAlreadyWritten {
             return AnswerOutcome(
-                dismiss: true, message: "Notes were generated without attendees.")
+                dismiss: false, message: "Notes were generated without attendees.",
+                terminal: true)
         }
         return AnswerOutcome(dismiss: false, message: retry)
     }
@@ -187,29 +203,40 @@ struct ParticipantConfirmSheet: View {
             Divider()
 
             HStack {
-                Toggle("Don't ask again", isOn: $dontAskAgain)
-                    .toggleStyle(.checkbox)
-                    .font(.callout)
-                Spacer()
-                // R3-F3: the dismissal control every other sheet in the app has.
-                // Closing answers nothing — the question stays on the meeting's
-                // row (and its notification) until it is answered or auto-skipped.
-                Button("Cancel") { isPresented = false }
-                    .keyboardShortcut(.cancelAction)
+                if model.terminal {
+                    // R4-F4: nothing here can be answered any more (the notes
+                    // are written). The reason above stays on screen and Close
+                    // is the whole control set — no Confirm/Skip to press into
+                    // a refusal, no Cancel that reads like "keep the question".
+                    Spacer()
+                    Button("Close") { isPresented = false }
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Toggle("Don't ask again", isOn: $dontAskAgain)
+                        .toggleStyle(.checkbox)
+                        .font(.callout)
+                    Spacer()
+                    // R3-F3: the dismissal control every other sheet in the app
+                    // has. Closing answers nothing — the question stays on the
+                    // meeting's row (and its notification) until it is answered
+                    // or auto-skipped.
+                    Button("Cancel") { isPresented = false }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(model.working)
+                    Button("Skip") {
+                        Task {
+                            if await model.skip(dontAskAgain: dontAskAgain) { isPresented = false }
+                        }
+                    }
                     .disabled(model.working)
-                Button("Skip") {
-                    Task {
-                        if await model.skip(dontAskAgain: dontAskAgain) { isPresented = false }
+                    Button("Confirm") {
+                        Task {
+                            if await model.confirm() { isPresented = false }
+                        }
                     }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.working || model.loading || !model.hasAnyName)
                 }
-                .disabled(model.working)
-                Button("Confirm") {
-                    Task {
-                        if await model.confirm() { isPresented = false }
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(model.working || model.loading || !model.hasAnyName)
             }
         }
         .padding(20)

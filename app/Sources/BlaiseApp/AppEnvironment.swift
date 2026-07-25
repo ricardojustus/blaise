@@ -549,11 +549,17 @@ final class AppEnvironment {
                 // the banner alone would be a dead end.
                 let meeting = try? await MeetingRepository(database: self.database)
                     .fetch(meetingID)
-                await MainActor.run {
-                    self.uiState.selectedMeetingID = meetingID
-                    self.uiState.participantConfirmMeeting = meeting
-                    self.uiState.openMainWindowRequest += 1
+                let outcome = await MainActor.run {
+                    let outcome = Self.routeParticipantConfirmClick(
+                        meetingID: meetingID, meeting: meeting, uiState: self.uiState)
                     NSApp.activate(ignoringOtherApps: true)
+                    return outcome
+                }
+                // R4-F3: the standing sheet kept its meeting, so the clicked one
+                // needs its surface back — the click consumed the notification.
+                if outcome == .deferredToStandingSheet, let meeting {
+                    await self.notificationAdapter.postParticipantConfirmation(
+                        meetingID: meetingID, title: meeting.title)
                 }
             }
         }
@@ -1122,6 +1128,37 @@ final class AppEnvironment {
         appIsActive: Bool, sheetPresenting: MeetingID?
     ) -> ParticipantAskSurface {
         appIsActive && sheetPresenting == nil ? .sheet : .notification
+    }
+
+    /// What a `participantConfirm` notification CLICK did with the shared sheet
+    /// state (R4-F3).
+    enum ParticipantClickOutcome: Equatable {
+        /// The clicked meeting is now the sheet's subject.
+        case presented
+        /// A DIFFERENT meeting's sheet was standing: it kept it, and the caller
+        /// owes the clicked meeting its notification back.
+        case deferredToStandingSheet
+    }
+
+    /// Routes a `participantConfirm` notification click under the SAME
+    /// presented-sheet rule as `participantAskSurface` (R4-F3). Installing the
+    /// clicked meeting over a standing sheet is exactly the overwrite that rule
+    /// exists to prevent: the presented sheet captured its own meeting at init,
+    /// so the write retargets nothing the user can see, and answering the
+    /// standing sheet then clears the clicked meeting's state — losing the
+    /// question through both of its surfaces. Deferring keeps the meeting
+    /// selected (its row and the parked banner are entry points) and tells the
+    /// caller to re-post the notification the click just consumed.
+    @MainActor
+    static func routeParticipantConfirmClick(
+        meetingID: MeetingID, meeting: Meeting?, uiState: AppUIState
+    ) -> ParticipantClickOutcome {
+        uiState.selectedMeetingID = meetingID
+        uiState.openMainWindowRequest += 1
+        let standing = uiState.participantConfirmMeeting
+        if let standing, standing.id != meetingID { return .deferredToStandingSheet }
+        uiState.participantConfirmMeeting = meeting
+        return .presented
     }
 
     /// Confirm-sheet pre-fill names (§3), in the spec's order: calendar
