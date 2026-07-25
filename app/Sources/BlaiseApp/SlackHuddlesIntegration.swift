@@ -491,8 +491,7 @@ actor SlackSocketClient {
         guard let urlError = error as? URLError else { return false }
         switch urlError.code {
         case .notConnectedToInternet, .networkConnectionLost, .timedOut,
-            .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
-            .dataNotAllowed, .internationalRoamingOff:
+            .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed:
             return true
         default:
             return false

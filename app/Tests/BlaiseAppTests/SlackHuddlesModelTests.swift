@@ -264,8 +264,16 @@ struct SlackHuddlesModelTests {
         // stale disable must not clear the identity the re-enable just pushed.
         model.setEnabled(false)
         model.setEnabled(true)
+        // Waits for a TRANSITION rather than a state: `enabled` already holds
+        // its expected value here, so settling on it would not wait at all.
+        // Only the surviving lifecycle task can persist the new member id, so
+        // seeing it proves that task completed.
         #expect(
-            await settleLifecycle(settings, memberID: "U987ZY6XW"),
+            await waitUntilApp {
+                let persisted = try? await settings.get(
+                    SlackHuddlesModel.settingsKey, as: SlackHuddlesSettings.self)
+                return (persisted ?? nil)?.memberID == "U987ZY6XW"
+            },
             "the surviving lifecycle task never completed")
 
         await tracker.handle(
@@ -290,20 +298,6 @@ struct SlackHuddlesModelTests {
             let persisted = try? await settings.get(
                 SlackHuddlesModel.settingsKey, as: SlackHuddlesSettings.self)
             return (persisted ?? nil)?.enabled == expected
-        }
-    }
-
-    /// Waits for a TRANSITION rather than a state. Use when the value being
-    /// waited on may already hold the expected result — `settleLifecycle` would
-    /// then return without waiting at all, because the poll evaluates its
-    /// condition before its first sleep. Only the surviving lifecycle task can
-    /// persist the new member id, so seeing it proves that task completed.
-    private func settleLifecycle(_ settings: SettingsStore, memberID expected: String) async -> Bool
-    {
-        await waitUntilApp {
-            let persisted = try? await settings.get(
-                SlackHuddlesModel.settingsKey, as: SlackHuddlesSettings.self)
-            return (persisted ?? nil)?.memberID == expected
         }
     }
 

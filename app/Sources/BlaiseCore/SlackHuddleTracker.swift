@@ -19,14 +19,6 @@ public actor SlackHuddleTracker {
     /// Heartbeat cadence while in a call (feeds MeetCallTracker's 5-min
     /// watchdog, same role as the extension's 1 s poll heartbeat).
     public static let heartbeatIntervalSeconds: TimeInterval = 60
-    /// Expiration ADVISORY threshold: `huddle_state` can linger after a huddle
-    /// ends, so this many seconds past `huddle_state_expiration_ts` with no
-    /// refreshing self event means the stamp is stale. The stamp is untrusted
-    /// JSON compared against wall clock, and Slack's refresh cadence for it is
-    /// unverified, so a passed expiry is LOGGED AND CLEARED — never treated as
-    /// self-left. Ending a live recording on this signal would destroy the
-    /// meeting's transcript and notes irrecoverably (hard floor 1).
-    public static let expirationBackstopSeconds: TimeInterval = 120
     /// Liveness-belief bound. `currentCallID` is BELIEF, refreshed only by a
     /// genuine self event; the heartbeat below is manufactured from it, and
     /// downstream `MeetCallTracker` treats every heartbeat as evidence the call
@@ -62,7 +54,7 @@ public actor SlackHuddleTracker {
     /// is not guaranteed.
     public static let foreignRingSeconds: TimeInterval = 60
     /// A single evaluation tick drives roster-flush coalescing (5 s),
-    /// heartbeat (60 s, timestamp-gated), the expiration advisory, and the liveness-belief bound.
+    /// heartbeat (60 s, timestamp-gated), and the liveness-belief bound.
     public static let tickIntervalSeconds: TimeInterval = 5
     /// Dedupe-key ring bound (redelivered-envelope guard). A session never
     /// approaches this; the FIFO cap only keeps memory flat over a long uptime.
@@ -85,7 +77,6 @@ public actor SlackHuddleTracker {
     /// removes the entry (stops heartbeating presence) but the attendee is
     /// already durably queued, so the roster is never retracted downstream.
     private var participants: [String: Participant] = [:]
-    private var expirationTs: Int64?
     private var lastSelfEventAt: Date?
     /// One-shot latch so the liveness-belief-stale notice logs once per call,
     /// not every 5 s tick. Reset wherever `lastSelfEventAt` is set or cleared.
@@ -147,7 +138,6 @@ public actor SlackHuddleTracker {
         selfUserID = trimmed
         currentCallID = nil
         participants = [:]
-        expirationTs = nil
         lastSelfEventAt = nil
         livenessBeliefStale = false
         owesRevivalHeartbeat = false
@@ -160,8 +150,8 @@ public actor SlackHuddleTracker {
     }
 
     /// Production 5 s evaluation timer (roster coalescing + heartbeat +
-    /// expiration advisory + liveness bound). Tests never call it — they drive `tick(now:)`
-    /// with an injected clock, exactly like `MeetCallTracker`.
+    /// liveness bound). Tests never call it — they drive `tick(now:)` with an
+    /// injected clock, exactly like `MeetCallTracker`.
     public func startTicking() {
         guard tickTask == nil else { return }
         tickTask = Task { [weak self] in
@@ -207,9 +197,8 @@ public actor SlackHuddleTracker {
     // MARK: - Input: periodic evaluation
 
     /// One evaluation pass (production: every 5 s). Flushes a coalesced roster,
-    /// applies the expiration advisory, emits a heartbeat when due, and stops
-    /// all manufactured liveness once the belief goes stale. Also
-    /// prunes the foreign-event ring while idle.
+    /// emits a heartbeat when due, and stops all manufactured liveness once the
+    /// belief goes stale. Also prunes the foreign-event ring while idle.
     public func tick(now injected: Date? = nil) async {
         let clock = injected ?? now()
         pruneForeignRing(before: clock)
@@ -233,22 +222,6 @@ public actor SlackHuddleTracker {
             // alternative: the downstream monotonic guard drops the second
             // (the same-millisecond collision C15 v1.1 item 4 closed).
             await flushRoster(at: clock)
-        }
-
-        // Expiration ADVISORY: `now > huddle_state_expiration_ts + 120 s` with
-        // no refreshing self event. Slack's refresh cadence for
-        // `huddle_state_expiration_ts` during a long huddle is UNVERIFIED (the
-        // spec's live-workspace touchpoint is open), so a passed expiry must
-        // never end the call — a stale stamp on a live huddle would auto-stop a
-        // real recording mid-meeting (hard floor 1). Log once and clear the
-        // stamp; automatic stops belong to the audio-keyed silence watchdog and
-        // an explicit self leave event, both grounded in signals we trust.
-        if let exp = expirationTs,
-            clock.timeIntervalSince1970 > Double(exp) + Self.expirationBackstopSeconds
-        {
-            logger.notice(
-                "huddle expiry passed for \(callID, privacy: .public) with no refresh — advisory only, call kept alive")
-            expirationTs = nil
         }
 
         // Liveness-belief bound: stop MANUFACTURING heartbeats once no genuine
@@ -281,11 +254,9 @@ public actor SlackHuddleTracker {
     private func handleSelfEvent(_ event: SlackHuddleEvent, at at: Date) async {
         if event.isInHuddle, let callID = event.callID {
             if currentCallID == callID {
-                // Refresh: same call, no lifecycle re-emit. Take the latest
-                // event's expiration verbatim (a refresh that omits it clears
-                // the advisory — a live huddle is kept alive by heartbeats/the
-                // watchdog, not force-ended on a stale expiry).
-                expirationTs = event.expirationTs
+                // Refresh: same call, no lifecycle re-emit. A live huddle is
+                // kept alive by heartbeats and the downstream watchdog; the
+                // event's expiry stamp is never consulted.
                 lastSelfEventAt = at
                 livenessBeliefStale = false
                 // `owesRevivalHeartbeat` is deliberately NOT cleared here. This
@@ -301,7 +272,7 @@ public actor SlackHuddleTracker {
             if currentCallID != nil {
                 await endCurrentCall(reason: "left", at: at)
             }
-            await startCall(callID: callID, expirationTs: event.expirationTs, at: at)
+            await startCall(callID: callID, at: at)
         } else {
             // State cleared / not in a huddle → self left.
             if currentCallID != nil {
@@ -310,9 +281,8 @@ public actor SlackHuddleTracker {
         }
     }
 
-    private func startCall(callID: String, expirationTs: Int64?, at: Date) async {
+    private func startCall(callID: String, at: Date) async {
         currentCallID = callID
-        self.expirationTs = expirationTs
         lastSelfEventAt = at
         livenessBeliefStale = false
         owesRevivalHeartbeat = false
@@ -349,7 +319,6 @@ public actor SlackHuddleTracker {
             lifecycle: MeetWireLifecycle(kind: .callEnded, atMs: ms(at), reason: reason), at: at)
         currentCallID = nil
         participants = [:]
-        expirationTs = nil
         lastSelfEventAt = nil
         livenessBeliefStale = false
         owesRevivalHeartbeat = false
