@@ -19,15 +19,24 @@ import Testing
         NotesPendingClass.isAwaitingParticipantConfirmation(meeting?.lastProcessingError)
     }
 
-    /// The resume dispatched when an answer lands inside the park-commit window
-    /// is its own run, queued behind the one that is still finishing. Waits
-    /// (bounded) for it to land — bounded rather than open-ended so a
-    /// regression FAILS the assertions below instead of hanging the suite.
-    private func settleAfterLateAnswer(_ harness: PipelineHarness, _ id: MeetingID) async throws {
+    /// The notes-only resume an answer dispatches is its own run (§3 — Confirm
+    /// and Skip dispatch it, they never await it). Waits (bounded) for the
+    /// meeting to reach the expected state — bounded rather than open-ended so
+    /// a regression FAILS the assertions below instead of hanging the suite.
+    private func settle(
+        _ harness: PipelineHarness, _ id: MeetingID,
+        until satisfied: @Sendable (Meeting?) -> Bool
+    ) async throws {
         for _ in 0 ..< 200 {
-            if try await harness.meeting(id)?.status == .ready { return }
+            if satisfied(try await harness.meeting(id)) { return }
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    /// The resume dispatched when an answer lands inside the park-commit window
+    /// is its own run, queued behind the one that is still finishing.
+    private func settleAfterLateAnswer(_ harness: PipelineHarness, _ id: MeetingID) async throws {
+        try await settle(harness, id) { $0?.status == .ready }
     }
 
     /// Counts `.participantConfirmationNeeded` events across `body`, breaking each
@@ -174,6 +183,8 @@ import Testing
             meetingID: meeting.id, names: ["Marina", "  marina ", ""])
         #expect(confirmed)
 
+        // The answer returns on the write; its resume runs behind the closed sheet.
+        try await settle(harness, meeting.id) { $0?.status == .ready }
         let stored = try #require(try await harness.meeting(meeting.id))
         #expect(stored.status == .ready)
         #expect(stored.lastProcessingError == nil, "marker cleared by the resume finalize")
@@ -200,6 +211,7 @@ import Testing
 
         let skipped = try await harness.pipeline.skipParticipantConfirmation(meetingID: meeting.id)
         #expect(skipped)
+        try await settle(harness, meeting.id) { $0?.status == .ready }
         let stored = try #require(try await harness.meeting(meeting.id))
         #expect(stored.status == .ready)
         #expect(stored.lastProcessingError == nil)
@@ -264,6 +276,7 @@ import Testing
         // Skip while the engine is broken → engine-park (NOT the participant marker).
         harness.notesPrimary.state.withLock { $0.error = .configurationMissing(key: "apiKey") }
         _ = try await harness.pipeline.skipParticipantConfirmation(meetingID: meeting.id)
+        try await settle(harness, meeting.id) { !isParticipantMarker($0) }
         let afterSkip = try #require(try await harness.meeting(meeting.id))
         #expect(NotesPendingClass.isPending(afterSkip.lastProcessingError))
         #expect(!isParticipantMarker(afterSkip), "skip moved past the gate; engine reason now")
@@ -777,6 +790,134 @@ import Testing
         #expect(stored.status == .ready)
         #expect(stored.lastProcessingError == nil)
         #expect(stored.attendees.isEmpty)
+    }
+
+    // MARK: - §3: the answer returns on the WRITE, not on the notes run
+
+    /// A one-shot gate parked in the notes engine's `onGenerate` seam: the
+    /// notes-only resume stops there, so a test can observe what the user's
+    /// answer call did while its resume is provably still in flight. Every wait
+    /// is bounded so a regression FAILS an assertion instead of hanging.
+    private final class ResumeGate: @unchecked Sendable {
+        private struct State {
+            var entered = false
+            var released = false
+        }
+        private let state = Mutex(State())
+
+        /// Awaited from `onGenerate` — holds the resume's notes call open.
+        func hold() async {
+            state.withLock { $0.entered = true }
+            for _ in 0 ..< 500 {
+                if state.withLock({ $0.released }) { return }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+
+        /// Waits until the resume's notes call has actually started.
+        func waitUntilEntered() async -> Bool {
+            for _ in 0 ..< 500 {
+                if state.withLock({ $0.entered }) { return true }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return false
+        }
+
+        func release() { state.withLock { $0.released = true } }
+    }
+
+    /// Waits (bounded) for the answer call to return, and reports whether it did.
+    private func returnedPromptly(_ answered: @Sendable () -> Bool) async throws -> Bool {
+        for _ in 0 ..< 200 {
+            if answered() { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return answered()
+    }
+
+    /// §3: Confirm "writes the names … then DISPATCHES the notes-only resume".
+    /// The field defect (build 87): it AWAITED that resume, so the sheet stayed
+    /// on screen with every control disabled until the notes run AND the handoff
+    /// had finished (~25 s) — while the attendees were long since committed.
+    @Test func confirmReturnsBeforeTheResumeFinishes() async throws {
+        let harness = try await makePipelineHarness()
+        try await enableGate(harness)
+        let meeting = try await harness.importTestMeeting(attendees: [])
+        _ = try await harness.pipeline.process(meetingID: meeting.id)
+        #expect(isParticipantMarker(try await harness.meeting(meeting.id)))
+
+        // The resume's notes call parks in the gate; the answer must not.
+        let gate = ResumeGate()
+        harness.notesPrimary.state.withLock { $0.onGenerate = { await gate.hold() } }
+        let answered = Mutex(false)
+        let pipeline = harness.pipeline
+        let meetingID = meeting.id
+        let answer = Task {
+            let ok = try await pipeline.confirmParticipants(
+                meetingID: meetingID, names: ["Marina"])
+            answered.withLock { $0 = true }
+            return ok
+        }
+
+        let started = await gate.waitUntilEntered()
+        #expect(started, "the resume must still be dispatched")
+        #expect(
+            try await returnedPromptly { answered.withLock { $0 } },
+            "Confirm returns when the attendees are committed, never when the notes run ends")
+        #expect(
+            try await harness.meeting(meetingID)?.attendees
+                == [Attendee(name: "Marina", source: .manual)],
+            "the write that the answer reports is already durable")
+
+        // The dispatched resume still runs to completion behind the closed sheet.
+        gate.release()
+        #expect(try await answer.value)
+        try await settle(harness, meetingID) { $0?.status == .ready }
+        let stored = try #require(try await harness.meeting(meetingID))
+        #expect(stored.status == .ready)
+        #expect(stored.lastProcessingError == nil, "the resume's finalize cleared the marker")
+        #expect(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meetingID)
+                != nil)
+        #expect(try await harness.queueRows(meetingID) == 1)
+    }
+
+    /// §3: Skip is "marker cleared, notes resume DISPATCHED" — so the sheet's
+    /// answer means the skip was ACCEPTED, not that the notes finished.
+    @Test func skipReturnsBeforeTheResumeFinishes() async throws {
+        let harness = try await makePipelineHarness()
+        try await enableGate(harness)
+        let meeting = try await harness.importTestMeeting(attendees: [])
+        _ = try await harness.pipeline.process(meetingID: meeting.id)
+        #expect(isParticipantMarker(try await harness.meeting(meeting.id)))
+
+        let gate = ResumeGate()
+        harness.notesPrimary.state.withLock { $0.onGenerate = { await gate.hold() } }
+        let answered = Mutex(false)
+        let pipeline = harness.pipeline
+        let meetingID = meeting.id
+        let answer = Task {
+            let ok = try await pipeline.skipParticipantConfirmation(meetingID: meetingID)
+            answered.withLock { $0 = true }
+            return ok
+        }
+
+        let started = await gate.waitUntilEntered()
+        #expect(started, "the resume must still be dispatched")
+        #expect(
+            try await returnedPromptly { answered.withLock { $0 } },
+            "Skip returns when the skip is accepted, never when the notes run ends")
+
+        gate.release()
+        #expect(try await answer.value, "an accepted skip reports success")
+        try await settle(harness, meetingID) { $0?.status == .ready }
+        let stored = try #require(try await harness.meeting(meetingID))
+        #expect(stored.status == .ready)
+        #expect(stored.lastProcessingError == nil)
+        #expect(stored.attendees.isEmpty, "skip writes no attendees")
+        #expect(
+            try await NotesRepository(database: harness.database).fetch(meetingID: meetingID)
+                != nil)
     }
 
     // MARK: - AC6 support: additive-only (rides lastProcessingError + the key)

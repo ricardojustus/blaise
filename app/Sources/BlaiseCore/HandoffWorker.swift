@@ -347,8 +347,8 @@ public actor HandoffWorker: HandoffKicking {
             // cleanup toggle is deliberately NOT cached here — it is re-read
             // immediately before each cleanup, after the transport await.)
             let deliverAudio = await HandoffDestination.deliverAudio(from: settingsStore)
-            // Local-folder-only transcript sidecar (default OFF), read on the
-            // same fresh-each-drain basis.
+            // Destination-independent transcript sidecar (default OFF), read on
+            // the same fresh-each-drain basis.
             let transcriptSidecar = await HandoffDestination.transcriptSidecar(from: settingsStore)
 
             // The identity of the destination this drain writes to, recorded on
@@ -405,6 +405,15 @@ public actor HandoffWorker: HandoffKicking {
                     // this meeting's next delivery), mirroring the local path.
                     if sidecar {
                         await uploadSidecar(
+                            item: claimed, settings: settings, host: host, remoteDir: remoteDir)
+                    }
+                    // The transcript sidecar rides the same call site on its OWN
+                    // toggle (default OFF), equally failure-isolated — the SSH
+                    // twin of the local branch. It runs AFTER the notes upload
+                    // because the notes command's prior-slug `rm` sweeps `*.md`;
+                    // writing the transcript last leaves both kinds in place.
+                    if transcriptSidecar {
+                        await uploadTranscriptSidecar(
                             item: claimed, settings: settings, host: host, remoteDir: remoteDir)
                     }
                     // G5 v1.3: audio delivery AFTER the sidecar step (opt-in,
@@ -531,20 +540,20 @@ public actor HandoffWorker: HandoffKicking {
         MarkdownSidecar.write(fields, to: dir)
     }
 
-    /// Writes the transcript Markdown sidecar next to the notes sidecar at the
-    /// LOCAL destination (opt-in, default OFF). The body is the app's existing
+    /// The transcript sidecar's fields — the SINGLE source both destinations
+    /// render from, so the local file and the uploaded remote file are
+    /// byte-identical for the same meeting. The body is the app's existing
     /// copy-transcript render over the PERSISTED transcript rows, so note edits
-    /// never change it. Same failure isolation as the notes sidecar: no
-    /// transcript (or no meeting) simply skips; a write failure is logged inside
-    /// `MarkdownSidecar.write` and retried on the next delivery.
-    private func writeTranscriptSidecar(item: HandoffItem, root: URL) async {
+    /// never change it. Nil (⇒ the sidecar is simply skipped) when there is no
+    /// meeting or no transcript rows.
+    private func transcriptSidecarFields(item: HandoffItem) async -> MarkdownSidecar.Fields? {
         guard
             let meeting = try? await MeetingRepository(database: database).fetch(item.meetingID),
             let segments = try? await TranscriptRepository(database: database)
                 .segments(meetingID: item.meetingID),
             !segments.isEmpty
-        else { return }
-        let fields = MarkdownSidecar.Fields(
+        else { return nil }
+        return MarkdownSidecar.Fields(
             meetingID: meeting.id,
             title: meeting.title,
             startedAt: meeting.startedAt,
@@ -552,8 +561,30 @@ public actor HandoffWorker: HandoffKicking {
             versionHash: item.versionHash,
             bodyMarkdown: TranscriptCopyText.assemble(segments),
             kind: .transcript)
+    }
+
+    /// Writes the transcript Markdown sidecar next to the notes sidecar at the
+    /// LOCAL destination (opt-in, default OFF). Same failure isolation as the
+    /// notes sidecar: no transcript (or no meeting) simply skips; a write
+    /// failure is logged inside `MarkdownSidecar.write` and retried on the next
+    /// delivery.
+    private func writeTranscriptSidecar(item: HandoffItem, root: URL) async {
+        guard let fields = await transcriptSidecarFields(item: item) else { return }
         let dir = root.appendingPathComponent(item.meetingID, isDirectory: true)
         MarkdownSidecar.write(fields, to: dir)
+    }
+
+    /// Uploads the transcript Markdown sidecar to the remote meeting dir AFTER
+    /// the JSON delivery succeeded (opt-in, default OFF) — the SSH twin of
+    /// `writeTranscriptSidecar`, with the notes uploader's failure isolation
+    /// verbatim: any failure is logged and swallowed, never fails or retries the
+    /// JSON queue item, retried on this meeting's next delivery.
+    private func uploadTranscriptSidecar(
+        item: HandoffItem, settings: HandoffSettings, host: String, remoteDir: String
+    ) async {
+        guard let fields = await transcriptSidecarFields(item: item) else { return }
+        await uploadSidecarDocument(
+            fields, item: item, settings: settings, host: host, remoteDir: remoteDir)
     }
 
     /// Uploads the Markdown sidecar to the remote meeting dir AFTER the JSON
@@ -578,13 +609,24 @@ public actor HandoffWorker: HandoffKicking {
             attendeeNames: meeting.attendees.map(\.name),
             versionHash: item.versionHash,
             bodyMarkdown: notes.markdown)
+        await uploadSidecarDocument(
+            fields, item: item, settings: settings, host: host, remoteDir: remoteDir)
+    }
+
+    /// Renders `fields` and streams the `.md` bytes to the remote meeting dir —
+    /// the one upload path both sidecar kinds use (`fields.kind` picks the
+    /// remote file name), so there is exactly ONE slug guard and one failure
+    /// isolation to reason about.
+    private func uploadSidecarDocument(
+        _ fields: MarkdownSidecar.Fields, item: HandoffItem, settings: HandoffSettings,
+        host: String, remoteDir: String
+    ) async {
         let slug = MarkdownSidecar.slug(fields.title)
         // Injection-safety guard: the slug is `[a-z0-9-]` by construction, so it
         // can never break out of the single-quoted remote command. Assert that
         // invariant and SKIP rather than ever emit an unsafe command — the
         // sidecar is convenience, never worth a malformed remote shell string.
-        guard slug.allSatisfy({ $0 == "-" || ($0 >= "a" && $0 <= "z") || ($0 >= "0" && $0 <= "9") })
-        else {
+        guard HandoffCommand.isSafeSlug(slug) else {
             logger.error(
                 "sidecar slug '\(slug, privacy: .public)' is not [a-z0-9-]; skipping upload (JSON already delivered)"
             )
@@ -593,7 +635,7 @@ public actor HandoffWorker: HandoffKicking {
         let document = Data(MarkdownSidecar.render(fields).utf8)
         let argv = HandoffCommand.sidecarArgv(
             user: settings.user, host: host, identityFile: settings.identityFile,
-            remoteDir: remoteDir, slug: slug)
+            remoteDir: remoteDir, slug: slug, kind: fields.kind)
         do {
             let outcome = try await transport.deliver(
                 argv: argv, payload: document,

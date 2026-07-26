@@ -41,9 +41,32 @@ public enum HandoffCommand {
     /// immutable `<hash>.json` history is untouched. The `2>/dev/null;`
     /// isolates the `rm`'s exit code (an empty dir is not a failure) from the
     /// `mkdir && cat` chain.
-    public static func sidecarRemoteCommand(remoteDir: String, slug: String) -> String {
-        "mkdir -p '\(remoteDir)' && rm -f '\(remoteDir)'/*.md 2>/dev/null; "
-            + "cat > '\(remoteDir)/\(slug).md'"
+    ///
+    /// `kind` selects the file-name suffix (`MarkdownSidecar.Kind.nameSuffix` —
+    /// the same single source the local writer names its files from): the notes
+    /// command is byte-identical to what it has always been, and the transcript
+    /// command writes the sibling `<slug>-transcript.md` and sweeps NOTHING —
+    /// `cat >` truncates, so it still supersedes its own file, and a stale
+    /// transcript left behind by a re-title is reclaimed by the notes command's
+    /// `*.md` sweep. That sweep does remove the transcript sidecar, which the
+    /// transcript upload (which always runs after it) rewrites in the same
+    /// drain. The suffix is a compile-time literal, not a new interpolated
+    /// value — the injection model is unchanged.
+    public static func sidecarRemoteCommand(
+        remoteDir: String, slug: String, kind: MarkdownSidecar.Kind = .notes
+    ) -> String {
+        let sweep = kind == .notes ? "rm -f '\(remoteDir)'/*.md 2>/dev/null; " : ""
+        return "mkdir -p '\(remoteDir)' && " + sweep
+            + "cat > '\(remoteDir)/\(slug)\(kind.nameSuffix).md'"
+    }
+
+    /// A Markdown-sidecar slug is injection-safe by construction (`[a-z0-9-]`,
+    /// `MarkdownSidecar.slug`): no `'`, so it can never break out of the
+    /// single-quoted remote command. The single guard both sidecar uploaders
+    /// assert before emitting a command (they SKIP on a non-match) — one
+    /// defense, one definition.
+    public static func isSafeSlug(_ slug: String) -> Bool {
+        slug.allSatisfy { $0 == "-" || ($0 >= "a" && $0 <= "z") || ($0 >= "0" && $0 <= "9") }
     }
 
     /// Full ssh argv for the sidecar upload — identical option set + identity
@@ -51,7 +74,8 @@ public enum HandoffCommand {
     /// rendered `.md` bytes stream on stdin (the transport's `payload`), exactly
     /// like the JSON payload.
     public static func sidecarArgv(
-        user: String, host: String, identityFile: String, remoteDir: String, slug: String
+        user: String, host: String, identityFile: String, remoteDir: String, slug: String,
+        kind: MarkdownSidecar.Kind = .notes
     ) -> [String] {
         [
             "/usr/bin/ssh",
@@ -63,7 +87,7 @@ public enum HandoffCommand {
             "-o", "IdentitiesOnly=yes",
             "-i", (identityFile as NSString).expandingTildeInPath,
             "\(user)@\(host)",
-            sidecarRemoteCommand(remoteDir: remoteDir, slug: slug),
+            sidecarRemoteCommand(remoteDir: remoteDir, slug: slug, kind: kind),
         ]
     }
 

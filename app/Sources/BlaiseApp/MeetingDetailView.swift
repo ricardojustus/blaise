@@ -1022,17 +1022,53 @@ private struct SearchHighlightedText: View {
     }
 
     private var highlighted: AttributedString {
+        SearchHighlight.applied(to: source, terms: terms)
+    }
+}
+
+/// Layers the match cues ON TOP of the source's own attributes: the markdown
+/// parser's bold, italics and links must survive a search (rebuilding the
+/// string from its characters discarded all of them).
+enum SearchHighlight {
+    @MainActor
+    static func applied(to source: AttributedString, terms: [String]) -> AttributedString {
         guard !terms.isEmpty else { return source }
-        var output = AttributedString()
+        var output = source
+        var offset = 0
         for segment in SearchTextMatcher.segments(String(source.characters), matching: terms) {
-            var run = AttributedString(segment.text)
-            if segment.isMatch {
-                run.inlinePresentationIntent = .stronglyEmphasized
-                run.foregroundColor = Design.accent
-                run.backgroundColor = Design.accent.opacity(0.2)
-                run.underlineStyle = .single
+            let length = segment.text.count
+            defer { offset += length }
+            guard segment.isMatch else { continue }
+            // ANY mutation invalidates EVERY index of an AttributedString, so
+            // the match's runs are recorded as CHARACTER OFFSETS (stable: the
+            // characters never change here) and each index is reacquired
+            // immediately before the mutation that uses it.
+            let matchStart = output.index(output.startIndex, offsetByCharacters: offset)
+            let matchEnd = output.index(matchStart, offsetByCharacters: length)
+            let spans = output[matchStart..<matchEnd].runs.map { run in
+                (
+                    offset: output.characters.distance(
+                        from: output.startIndex, to: run.range.lowerBound),
+                    length: output.characters.distance(
+                        from: run.range.lowerBound, to: run.range.upperBound),
+                    intent: run.inlinePresentationIntent
+                )
             }
-            output.append(run)
+            for span in spans {
+                // Emphasis MERGES with whatever the run already carries (an
+                // italic match stays italic); the run's whole cue set is applied
+                // in ONE mutation, so no index outlives a write.
+                var merged = span.intent ?? []
+                merged.insert(.stronglyEmphasized)
+                var cues = AttributeContainer()
+                cues.inlinePresentationIntent = merged
+                cues.foregroundColor = Design.accent
+                cues.backgroundColor = Design.accent.opacity(0.2)
+                cues.underlineStyle = .single
+                let start = output.index(output.startIndex, offsetByCharacters: span.offset)
+                let end = output.index(start, offsetByCharacters: span.length)
+                output[start..<end].mergeAttributes(cues)
+            }
         }
         return output
     }
@@ -1123,30 +1159,31 @@ struct MarkdownBlocksView: View {
         case .thematicBreak:
             Divider()
         case .table(let header, let rows, let alignments):
-            // Horizontal scroll so a wide table never clips the notes column.
-            ScrollView(.horizontal, showsIndicators: false) {
-                Grid(alignment: .topLeading, horizontalSpacing: 14, verticalSpacing: 6) {
-                    if !header.isEmpty {
-                        GridRow {
-                            ForEach(Array(header.enumerated()), id: \.offset) { column, cell in
-                                tableCell(cell, alignments: alignments, column: column, header: true)
-                            }
+            // The table lays out INSIDE the notes column: columns size to their
+            // content and cell text wraps, growing the row (a horizontal scroll
+            // pushed prose off the right edge).
+            Grid(alignment: .topLeading, horizontalSpacing: 14, verticalSpacing: 6) {
+                if !header.isEmpty {
+                    GridRow {
+                        ForEach(Array(header.enumerated()), id: \.offset) { column, cell in
+                            tableCell(cell, alignments: alignments, column: column, header: true)
                         }
-                        Divider()
                     }
-                    ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                        GridRow {
-                            ForEach(Array(row.enumerated()), id: \.offset) { column, cell in
-                                tableCell(cell, alignments: alignments, column: column, header: false)
-                            }
+                    Divider()
+                }
+                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                    GridRow {
+                        ForEach(Array(row.enumerated()), id: \.offset) { column, cell in
+                            tableCell(cell, alignments: alignments, column: column, header: false)
                         }
-                        if index < rows.count - 1 {
-                            Divider().opacity(0.4)
-                        }
+                    }
+                    if index < rows.count - 1 {
+                        Divider().opacity(0.4)
                     }
                 }
-                .padding(.vertical, 2)
             }
+            .padding(.vertical, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1159,13 +1196,34 @@ struct MarkdownBlocksView: View {
         SearchHighlightedText(source: cell, terms: searchTerms)
             .font(Design.readingFont(14, weight: header ? .semibold : .regular))
             .foregroundStyle(.primary.opacity(header ? 1 : 0.88))
+            .multilineTextAlignment(textAlignment(alignments, column))
             .textSelection(.enabled)
+            // Wrap instead of demanding the cell's natural single-line width,
+            // and let the row grow vertically to fit what wrapped. The cell is
+            // deliberately NOT stretched to maxWidth: .infinity — a flexible
+            // cell makes Grid split the width EQUALLY between columns, which
+            // gave a one-word label the same share as a prose column. Left
+            // content-sized, a short label column stays narrow, the prose
+            // column takes the remainder, and gridColumnAlignment positions the
+            // cell inside its column again.
+            .fixedSize(horizontal: false, vertical: true)
             .gridColumnAlignment(columnAlignment(alignments, column))
     }
 
     private func columnAlignment(
         _ alignments: [PresentationIntent.TableColumn.Alignment], _ column: Int
     ) -> HorizontalAlignment {
+        switch alignments.indices.contains(column) ? alignments[column] : .left {
+        case .center: .center
+        case .right: .trailing
+        default: .leading
+        }
+    }
+
+    /// The same per-column alignment applied to the WRAPPED lines inside a cell.
+    private func textAlignment(
+        _ alignments: [PresentationIntent.TableColumn.Alignment], _ column: Int
+    ) -> TextAlignment {
         switch alignments.indices.contains(column) ? alignments[column] : .left {
         case .center: .center
         case .right: .trailing

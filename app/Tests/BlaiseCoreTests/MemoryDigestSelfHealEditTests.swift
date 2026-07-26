@@ -14,6 +14,100 @@ private enum SelfHealFixtures {
     static let attendees = [Attendee(name: "Dana Marsh", email: "dana@vexatronlabs.example", source: .manual)]
 }
 
+private func makeMintedNameCorrectionMeeting(
+    _ harness: PipelineHarness, digest: String, summary: String
+) async throws -> Meeting {
+    let meeting = makeMeeting(title: "Meeting", status: .ready)
+    try await MeetingRepository(database: harness.database).create(meeting)
+    try harness.database.paths.createMeetingDirectory(meeting.id)
+    let structured = NotesStructured(
+        summary: summary, detailedNotes: "", decisions: [], actionItems: [], userActionItems: [])
+    let notes = MeetingNotes(
+        meetingID: meeting.id, markdown: "", structured: structured, language: "en",
+        generatedAt: msDate(),
+        provenance: NotesProvenance(engine: "fixture", model: "fixture", pipelineVersion: "fixture"),
+        memoryDigest: digest)
+    try await NotesRepository(database: harness.database).upsert(notes)
+    return meeting
+}
+
+// Fix 0 §5 T5 — both live name-edit insertion points carry a multi-word
+// correction through the stored digest without a second digest-engine call.
+@Suite struct MultiWordMemoryDigestEditPathTests {
+    @Test func notesCorrectionRewritesMultiWordDigestInLockstep() async throws {
+        let digest = "## HEADER\nname: Dana Del Rosso\n\n## NOTES\nDana Del Rosso reviewed the plan.\n"
+        let harness = try await makeHarness(digest: digest)
+        let meeting = try await makeMintedNameCorrectionMeeting(
+            harness, digest: digest, summary: "Dana Del Rosso reviewed the plan.")
+        let digestCallsBefore = harness.notesPrimary.state.withLock { $0.digestRequests.count }
+
+        let count = try await harness.pipeline.correctNameInNotes(
+            meetingID: meeting.id, original: "Dana Del Rosso", replacement: "Dana Quoll",
+            allOccurrences: true)
+        #expect(count == 1)
+
+        let notes = try #require(try await NotesRepository(database: harness.database)
+            .fetch(meetingID: meeting.id))
+        #expect(notes.structured.summary == "Dana Quoll reviewed the plan.")
+        let rewritten = try #require(notes.memoryDigest)
+        #expect(rewritten.contains("Dana Quoll"))
+        #expect(!rewritten.contains("Dana Del Rosso"))
+        // T5 (spec wording): the RE-MINTED payload — not just the stored row —
+        // carries the corrected digest (a mint/enqueue regression must fail here).
+        let payload = try parsePayload(
+            harness, path: try #require(await latestPayloadPath(harness, meeting.id)))
+        let payloadDigest = try #require(payload["memory_digest"] as? String)
+        #expect(payloadDigest.contains("Dana Quoll"))
+        #expect(!payloadDigest.contains("Dana Del Rosso"))
+        #expect(
+            harness.notesPrimary.state.withLock { $0.digestRequests.count } == digestCallsBefore,
+            "a multi-word notes correction rewrites the stored digest without an engine call")
+    }
+
+    @Test func speakerRenameRewritesMultiWordSpeakerDigestInLockstep() async throws {
+        let digest = "## HEADER\nspeaker: Dana Del Rosso\n\n## NOTES\nDana Del Rosso owns the plan.\n"
+        let harness = try await makeHarness(digest: digest)
+        let meeting = try await makeMintedNameCorrectionMeeting(
+            harness, digest: digest, summary: "Dana Del Rosso owns the plan.")
+        try await TranscriptRepository(database: harness.database).replaceAllSegments(
+            meetingID: meeting.id,
+            with: [TranscriptSegment(
+                meetingID: meeting.id, ord: 0, startSeconds: 0, endSeconds: 1,
+                speakerLabel: "S1", speakerName: "Dana Del Rosso", text: "Kip Rho")])
+        let digestCallsBefore = harness.notesPrimary.state.withLock { $0.digestRequests.count }
+
+        _ = try await harness.pipeline.renameSpeaker(
+            meetingID: meeting.id, speakerLabel: "S1", to: "Dana Quoll")
+
+        let rewritten = try #require(try await storedDigest(harness, meeting.id))
+        #expect(rewritten.contains("Dana Quoll"))
+        #expect(!rewritten.contains("Dana Del Rosso"))
+        // T5 (spec wording): the re-minted payload carries the corrected digest.
+        let payload = try parsePayload(
+            harness, path: try #require(await latestPayloadPath(harness, meeting.id)))
+        let payloadDigest = try #require(payload["memory_digest"] as? String)
+        #expect(payloadDigest.contains("Dana Quoll"))
+        #expect(!payloadDigest.contains("Dana Del Rosso"))
+        #expect(
+            harness.notesPrimary.state.withLock { $0.digestRequests.count } == digestCallsBefore,
+            "a multi-word speaker rename rewrites the stored digest without an engine call")
+    }
+}
+
+/// The most recently enqueued handoff payload path for a meeting — the
+/// re-minted artifact the T5 assertions must inspect.
+private func latestPayloadPath(_ harness: PipelineHarness, _ id: MeetingID) async -> String? {
+    try? await harness.database.pool.read { db in
+        try String.fetchOne(
+            db,
+            sql: """
+                SELECT payload_path FROM handoff_queue
+                WHERE meeting_id = ? ORDER BY created_seq DESC LIMIT 1
+                """,
+            arguments: [id])
+    }
+}
+
 private func makeHarness(digest: String = "## HEADER\nmeeting: Vexatron Labs sync\nspeaker: (none resolved)\n")
     async throws -> PipelineHarness
 {

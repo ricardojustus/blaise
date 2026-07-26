@@ -2154,24 +2154,36 @@ public actor ProcessingPipeline {
         // Pre-park: the in-flight run picks the names up at its notes stage —
         // dispatching a resume here would collide with it.
         guard wasParked else { return true }
-        do {
-            _ = try await processNotesOnly(meetingID: meetingID, confirmingParticipants: true)
-        } catch {
-            // The attendees ARE written (that is what `true` reports); the resume
-            // is retried by the ordinary pending self-heal. Never swallow the
-            // reason it failed.
-            logger.error(
-                "participant confirm resume failed for \(meetingID, privacy: .public): \(String(describing: error), privacy: .public) — attendees written; pending self-heal retries"
-            )
-        }
+        dispatchAnsweredResume(meetingID: meetingID, answer: "confirm")
         return true
+    }
+
+    /// G15 §3: dispatch the notes-only resume without awaiting it. Confirm's
+    /// answer is durable before this is called (the attendee write above); a
+    /// Skip's is not — this resume is what retires the pending marker, so a quit
+    /// inside the resume window re-asks the question. Accepted trade.
+    /// Failures are logged, and the ordinary pending self-heal retries them.
+    private func dispatchAnsweredResume(meetingID: MeetingID, answer: String) {
+        Task {
+            do {
+                _ = try await self.processNotesOnly(
+                    meetingID: meetingID, confirmingParticipants: true)
+            } catch {
+                self.logger.error(
+                    "participant \(answer, privacy: .public) resume failed for \(meetingID, privacy: .public): \(String(describing: error), privacy: .public) — the answer is recorded; pending self-heal retries"
+                )
+            }
+        }
     }
 
     /// G15 Skip (§3): proceed WITHOUT attendees for this meeting — nothing is
     /// written; the gate-bypassing resume mints notes and its finalize clears the
     /// marker. A subsequent engine-park (no notes) carries the engine marker, so
     /// the skip is durable (a later self-heal does not re-gate). No-op when the
-    /// meeting is no longer participant-pending.
+    /// meeting is no longer participant-pending. Returns whether the skip was
+    /// ACCEPTED — the marker VERIFIED here (this path claims and writes
+    /// nothing), or the skip carried by the run that is still committing its
+    /// park — never whether the notes finished.
     @discardableResult
     public func skipParticipantConfirmation(meetingID: MeetingID) async throws -> Bool {
         // L1: no-op unless the meeting is STILL parked on the participant marker
@@ -2203,14 +2215,14 @@ public actor ProcessingPipeline {
                 NotesPendingClass.isAwaitingParticipantConfirmation(fresh.lastProcessingError),
                 participantStopSkips.remove(meetingID) != nil
             {
-                return try await processNotesOnly(
-                    meetingID: meetingID, confirmingParticipants: true) != nil
+                dispatchAnsweredResume(meetingID: meetingID, answer: "skip")
             }
+            // Accepted either way: this side dispatched the resume, or the run
+            // that is still committing its park carries the skip to the notes.
             return true
         }
-        let record = try await processNotesOnly(
-            meetingID: meetingID, confirmingParticipants: true)
-        return record != nil
+        dispatchAnsweredResume(meetingID: meetingID, answer: "skip")
+        return true
     }
 
     /// Confirm-sheet pre-fill (§3): the grounded person-hint canonicals for a

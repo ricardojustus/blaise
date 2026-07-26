@@ -2,6 +2,59 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [1.5.0] — 26/07/2026
+
+The community release. Slack Huddles support, a participant confirmation gate, capture that
+survives audio-device changes, and readable tables in notes. Three of the four largest changes
+here are contributed by @arthursoares.
+
+> This build is not signed with a Developer ID. macOS will warn on first open (right-click →
+> Open, or System Settings → Privacy & Security → Open Anyway). Signed and notarised builds ship
+> in the next release.
+
+### Added
+- **Slack Huddles integration** (@arthursoares). While you are in a huddle, Blaise learns the
+  participant roster and the call lifecycle through Slack's own API and feeds them into the same
+  speaker-naming and recording-automation flow as Google Meet. Metadata only — the bot scope is
+  `users:read`, so Blaise reads who is in a huddle and when, never messages, never audio, and no
+  bot joins the call. Both tokens live in the macOS Keychain. Setup uses a personal Slack app from
+  the manifest in `docs/slack_huddles_contract.md`. Honest limitation: Slack exposes presence, not
+  who-spoke-when, so huddle speaker naming leans on the roster rather than voice matching.
+- **Slack in the manual recording source picker**, bound to the live huddle when one is tracked.
+  Requested by @bdejong (#7).
+- **Participant confirmation gate** (@arthursoares, opt-in, off by default). When Blaise cannot
+  learn who attended from your calendar or a roster, it asks. Names land before the notes are
+  written, so speaker labels and action-item owners are attributed correctly instead of being
+  corrected afterwards. Transcription and audio retention are never held up — only the notes wait.
+  A meeting awaiting your answer stays visibly marked in the library list, and an optional
+  sub-toggle writes the notes without names after five minutes.
+- **Transcript Markdown sidecar** (opt-in, off by default): writes the full transcript as its own
+  Markdown file alongside the delivered payload, on whichever destination you have configured.
+- **Destination hygiene and audio delivery** (@arthursoares): optionally remove superseded payloads
+  at the destination so one current file per meeting remains (off by default — every delivered
+  version is kept unless you turn it on), and optionally include the meeting's audio recordings
+  with the delivery (off by default, the privacy default, since a syncing destination means audio
+  leaves the machine).
+- **Automated secret scanning in CI** on every push and pull request, alongside build and test.
+
+### Changed
+- **Markdown tables render as tables** in the notes view, wrapping to the notes column instead of
+  running off the edge. No new dependencies.
+- **Speaker-layer unification** (@arthursoares): correcting a name in the notes now also updates
+  the matching speaker rename and the stored transcript in the same pass, so a meeting's transcript
+  and its notes can no longer disagree about who someone is.
+
+### Fixed
+- **Recording no longer breaks when audio devices change** (@arthursoares). Switching or unplugging
+  a device mid-meeting could leave a track silently empty behind a healthy-looking indicator. The
+  capture path now detects the change, rebuilds cleanly, tolerates transient failures through a
+  bounded retry ladder, and raises a visible warning if capture is genuinely down. Two pre-existing
+  failure modes and a reproducible crash on a degenerate fallback sample rate were fixed alongside.
+- **The participant dialogue closes as soon as your answer is saved**, instead of staying frozen
+  until the notes finish generating.
+- **Searching no longer strips formatting.** Bold, italics and links now survive while a match is
+  highlighted.
+
 ## [1.4.0] — 10/07/2026
 
 A polish and reliability release: live recording feedback, clearer menu-bar state,
@@ -84,6 +137,7 @@ synthesis option.
 - Stuck "Processing" indicator in some states.
 - Escaping and formatting edge cases in account-engine notes output.
 
+[1.5.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.5.0
 [1.4.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.4.0
 [1.3.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.3.0
 [1.2.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.2.0

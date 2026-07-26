@@ -17,10 +17,12 @@ import os
 ///   sidecar on the meeting's next delivery, never failing the queue item.
 ///
 /// The same machinery writes the OPT-IN transcript sidecar (`kind: .transcript`,
-/// local destination only): `<slug>-transcript.md`, body rendered by
+/// either destination): `<slug>-transcript.md`, body rendered by
 /// `TranscriptCopyText`, a `kind: transcript` frontmatter line and no
-/// `version_hash` (its provenance is the transcript rows, not the payload). The
-/// kinds are independent files and never delete each other.
+/// `version_hash` (its provenance is the transcript rows, not the payload).
+/// LOCALLY the kinds are independent files and never delete each other —
+/// prior-sidecar removal matches on `native_id` + `kind`. The SSH path
+/// supersedes by glob instead; see `HandoffCommand.sidecarRemoteCommand`.
 public enum MarkdownSidecar {
     private static let logger = Logger(subsystem: BlaiseBundle.identifier, category: "handoff.sidecar")
 

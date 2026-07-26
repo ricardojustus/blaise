@@ -860,16 +860,6 @@ private struct HandoffSection: View {
                 }
                 Button("Choose Folder…") { chooseFolder() }
                     .accessibilityLabel("Choose local destination folder")
-
-                // Community request: the transcript as its OWN Markdown file.
-                // Local Folder only (the SSH path is unchanged), default OFF —
-                // so it lives inside this branch rather than showing dead to
-                // SSH users.
-                Toggle("Also write the transcript as Markdown", isOn: $model.transcriptSidecar)
-                    .accessibilityLabel("Write the transcript as a separate Markdown file")
-                Text("Off by default. On writes the full transcript to its own \"…-transcript.md\" in the meeting's folder; applies at each meeting's next delivery.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
 
             // G6: the Markdown-sidecar toggle is destination-independent — SSH
@@ -877,6 +867,15 @@ private struct HandoffSection: View {
             // the JSON. (Mirrors the memory-digest toggle's placement.)
             Toggle("Write Markdown sidecar (Obsidian-ready)", isOn: $model.markdownSidecar)
                 .accessibilityLabel("Write Markdown sidecar alongside the evidence payload")
+
+            // Community request: the transcript as its OWN Markdown file.
+            // Destination-independent like its notes sibling — SSH uploads it
+            // alongside the JSON, Local Folder writes it next to the JSON.
+            Toggle("Also write the transcript as Markdown", isOn: $model.transcriptSidecar)
+                .accessibilityLabel("Write the transcript as a separate Markdown file")
+            Text("Off by default. On delivers the full transcript as its own \"…-transcript.md\" beside the notes sidecar, at whichever destination is selected; applies at each meeting's next delivery.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             // G5 v1.3: superseded-payload REMOVAL. Default OFF ⇒ delivered
             // payloads accumulate, preserving the published immutable-history

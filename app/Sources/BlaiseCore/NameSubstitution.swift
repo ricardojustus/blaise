@@ -77,6 +77,16 @@ public enum NameSubstitution {
         case prose
     }
 
+    /// The reason a position-scoped correction can or cannot change the
+    /// selected occurrence. This is deliberately separate from the pipeline's
+    /// replacement count: a guard-covered occurrence is present, but already
+    /// agrees with the requested replacement.
+    public enum OccurrenceClassification: Sendable, Equatable {
+        case replaceable
+        case alreadyCorrect
+        case absent
+    }
+
     // MARK: - Notes entry point
 
     /// Applies the pass to a `NotesStructured` value, returning the substituted
@@ -507,51 +517,305 @@ public enum NameSubstitution {
         wordRuns(in: text).map { VocabNormalization.canonicalMode($0.text) }.filter { !$0.isEmpty }
     }
 
-    /// §5 position-scoped notes correction (NH-C). Replaces fold-equal whole-word
-    /// runs of `original` with `replacement` in the structured notes.
+    // MARK: - Correction windows
+
+    /// One identity-bearing occurrence from the §3.1 scan. The run indexes
+    /// remain attached so the §3.2 guard can inspect the PRE-EDIT run array;
+    /// the source range is the span consumed by the replacement.
+    private struct CorrectionWindow {
+        let firstRunIndex: Int
+        let lastRunIndex: Int
+        let range: Range<String.Index>
+    }
+
+    /// The only line-break graphemes accepted inside a multi-word correction
+    /// window. `Character.isNewline` intentionally admits more than the
+    /// structural grammar permits, so this is an allowlist rather than a
+    /// blocklist.
+    private static func isAllowedCorrectionLineBreak(_ character: Character) -> Bool {
+        let scalars = Array(character.unicodeScalars)
+        if scalars.count == 1 {
+            return scalars[0].value == 0x0A || scalars[0].value == 0x0D
+        }
+        return scalars.count == 2
+            && scalars[0].value == 0x0D
+            && scalars[1].value == 0x0A
+    }
+
+    /// §3.1 separator grammar: whitespace-only gaps, with at most one
+    /// allowlisted line-break grapheme. Empty gaps are accepted vacuously;
+    /// `.byWords` normally prevents adjacent word runs from reaching this
+    /// case.
+    private static func correctionGapsAreValid(
+        in text: String, runs: [WordRun], first: Int, last: Int
+    ) -> Bool {
+        guard first < last else { return true }
+        for index in first ..< last {
+            let gap = text[runs[index].range.upperBound ..< runs[index + 1].range.lowerBound]
+            var lineBreakCount = 0
+            for character in gap {
+                guard character.isWhitespace else { return false }
+                let hasExplicitDisallowedNewlineScalar = character.unicodeScalars.contains {
+                    [0x000B, 0x000C, 0x0085, 0x2028, 0x2029].contains($0.value)
+                }
+                if character.isNewline || hasExplicitDisallowedNewlineScalar {
+                    guard isAllowedCorrectionLineBreak(character) else { return false }
+                    lineBreakCount += 1
+                    guard lineBreakCount <= 1 else { return false }
+                }
+            }
+        }
+        return true
+    }
+
+    private static func correctionWindowFoldsEqual(
+        _ runs: [WordRun], first: Int, last: Int, expected: [String]
+    ) -> Bool {
+        guard last - first + 1 == expected.count else { return false }
+        for offset in 0 ..< expected.count {
+            let fold = VocabNormalization.canonicalMode(runs[first + offset].text)
+            guard fold == expected[offset] else { return false }
+        }
+        return true
+    }
+
+    /// §3.1 PHASE 1 — enumerate identity-bearing, non-overlapping windows
+    /// without consulting the replacement or its containment guard.
+    private static func enumerateCorrectionWindows(
+        in text: String, original: String
+    ) -> [CorrectionWindow] {
+        let targetFolds = foldedWords(in: original)
+        guard !targetFolds.isEmpty else { return [] }
+        let runs = wordRuns(in: text)
+        let wordCount = targetFolds.count
+        guard runs.count >= wordCount else { return [] }
+
+        var windows: [CorrectionWindow] = []
+        var first = 0
+        while first + wordCount <= runs.count {
+            let last = first + wordCount - 1
+            if correctionWindowFoldsEqual(
+                runs, first: first, last: last, expected: targetFolds),
+                correctionGapsAreValid(in: text, runs: runs, first: first, last: last)
+            {
+                windows.append(CorrectionWindow(
+                    firstRunIndex: first, lastRunIndex: last,
+                    range: runs[first].range.lowerBound ..< runs[last].range.upperBound))
+                // The accepted occurrence consumes the complete candidate
+                // window. This is the locked overlap/adjacency identity rule.
+                first += wordCount
+            } else {
+                first += 1
+            }
+        }
+        return windows
+    }
+
+    /// §3.2: every valid replacement-window START index, computed ONCE per
+    /// (text, replacement) pass — a single O(runs × m) scan. Per-candidate
+    /// coverage then costs a binary search, keeping the whole guard inside the
+    /// spec's attested O(runs × max(n, m)) instead of O(runs × m²) when a
+    /// pathological long replacement is pasted (impl-audit I-H3).
+    private static func validReplacementWindowStarts(
+        in text: String, runs: [WordRun], replacementFolds: [String]
+    ) -> [Int] {
+        let m = replacementFolds.count
+        guard m > 0, runs.count >= m else { return [] }
+        var starts: [Int] = []
+        for first in 0 ... (runs.count - m) {
+            if correctionWindowFoldsEqual(
+                runs, first: first, last: first + m - 1, expected: replacementFolds),
+                correctionGapsAreValid(in: text, runs: runs, first: first, last: first + m - 1)
+            {
+                starts.append(first)
+            }
+        }
+        return starts
+    }
+
+    /// §3.2 containment guard evaluated against the PRE-EDIT run array: the
+    /// candidate [i...j] is covered iff some valid replacement window of
+    /// length m starts at a ∈ [j-m+1, i] (length m ⇒ that start covers the
+    /// whole candidate interval). `starts` is ascending by construction.
+    private static func correctionWindowIsCovered(
+        _ candidate: CorrectionWindow, replacementWindowStarts starts: [Int],
+        replacementCount: Int
+    ) -> Bool {
+        guard replacementCount > 0, !starts.isEmpty else { return false }
+        let minStart = candidate.lastRunIndex - replacementCount + 1
+        let maxStart = candidate.firstRunIndex
+        guard minStart <= maxStart else { return false }
+        var lo = 0
+        var hi = starts.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if starts[mid] < minStart { lo = mid + 1 } else { hi = mid }
+        }
+        return lo < starts.count && starts[lo] <= maxStart
+    }
+
+    private static func applyingCorrectionWindows(
+        _ windows: [CorrectionWindow], in text: String, replacement: String
+    ) -> (text: String, count: Int) {
+        guard !windows.isEmpty else { return (text, 0) }
+        var result = text
+        for window in windows.reversed() {
+            result.replaceSubrange(window.range, with: replacement)
+        }
+        return (result, windows.count)
+    }
+
+    /// Replacement-independent occurrence identity for one flat text field.
+    public static func selectableOccurrenceCount(in text: String, original: String) -> Int {
+        enumerateCorrectionWindows(in: text, original: original).count
+    }
+
+    /// Replacement-aware count of actual changes for one flat text field.
+    public static func replaceableOccurrenceCount(
+        in text: String, original: String, replacement: String
+    ) -> Int {
+        let windows = enumerateCorrectionWindows(in: text, original: original)
+        guard !windows.isEmpty else { return 0 }
+        let runs = wordRuns(in: text)
+        let replacementFolds = foldedWords(in: replacement)
+        let starts = validReplacementWindowStarts(
+            in: text, runs: runs, replacementFolds: replacementFolds)
+        return windows.filter {
+            !correctionWindowIsCovered(
+                $0, replacementWindowStarts: starts,
+                replacementCount: replacementFolds.count)
+        }.count
+    }
+
+    private static func noteCorrectionFieldValues(_ notes: NotesStructured) -> [String] {
+        // MUST mirror applyNoteCorrection's traversal exactly — same fields,
+        // same order (per action item: owner then text) — or the UI counts,
+        // the picker's global occurrence index, and the apply pass diverge.
+        var values: [String] = []
+        if let title = notes.title { values.append(title) }
+        values.append(notes.summary)
+        values.append(notes.detailedNotes)
+        values.append(contentsOf: notes.decisions)
+        for item in notes.actionItems {
+            values.append(item.owner)
+            values.append(item.text)
+        }
+        for item in notes.userActionItems {
+            values.append(item.owner)
+            values.append(item.text)
+        }
+        return values
+    }
+
+    /// §3.3 replacement-independent occurrence count across notes fields in
+    /// the existing reading order: title, summary, detailed notes, decisions,
+    /// then each action item (owner, text), then each user action item
+    /// (owner, text) — applyNoteCorrection's own traversal, mirrored.
+    public static func selectableOccurrenceCount(
+        in notes: NotesStructured, original: String
+    ) -> Int {
+        noteCorrectionFieldValues(notes).reduce(into: 0) { count, value in
+            count += selectableOccurrenceCount(in: value, original: original)
+        }
+    }
+
+    /// §3.3 guarded count of occurrences that an all-occurrences confirm will
+    /// actually replace.
+    public static func replaceableOccurrenceCount(
+        in notes: NotesStructured, original: String, replacement: String
+    ) -> Int {
+        noteCorrectionFieldValues(notes).reduce(into: 0) { count, value in
+            count += replaceableOccurrenceCount(
+                in: value, original: original, replacement: replacement)
+        }
+    }
+
+    /// §3.3 status preflight for the global notes occurrence index.
+    public static func classifyNoteOccurrence(
+        in notes: NotesStructured, original: String, replacement: String,
+        occurrenceIndex: Int?
+    ) -> OccurrenceClassification {
+        let target = occurrenceIndex ?? 0
+        guard target >= 0 else { return .absent }
+        var seen = 0
+        let replacementFolds = foldedWords(in: replacement)
+        for value in noteCorrectionFieldValues(notes) {
+            let windows = enumerateCorrectionWindows(in: value, original: original)
+            if target < seen + windows.count {
+                let window = windows[target - seen]
+                let runs = wordRuns(in: value)
+                let starts = validReplacementWindowStarts(
+                    in: value, runs: runs, replacementFolds: replacementFolds)
+                return correctionWindowIsCovered(
+                    window, replacementWindowStarts: starts,
+                    replacementCount: replacementFolds.count)
+                    ? .alreadyCorrect
+                    : .replaceable
+            }
+            seen += windows.count
+        }
+        return .absent
+    }
+
+    /// §5/§3 position-scoped notes correction (NH-C). Replaces the shared
+    /// §3.1 windows in the structured notes.
     ///
-    /// - `allOccurrences == true`: replace EVERY identical run across all fields
-    ///   (the toggle, count shown in the UI).
-    /// - `allOccurrences == false`: POSITION-SCOPED — replace the SINGLE run the
-    ///   user pointed at, identified by `occurrenceIndex` (its zero-based index
-    ///   among all fold-equal runs in field reading order). The token the user
-    ///   selected is ALWAYS the one fixed, never silently the first. A nil
-    ///   `occurrenceIndex` defaults to occurrence 0 (a provenance-line correction
-    ///   with no specific selection fixes the first occurrence).
+    /// - `allOccurrences == true`: replace every identity window that is not
+    ///   covered by the §3.2 containment guard across all fields (the guarded
+    ///   count shown in the UI).
+    /// - `allOccurrences == false`: POSITION-SCOPED — replace the single window
+    ///   the user pointed at, identified by `occurrenceIndex` (its zero-based
+    ///   index among all §3.1 windows in field reading order). A
+    ///   guard-covered selection is an honest no-op. A nil `occurrenceIndex`
+    ///   defaults to occurrence 0 (a provenance-line correction with no
+    ///   specific selection fixes the first occurrence).
     ///
-    /// Returns the edited notes and the number of runs replaced (0 or 1 in the
-    /// position-scoped case; N when `allOccurrences`).
+    /// Returns the edited notes and the number of windows replaced (0 or 1 in
+    /// the position-scoped case; N when `allOccurrences`).
     public static func applyNoteCorrection(
         notes: NotesStructured, original: String, replacement: String,
         allOccurrences: Bool, occurrenceIndex: Int? = nil
     ) -> (notes: NotesStructured, count: Int) {
         var out = notes
         var replaced = 0
-        let targetFold = VocabNormalization.canonicalMode(original)
+        let replacementFolds = foldedWords(in: replacement)
         // The position-scoped target occurrence (reading order across fields).
         let target = allOccurrences ? -1 : (occurrenceIndex ?? 0)
-        // Running count of fold-equal runs seen so far across all fields, so the
-        // occurrence index is GLOBAL (the same order the UI enumerates them in).
+        // Running count of §3.1 identity occurrences seen so far across all
+        // fields, so the occurrence index is GLOBAL.
         var seen = 0
 
         func fix(_ value: String) -> String {
+            let windows = enumerateCorrectionWindows(in: value, original: original)
             let runs = wordRuns(in: value)
-            var matches: [Range<String.Index>] = []
-            for run in runs where VocabNormalization.canonicalMode(run.text) == targetFold {
+            let fieldStart = seen
+            seen += windows.count
+
+            let chosen: [CorrectionWindow]
+            if windows.isEmpty {
+                chosen = []
+            } else {
+                let starts = validReplacementWindowStarts(
+                    in: value, runs: runs, replacementFolds: replacementFolds)
                 if allOccurrences {
-                    matches.append(run.range)
-                } else if seen == target {
-                    matches.append(run.range)
+                    chosen = windows.filter {
+                        !correctionWindowIsCovered(
+                            $0, replacementWindowStarts: starts,
+                            replacementCount: replacementFolds.count)
+                    }
+                } else if target >= fieldStart, target < fieldStart + windows.count {
+                    let window = windows[target - fieldStart]
+                    chosen = correctionWindowIsCovered(
+                        window, replacementWindowStarts: starts,
+                        replacementCount: replacementFolds.count)
+                        ? [] : [window]
+                } else {
+                    chosen = []
                 }
-                seen += 1
             }
-            guard !matches.isEmpty else { return value }
-            var result = value
-            for range in matches.reversed() {
-                result.replaceSubrange(range, with: replacement)
-                replaced += 1
-            }
-            return result
+            let result = applyingCorrectionWindows(chosen, in: value, replacement: replacement)
+            replaced += result.count
+            return result.text
         }
 
         if let title = out.title { out.title = fix(title) }
@@ -567,32 +831,25 @@ public enum NameSubstitution {
         return (out, replaced)
     }
 
-    /// G14 (M3): deterministic name rewrite over a FLAT Markdown string (the
-    /// stored `memory_digest`). Replaces EVERY fold-equal whole-word run of
-    /// `original` with `replacement` — the same fold-equal whole-word matching
-    /// `applyNoteCorrection` uses, but over one flat string and always
-    /// all-occurrences (a name-changing edit corrects every mention of the old
-    /// name in the digest). NO LLM call. Returns the rewritten string and the
-    /// number of runs replaced (0 ⇒ the digest carried no occurrence, so it is
-    /// reproduced unchanged). Used to keep the digest's names in lockstep with a
-    /// speaker-rename / notes name-correction edit, deterministically, at zero
-    /// added cost.
+    /// G14 (M3): deterministic, guarded name rewrite over a FLAT Markdown
+    /// string. The same §3.1 occurrence identity and §3.2 containment guard are
+    /// used by the notes path, so digest and notes cannot diverge on a bare→full
+    /// correction. NO LLM call.
     public static func applyTextCorrection(
         text: String, original: String, replacement: String
     ) -> (text: String, count: Int) {
-        let targetFold = VocabNormalization.canonicalMode(original)
-        guard !targetFold.isEmpty else { return (text, 0) }
+        let windows = enumerateCorrectionWindows(in: text, original: original)
+        guard !windows.isEmpty else { return (text, 0) }
         let runs = wordRuns(in: text)
-        var matches: [Range<String.Index>] = []
-        for run in runs where VocabNormalization.canonicalMode(run.text) == targetFold {
-            matches.append(run.range)
+        let replacementFolds = foldedWords(in: replacement)
+        let starts = validReplacementWindowStarts(
+            in: text, runs: runs, replacementFolds: replacementFolds)
+        let chosen = windows.filter {
+            !correctionWindowIsCovered(
+                $0, replacementWindowStarts: starts,
+                replacementCount: replacementFolds.count)
         }
-        guard !matches.isEmpty else { return (text, 0) }
-        var result = text
-        for range in matches.reversed() {
-            result.replaceSubrange(range, with: replacement)
-        }
-        return (result, matches.count)
+        return applyingCorrectionWindows(chosen, in: text, replacement: replacement)
     }
 
     /// §3/§1: apply the substitution pass to a SPEAKER LABEL surface (label

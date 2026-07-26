@@ -255,6 +255,212 @@ private func markdownNames(_ dir: URL) -> [String] {
     }
 }
 
+// MARK: - The transcript sidecar over SSH (destination parity with the notes sidecar)
+
+/// Opts the SSH path into a sidecar combination. Both keys are
+/// destination-independent; `seedDeliverable` leaves the notes key OFF.
+private func setSSHSidecars(
+    _ database: BlaiseDatabase, notes: Bool, transcript: Bool
+) async throws {
+    let store = SettingsStore(database: database)
+    try await store.set(HandoffDestination.Key.localMarkdownSidecar, to: notes)
+    try await store.set(HandoffDestination.Key.transcriptSidecar, to: transcript)
+}
+
+/// Replay a recorded remote command against a real `sh`, rooted at a temp dir
+/// standing in for the remote root, with the recorded payload on stdin. The
+/// remote LOGIN SHELL is what expands the command's globs, so re-implementing
+/// that expansion in Swift would pin an assumption rather than the behaviour.
+private func replayRemoteCommand(_ call: MockTransport.Call, root: URL) throws {
+    let command = (call.argv.last ?? "")
+        .replacingOccurrences(of: handoffValidExample.remoteRoot, with: root.path)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", command]
+    let stdin = Pipe()
+    process.standardInput = stdin
+    try process.run()
+    stdin.fileHandleForWriting.write(call.payload)
+    try stdin.fileHandleForWriting.close()
+    process.waitUntilExit()
+}
+
+@Suite struct SSHTranscriptSidecarTests {
+    /// Toggle ON: a THIRD ssh invocation uploads the transcript to the same
+    /// remote meeting dir under the `-transcript` name, with `kind: transcript`
+    /// frontmatter and the persisted-transcript body.
+    @Test func sshUploadsTranscriptSidecarWhenToggleOn() async throws {
+        let database = try makeDatabase()
+        let item = try await seedDeliverable(database, title: "Q2 Budget Review")
+        try await setSSHSidecars(database, notes: true, transcript: true)
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        let rows = try await HandoffRepository(database: database).allItems()
+        #expect(rows.allSatisfy { $0.state == .delivered })
+        #expect(transport.calls.count == 3)  // JSON, notes sidecar, transcript sidecar
+
+        let settings = handoffValidExample
+        let remoteDir = settings.remoteRoot + "/" + item.meetingID
+        let transcriptCall = transport.calls[2]
+        #expect(transcriptCall.argv == HandoffCommand.sidecarArgv(
+            user: settings.user, host: settings.hosts[0], identityFile: settings.identityFile,
+            remoteDir: remoteDir, slug: "q2-budget-review", kind: .transcript))
+        #expect(transcriptCall.argv.last
+            == "mkdir -p '\(remoteDir)' && cat > '\(remoteDir)/q2-budget-review-transcript.md'")
+
+        // The streamed bytes are the transcript render — byte-identical to what
+        // the LOCAL writer would produce for this meeting (same fields, same
+        // renderer), which is what "one source" buys.
+        let segments = try await TranscriptRepository(database: database)
+            .segments(meetingID: item.meetingID)
+        let body = String(decoding: transcriptCall.payload, as: UTF8.self)
+        #expect(body.contains("\nkind: transcript\n"))
+        #expect(body.contains("native_id: \(item.meetingID)\n"))
+        #expect(!body.contains("version_hash:"))
+        #expect(body.hasSuffix(TranscriptCopyText.assemble(segments) + "\n"))
+    }
+
+    /// Toggle OFF (the shipped default, asserted from the ABSENT key): the SSH
+    /// path uploads the notes sidecar only — no transcript file.
+    @Test func sshUploadsNoTranscriptSidecarWhenToggleOff() async throws {
+        let database = try makeDatabase()
+        _ = try await seedDeliverable(database, title: "Q2 Budget Review")
+        // Notes ON, transcript key deliberately never set.
+        try await SettingsStore(database: database)
+            .set(HandoffDestination.Key.localMarkdownSidecar, to: true)
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(transport.calls.count == 2)  // JSON + notes sidecar
+        #expect(transport.calls.allSatisfy { $0.argv.last?.contains("-transcript.md") == false })
+    }
+
+    /// The two kinds COEXIST remotely: distinct file names, and each command's
+    /// prior-slug `rm` is scoped to its own kind, so neither upload removes the
+    /// other's remote file.
+    @Test func notesAndTranscriptSidecarsCoexistRemotely() async throws {
+        let database = try makeDatabase()
+        let item = try await seedDeliverable(database, title: "Q2 Budget Review")
+        try await setSSHSidecars(database, notes: true, transcript: true)
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        let remoteDir = handoffValidExample.remoteRoot + "/" + item.meetingID
+        let notesCommand = transport.calls[1].argv.last ?? ""
+        let transcriptCommand = transport.calls[2].argv.last ?? ""
+        // Different targets…
+        #expect(notesCommand.hasSuffix("cat > '\(remoteDir)/q2-budget-review.md'"))
+        #expect(transcriptCommand.hasSuffix("cat > '\(remoteDir)/q2-budget-review-transcript.md'"))
+        // …and the transcript command sweeps nothing at all, so it cannot reach
+        // the notes file, while the notes sweep runs FIRST, before the
+        // transcript is written back.
+        #expect(!transcriptCommand.contains("rm -f"))
+        #expect(notesCommand.contains("rm -f '\(remoteDir)'/*.md"))
+    }
+
+    /// Coexistence as the PROPERTY, not as command text: a title whose slug
+    /// already ends in `-transcript` gives the notes sidecar a remote name that
+    /// any `*-transcript.md` sweep would match. Both commands are replayed, in
+    /// the worker's order, against a real shell — BOTH files must survive.
+    @Test func sidecarsCoexistWhenTheSlugEndsInTranscript() async throws {
+        let database = try makeDatabase()
+        let item = try await seedDeliverable(database, title: "Quoll Harbor transcript")
+        try await setSSHSidecars(database, notes: true, transcript: true)
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(transport.calls.count == 3)  // JSON, notes sidecar, transcript sidecar
+        let root = try tsTempFolder()
+        try replayRemoteCommand(transport.calls[1], root: root)  // notes first, as the worker orders them
+        try replayRemoteCommand(transport.calls[2], root: root)
+
+        let remoteDir = root.appendingPathComponent(item.meetingID)
+        #expect(markdownNames(remoteDir)
+            == ["quoll-harbor-transcript-transcript.md", "quoll-harbor-transcript.md"])
+    }
+
+    /// A hostile, shell-metacharacter-laden title reaches the transcript command
+    /// only through the `[a-z0-9-]` slug — no injectable token, no breakout.
+    @Test func sshTranscriptSlugFromHostileTitleIsSafe() async throws {
+        let database = try makeDatabase()
+        let hostile = "'; rm -rf / # $(whoami) `id` && echo pwned"
+        let item = try await seedDeliverable(database, title: hostile)
+        try await setSSHSidecars(database, notes: false, transcript: true)
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(transport.calls.count == 2)  // JSON + transcript sidecar
+        let remoteDir = handoffValidExample.remoteRoot + "/" + item.meetingID
+        let slug = MarkdownSidecar.slug(hostile)
+        #expect(HandoffCommand.isSafeSlug(slug))
+        let command = transport.calls[1].argv.last
+        #expect(command
+            == "mkdir -p '\(remoteDir)' && cat > '\(remoteDir)/\(slug)-transcript.md'")
+        #expect(command?.contains("rm -rf") == false)
+    }
+
+    /// The block path of the slug guard: an unsafe slug is rejected outright, so
+    /// the uploader SKIPS rather than ever emitting such a command. (The
+    /// production `slug` cannot produce one; this pins the guard itself.)
+    @Test func unsafeSlugsAreRejectedByTheGuard() {
+        #expect(!HandoffCommand.isSafeSlug("q2'; rm -rf /"))
+        #expect(!HandoffCommand.isSafeSlug("Q2-budget"))
+        #expect(!HandoffCommand.isSafeSlug("q2 budget"))
+        #expect(!HandoffCommand.isSafeSlug("q2/../budget"))
+        #expect(HandoffCommand.isSafeSlug("q2-budget-review"))
+    }
+
+    /// Failure isolation: a transcript-upload failure never fails or retries the
+    /// JSON queue item (the JSON is the contract; the sidecar is convenience).
+    @Test func transcriptUploadFailureDoesNotFailJSONDelivery() async throws {
+        let database = try makeDatabase()
+        let item = try await seedDeliverable(database, title: "Q2 Budget Review")
+        try await setSSHSidecars(database, notes: false, transcript: true)
+        // Call 1 (JSON) succeeds; call 2 (transcript sidecar) fails non-zero.
+        let transport = MockTransport(script: [
+            HandoffTransportOutcome(exitStatus: 0, stderrTail: "", timedOut: false),
+            HandoffTransportOutcome(exitStatus: 255, stderrTail: "transcript boom", timedOut: false),
+        ])
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        let rows = try await HandoffRepository(database: database).allItems()
+        #expect(rows.first?.state == .delivered)
+        #expect(rows.first?.id == item.id)
+        #expect(transport.calls.count == 2)  // attempted once, not retried
+        let history = await worker.deliveryHistory()
+        #expect(history.map(\.itemID) == [item.id])
+        await #expect(worker.currentSnapshot().state == .idle)
+    }
+
+    /// No transcript rows ⇒ no upload at all (the local skip, over SSH).
+    @Test func noTranscriptRowsSkipsTheUpload() async throws {
+        let database = try makeDatabase()
+        let item = try await seedDeliverable(database, title: "Q2 Budget Review")
+        try await setSSHSidecars(database, notes: false, transcript: true)
+        try await TranscriptRepository(database: database).deleteTranscript(
+            meetingID: item.meetingID)
+        let transport = MockTransport()
+        let worker = makeWorker(database, transport: transport)
+        await worker.kick()
+        await worker.waitUntilSettled()
+
+        #expect(transport.calls.count == 1)  // JSON only
+    }
+}
+
 private func tsFields(
     _ meetingID: String, title: String = "Quoll Harbor sync", body: String,
     kind: MarkdownSidecar.Kind = .notes

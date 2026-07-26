@@ -197,7 +197,7 @@ public final class HandoffSettingsModel {
     public private(set) var localFolderPath = ""
     /// Markdown sidecar toggle for the local folder (default ON).
     public var markdownSidecar = true
-    /// Transcript Markdown sidecar, LOCAL FOLDER only (default OFF): writes the
+    /// Transcript Markdown sidecar, either destination (default OFF): writes the
     /// transcript as its own `.md` beside the notes sidecar.
     public var transcriptSidecar = false
     /// G5 v1.3: REMOVE superseded payloads at the destination. Default OFF ⇒
@@ -287,8 +287,8 @@ public final class HandoffSettingsModel {
             hosts: hosts,
             remoteRoot: remoteRoot.trimmingCharacters(in: .whitespaces))
         // Persist the active destination kind (G5). SSH fields are always
-        // persisted (so switching back keeps them); the sidecar toggle is
-        // persisted for the local folder.
+        // persisted (so switching back keeps them); the sidecar toggles are
+        // persisted for either destination.
         try? await settings.set(HandoffDestination.Key.kind, to: destinationKind)
         try? await settings.set(HandoffDestination.Key.localMarkdownSidecar, to: markdownSidecar)
         try? await settings.set(HandoffDestination.Key.transcriptSidecar, to: transcriptSidecar)

@@ -84,7 +84,7 @@ public enum MemoryDigestSettings {
     /// cost); OFF → the default `ClaudeSummarizationEngine.model` (Sonnet). It
     /// does NOT gate whether the audit runs (the verify/reconcile toggles do that)
     /// and has NO effect on notes, synthesis, or the md-v5 verify/reconcile
-    /// passes — those always stay Sonnet. Default OFF (Sonnet) until Ric validates
+    /// passes — those always stay Sonnet. Default OFF (Sonnet) until validated for
     /// Haiku-audit quality; default-OFF is byte-identical Sonnet everywhere. Read
     /// at the same pipeline combined-audit decision point; the dev env override
     /// `BLAISE_HAIKU_AUDIT=1` forces Haiku on regardless (so the quality gauntlet

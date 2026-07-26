@@ -104,12 +104,19 @@ struct SubstitutionReportView: View {
     }
 }
 
-/// Backs the correct-name popover: everyday-aware defaults, occurrence count,
-/// the glossary-link admission pre-check, and the pipeline writes.
+/// Backs the correct-name popover: everyday-aware defaults, the two §3.3
+/// occurrence quantities/classification, the Remember gate, the glossary-link
+/// admission pre-check, and the pipeline writes.
 @MainActor @Observable
 final class CorrectNameModel {
-    private let database: BlaiseDatabase
-    private let pipeline: ProcessingPipeline
+    private let database: BlaiseDatabase?
+    private let pipeline: ProcessingPipeline?
+    /// These seams keep the state/copy contract headless-testable without
+    /// changing the production pipeline API. Production construction leaves
+    /// them nil and uses `pipeline` below.
+    private let correctionHandler: ((MeetingID, String, String, Bool, Int?) async -> Int)?
+    private let rememberHandler:
+        ((String, String, MeetingID?) async throws -> NameCorrectionStore.WriteResult)?
     let meeting: Meeting
     let notes: MeetingNotes?
     /// L-5: resolved speaker names from the transcript — a rule-2 pre-fill
@@ -137,16 +144,25 @@ final class CorrectNameModel {
     let openedFromToken: Bool
 
     var statusMessage: String?
+    /// True while confirm() is in flight — disables Confirm and the text
+    /// fields so the awaited correction and the durable Remember write cannot
+    /// race a concurrent edit of the fields (impl-audit I-C2).
+    var isConfirming: Bool = false
 
     init(
-        meeting: Meeting, notes: MeetingNotes?, database: BlaiseDatabase,
-        pipeline: ProcessingPipeline, resolvedSpeakers: [String] = [],
-        preselected: String? = nil, preselectedOccurrence: Int? = nil
+        meeting: Meeting, notes: MeetingNotes?, database: BlaiseDatabase? = nil,
+        pipeline: ProcessingPipeline? = nil, resolvedSpeakers: [String] = [],
+        preselected: String? = nil, preselectedOccurrence: Int? = nil,
+        correctionHandler: ((MeetingID, String, String, Bool, Int?) async -> Int)? = nil,
+        rememberHandler:
+            ((String, String, MeetingID?) async throws -> NameCorrectionStore.WriteResult)? = nil
     ) {
         self.meeting = meeting
         self.notes = notes
         self.database = database
         self.pipeline = pipeline
+        self.correctionHandler = correctionHandler
+        self.rememberHandler = rememberHandler
         self.resolvedSpeakers = resolvedSpeakers
         self.openedFromToken = preselectedOccurrence != nil
         // §5: pre-fill the misheard surface from a text selection when present.
@@ -196,12 +212,35 @@ final class CorrectNameModel {
         return everydayTest(folded)
     }
 
-    /// Count of identical occurrences in these notes (whole-word, folded).
-    var occurrenceCount: Int {
-        guard let structured = notes?.structured, !original.isEmpty else { return 0 }
-        let (_, count) = NameSubstitution.applyNoteCorrection(
-            notes: structured, original: original, replacement: "_", allOccurrences: true)
-        return count
+    /// Replacement-independent §3.1 occurrence identity across these notes.
+    /// This is the index domain for the position picker.
+    var selectableOccurrenceCount: Int {
+        guard let structured = notes?.structured else { return 0 }
+        return NameSubstitution.selectableOccurrenceCount(in: structured, original: original)
+    }
+
+    /// §3.2-guarded count of occurrences an all-occurrences confirm will
+    /// actually replace. This is the quantity shown next to the toggle.
+    var replaceableCount: Int {
+        guard let structured = notes?.structured else { return 0 }
+        return NameSubstitution.replaceableOccurrenceCount(
+            in: structured, original: original, replacement: replacement)
+    }
+
+    /// Whether the durable G2 store can truthfully remember this correction.
+    /// The store matcher remains single-run by contract, so multi-word keys are
+    /// intentionally meeting-local.
+    var supportsRemember: Bool {
+        NameSubstitution.foldedWords(in: original).count == 1
+    }
+
+    /// The status reason for the selected identity occurrence. A stale index
+    /// is `.absent`; a guard-covered occurrence is `.alreadyCorrect`.
+    var selectedOccurrenceClassification: NameSubstitution.OccurrenceClassification {
+        guard let structured = notes?.structured else { return .absent }
+        return NameSubstitution.classifyNoteOccurrence(
+            in: structured, original: original, replacement: replacement,
+            occurrenceIndex: selectedOccurrence)
     }
 
     /// Recompute the everyday-aware toggle default when the surface changes,
@@ -210,6 +249,9 @@ final class CorrectNameModel {
     func surfaceChanged() {
         applyToAll = !isEverydaySurface
         selectedOccurrence = 0
+        // A disabled Toggle preserves its binding. Force the state off at the
+        // same transition that makes a multi-word original unsupported.
+        if !supportsRemember { remember = false }
         if replacement.trimmingCharacters(in: .whitespaces).isEmpty,
             let candidate = rule2Candidate
         {
@@ -220,6 +262,9 @@ final class CorrectNameModel {
     /// The honest durability copy (§5 / R4-M3): for an EVERYDAY surface
     /// corrected in prose, remembering does NOT preserve the prose fix.
     var durabilityCopy: String {
+        if NameSubstitution.foldedWords(in: original).count > 1 {
+            return "Durable corrections for multi-word names aren't supported yet — this fix applies to these notes only"
+        }
         if remember {
             if isEverydaySurface {
                 return "Remembered corrections for everyday words apply to owners and speaker labels; this prose fix is for these notes only."
@@ -231,7 +276,7 @@ final class CorrectNameModel {
 
     /// The scope-consequence copy shown before saving a remembered row (§2/§5).
     var rememberScopeCopy: String? {
-        guard remember else { return nil }
+        guard remember && supportsRemember else { return nil }
         if isEverydaySurface {
             return "“\(VocabNormalization.canonicalMode(original))” is an everyday word — this will apply to owners and speaker labels, not prose."
         }
@@ -246,25 +291,88 @@ final class CorrectNameModel {
     }
 
     var canConfirm: Bool {
-        !original.trimmingCharacters(in: .whitespaces).isEmpty
-            && !replacement.trimmingCharacters(in: .whitespaces).isEmpty
-            && occurrenceCount > 0
+        guard !original.trimmingCharacters(in: .whitespaces).isEmpty,
+            !replacement.trimmingCharacters(in: .whitespaces).isEmpty
+        else { return false }
+        return applyToAll ? replaceableCount > 0 : selectableOccurrenceCount > 0
     }
 
     /// Confirm: position/occurrence-scoped notes fix, then optionally remember
     /// (the store write may hit a §2(d) conflict — surfaced, local fix kept).
+    ///
+    /// Race hardening (impl-audit I-C1/I-C2): the whole request is captured
+    /// into immutable locals at entry — the applied correction and the durable
+    /// Remember write always describe the SAME edit even if the fields change
+    /// mid-await — and the persisted notes are re-fetched and compared against
+    /// this model's snapshot before applying, because the position index is
+    /// only meaningful against the notes the picker enumerated. Residual: the
+    /// check-to-apply gap is not transactional (a pipeline revision token would
+    /// need a LOCKED-signature change) — backlogged with trigger.
     func confirm() async {
-        let count = (try? await pipeline.correctNameInNotes(
-            meetingID: meeting.id, original: original, replacement: replacement,
-            allOccurrences: applyToAll,
-            occurrenceIndex: applyToAll ? nil : selectedOccurrence)) ?? 0
+        guard !isConfirming else { return }
+        isConfirming = true
+        defer { isConfirming = false }
+        let requestOriginal = original
+        let requestReplacement = replacement
+        let requestApplyToAll = applyToAll
+        let requestIndex = applyToAll ? nil : Optional(selectedOccurrence)
+        let requestRemember = remember && supportsRemember
+        // The zero-count status must describe the REQUEST, not whatever the
+        // picker points at when the await returns (impl-audit r2 High):
+        // classified here, synchronously, from the same captured state.
+        let requestClassification = selectedOccurrenceClassification
+
+        // I-C1 drift guard: the position index (and the counts the user just
+        // read) were computed against this model's notes snapshot. If the
+        // persisted notes have changed underneath the open popover (a resume
+        // or regeneration landing), the index maps to a DIFFERENT occurrence —
+        // abort honestly instead of correcting the wrong one.
+        if let database, let snapshot = notes?.structured {
+            let fresh = try? await NotesRepository(database: database)
+                .fetch(meetingID: meeting.id)
+            if let fresh, fresh.structured != snapshot {
+                statusMessage =
+                    "These notes changed since this popover opened — close and reopen to correct."
+                return
+            }
+        }
+
+        let count: Int
+        if let correctionHandler {
+            count = await correctionHandler(
+                meeting.id, requestOriginal, requestReplacement, requestApplyToAll,
+                requestIndex)
+        } else if let pipeline {
+            count = (try? await pipeline.correctNameInNotes(
+                meetingID: meeting.id, original: requestOriginal,
+                replacement: requestReplacement,
+                allOccurrences: requestApplyToAll,
+                occurrenceIndex: requestIndex)) ?? 0
+        } else {
+            count = 0
+        }
         if count == 0 {
-            statusMessage = "No matching name found in these notes."
+            statusMessage = !requestApplyToAll
+                && requestClassification == .alreadyCorrect
+                ? "Already matches the correction."
+                : "No matching name found in these notes."
             return
         }
-        if remember {
-            let result = try? await pipeline.rememberCorrection(
-                mishearedSurface: original, replacement: replacement, sourceMeetingID: meeting.id)
+        // Defense in depth: even if a caller mutates state without going
+        // through `surfaceChanged`, unsupported multi-word corrections never
+        // reach the durable store.
+        if requestRemember {
+            let result: NameCorrectionStore.WriteResult?
+            if let rememberHandler {
+                result = try? await rememberHandler(
+                    requestOriginal, requestReplacement, meeting.id)
+            } else if let pipeline {
+                result = try? await pipeline.rememberCorrection(
+                    mishearedSurface: requestOriginal, replacement: requestReplacement,
+                    sourceMeetingID: meeting.id)
+            } else {
+                result = nil
+            }
             switch result {
             case .written:
                 statusMessage = "Fixed \(count) and remembered."
@@ -307,19 +415,22 @@ struct CorrectNamePopover: View {
                 TextField("e.g. SEMI", text: $model.original)
                     .textFieldStyle(.roundedBorder)
                     .onChange(of: model.original) { model.surfaceChanged() }
+                    .disabled(model.isConfirming)
             }
             VStack(alignment: .leading, spacing: 4) {
                 Text("Correct name").font(.caption).foregroundStyle(.secondary)
                 TextField("e.g. Sammy", text: $model.replacement)
                     .textFieldStyle(.roundedBorder)
+                    .disabled(model.isConfirming)
             }
 
-            if model.occurrenceCount > 0 {
+            if model.selectableOccurrenceCount > 0 {
                 Toggle(isOn: $model.applyToAll) {
-                    Text("Apply to all \(model.occurrenceCount) identical occurrence\(model.occurrenceCount == 1 ? "" : "s") in these notes")
+                    Text("Apply to all \(model.replaceableCount) identical occurrence\(model.replaceableCount == 1 ? "" : "s") in these notes")
                         .font(.system(size: 12))
                 }
                 .toggleStyle(.checkbox)
+                .disabled(model.isConfirming)
                 if model.applyToAll && model.isEverydaySurface {
                     Text("“\(model.original)” is an everyday word — replacing every occurrence may change ordinary prose.")
                         .font(.caption2)
@@ -333,16 +444,17 @@ struct CorrectNamePopover: View {
                 // `.textSelection` exposes no selected-token callback to scope
                 // from), it defaults to the FIRST occurrence and the count is
                 // shown so the user chooses deliberately.
-                if !model.applyToAll && model.occurrenceCount > 1 {
+                if !model.applyToAll && model.selectableOccurrenceCount > 1 {
                     Picker("Occurrence", selection: $model.selectedOccurrence) {
-                        ForEach(0 ..< model.occurrenceCount, id: \.self) { i in
-                            Text("Occurrence \(i + 1) of \(model.occurrenceCount)").tag(i)
+                        ForEach(0 ..< model.selectableOccurrenceCount, id: \.self) { i in
+                            Text("Occurrence \(i + 1) of \(model.selectableOccurrenceCount)").tag(i)
                         }
                     }
                     .pickerStyle(.menu)
                     .font(.system(size: 12))
+                    .disabled(model.isConfirming)
                     if !model.openedFromToken {
-                        Text("Counted in reading order (summary → your items → decisions → action items). Pick the one to fix.")
+                        Text("Counted in reading order (title → summary → detailed notes → decisions → action items → your action items; each item counts owner, then text). Pick the one to fix.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -359,6 +471,7 @@ struct CorrectNamePopover: View {
                 Text("Remember this correction").font(.system(size: 12, weight: .medium))
             }
             .toggleStyle(.checkbox)
+            .disabled(!model.supportsRemember || model.isConfirming)
             if let scope = model.rememberScopeCopy {
                 Text(scope).font(.caption2).foregroundStyle(.secondary)
             }
@@ -387,7 +500,7 @@ struct CorrectNamePopover: View {
                     Task { await model.confirm() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(!model.canConfirm)
+                .disabled(!model.canConfirm || model.isConfirming)
             }
         }
         .padding(16)
