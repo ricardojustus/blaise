@@ -58,7 +58,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleVersion</key>
 	<string>__BLAISE_BUILD_NUMBER__</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.5.0</string>
+	<string>1.5.1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.1</string>
 	<key>NSHighResolutionCapable</key>
@@ -124,8 +124,32 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 # "Apple Development: <your-apple-id> (<TEAMID>)") so TCC grants survive
 # rebuilds; otherwise the build falls back to ad-hoc signing (loud warning
 # below). `security find-identity -v -p codesigning` lists yours.
+#
+# BLAISE_RELEASE_SIGN=1 opts into the RELEASE path: BLAISE_SIGN_IDENTITY must
+# then name a Developer ID Application identity, and everything is signed with
+# the hardened runtime and a secure timestamp (both required for
+# notarization). Nested Mach-O first, bundle last — codesign seals the bundle
+# over its contents, so the inner signature must already be in place. No
+# ad-hoc fallback on this path: a release build that silently degrades is
+# worse than one that stops.
 IDENTITY="${BLAISE_SIGN_IDENTITY:-}"
-if [[ -n "$IDENTITY" ]] && security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"; then
+if [[ "${BLAISE_RELEASE_SIGN:-}" == "1" ]]; then
+    # Presence in the keychain is not enough: an Apple Development identity
+    # signs fine here and is only rejected later, by Apple, at notarization.
+    if [[ "$IDENTITY" != "Developer ID Application: "* ]] \
+       || ! security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"; then
+        echo "error: BLAISE_RELEASE_SIGN=1 requires BLAISE_SIGN_IDENTITY to be a valid" >&2
+        echo "error: \"Developer ID Application: ...\" identity in the keychain." >&2
+        echo "error: got: \"${IDENTITY:-<unset>}\"" >&2
+        echo "error: candidates: security find-identity -v -p codesigning" >&2
+        exit 1
+    fi
+    codesign -s "$IDENTITY" --force --options runtime --timestamp "$APP/Contents/Resources/uv"
+    codesign -s "$IDENTITY" --force --options runtime --timestamp \
+        --entitlements "$ROOT/scripts/entitlements.plist" "$APP"
+    echo "RELEASE-signed (hardened runtime + timestamp) with: $IDENTITY"
+    echo "next: scripts/notarize_app.sh (uploads to Apple — release-time step)"
+elif [[ -n "$IDENTITY" ]] && security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"; then
     codesign -s "$IDENTITY" --force "$APP"
     echo "signed with stable identity: $IDENTITY"
 else

@@ -2,6 +2,25 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [1.5.1] — 26/07/2026
+
+The signed release. No feature changes — this build exists so macOS opens Blaise without
+warnings.
+
+### Changed
+- **The app is now signed with a Developer ID certificate, hardened-runtime enabled, and
+  notarised by Apple.** Gatekeeper opens it normally: no right-click → Open ritual, no
+  "unidentified developer" warning. This was the most-requested fix from the 1.5.0 release.
+- Upgrading from an unsigned build: macOS ties permission grants to the signing identity, so
+  Blaise will re-ask for Microphone, System Audio Recording, and Calendar access once on first
+  launch. Your meetings, transcripts, notes, and settings are untouched.
+- If notifications were silently missing for you on 1.5.0 (#8), this build is the test of the
+  leading suspect — ad-hoc signing. Please report back either way.
+- For source builds: `scripts/build_app.sh` gains an opt-in release-signing path
+  (`BLAISE_RELEASE_SIGN=1` + your own `BLAISE_SIGN_IDENTITY`), and `scripts/notarize_app.sh`
+  wraps the zip → notarize → staple → verify sequence. The default unsigned dev build is
+  unchanged.
+
 ## [1.5.0] — 26/07/2026
 
 The community release. Slack Huddles support, a participant confirmation gate, capture that
@@ -136,6 +155,7 @@ synthesis option.
 - Stuck "Processing" indicator in some states.
 - Escaping and formatting edge cases in account-engine notes output.
 
+[1.5.1]: https://github.com/ricardojustus/blaise/releases/tag/v1.5.1
 [1.5.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.5.0
 [1.4.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.4.0
 [1.3.0]: https://github.com/ricardojustus/blaise/releases/tag/v1.3.0
