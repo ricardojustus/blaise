@@ -90,7 +90,12 @@ Blaise is local-first by design, and the privacy boundary is stated honestly:
   Claude (Anthropic's Sonnet model) under **your own API key**, which means the
   meeting *transcript* — not the audio — is sent to Anthropic for that one step.
   This is the only network call that carries meeting content, and it is opt-in by
-  configuring a key.
+  configuring a key. There are two other ways to run that step, switchable in
+  Settings: an **account engine** that uses your existing Claude subscription
+  through the `claude` CLI's OAuth token instead of a metered API key (same
+  transcript, same destination — only the billing and the credential differ, and
+  no API key is exposed to it), or a **local engine** that runs on-device and
+  makes no network call at all.
 - **Spend tracking and a ceiling are built in.** Blaise tracks what the notes step
   costs and enforces a configurable monthly ceiling, so the cloud step can never
   run away.
