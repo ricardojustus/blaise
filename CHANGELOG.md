@@ -35,7 +35,6 @@ here are contributed by @arthursoares.
   version is kept unless you turn it on), and optionally include the meeting's audio recordings
   with the delivery (off by default, the privacy default, since a syncing destination means audio
   leaves the machine).
-- **Automated secret scanning in CI** on every push and pull request, alongside build and test.
 
 ### Changed
 - **Markdown tables render as tables** in the notes view, wrapping to the notes column instead of
