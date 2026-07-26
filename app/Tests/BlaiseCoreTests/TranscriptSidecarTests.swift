@@ -216,6 +216,42 @@ private func markdownNames(_ dir: URL) -> [String] {
         #expect(name == "quoll-harbor-sync.md")
         #expect(markdownNames(dir) == ["quoll-harbor-sync-transcript.md", "quoll-harbor-sync.md"])
         #expect(try String(contentsOf: legacy, encoding: .utf8).hasSuffix("# Notes v2\n"))
+
+        // Block path for the closing-delimiter guard: a `---`-opened file with
+        // NO closing `---` is unclassifiable, so it survives untouched and the
+        // transcript write mints a ULID-suffixed twin instead of claiming it.
+        let mangled = dir.appendingPathComponent("quoll-harbor-sync-transcript.md")
+        let truncated = "---\ntitle: Quoll Harbor sync\nnative_id: \(m)\nkind: transcript\n"
+        try Data(truncated.utf8).write(to: mangled)
+        MarkdownSidecar.write(tsFields(m, body: "Sam: olá", kind: .transcript), to: dir)
+        #expect(try String(contentsOf: mangled, encoding: .utf8) == truncated)
+        #expect(markdownNames(dir).contains("quoll-harbor-sync-transcript-\(m).md"))
+    }
+
+    /// A user's OWN note — no frontmatter at all, but a `---` rule in the body
+    /// and a line quoting `native_id:` — is nobody's sidecar: classification
+    /// starts at a leading `---`. Neither a notes nor a transcript write may
+    /// claim it (claiming it means deleting it as a "prior sidecar").
+    @Test func frontmatterlessNoteQuotingNativeIDIsNeverOurs() throws {
+        let dir = try tsTempFolder()
+        let m = ULID.generate()
+        let mine = dir.appendingPathComponent("my-thoughts.md")
+        let text = """
+            # My own note
+
+            native_id: \(m)
+
+            ---
+
+            still mine
+
+            """
+        try Data(text.utf8).write(to: mine)
+
+        MarkdownSidecar.write(tsFields(m, body: "# Notes\n"), to: dir)
+        MarkdownSidecar.write(tsFields(m, body: "Sam: olá", kind: .transcript), to: dir)
+        #expect(try String(contentsOf: mine, encoding: .utf8) == text)
+        #expect(markdownNames(dir).contains("my-thoughts.md"))
     }
 }
 

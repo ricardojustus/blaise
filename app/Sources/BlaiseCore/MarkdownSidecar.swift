@@ -189,9 +189,10 @@ public enum MarkdownSidecar {
         // Classify from the FRONTMATTER ONLY (everything before the closing
         // `---`): a BODY line reading `kind: transcript` — a note quoting this
         // very format — must never flip a file's kind or its ownership. No
-        // closing delimiter ⇒ no frontmatter ⇒ not ours.
+        // closing delimiter ⇒ no frontmatter ⇒ not ours. Nor does a file that
+        // never OPENS with `---`: its leading body is not a header.
         let parts = text.components(separatedBy: "\n---\n")
-        guard parts.count > 1 else { return false }
+        guard text.hasPrefix("---\n"), parts.count > 1 else { return false }
         let header = parts[0] + "\n"
         let isTranscript = header.contains("\nkind: transcript\n")
         return header.contains("\nnative_id: \(meetingID)\n") && isTranscript == (kind == .transcript)

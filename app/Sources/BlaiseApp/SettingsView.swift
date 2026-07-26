@@ -867,7 +867,7 @@ private struct HandoffSection: View {
                 // SSH users.
                 Toggle("Also write the transcript as Markdown", isOn: $model.transcriptSidecar)
                     .accessibilityLabel("Write the transcript as a separate Markdown file")
-                Text("Off by default. On writes the full transcript to its own \"…-transcript.md\" beside the notes Markdown; applies to each meeting's next delivery.")
+                Text("Off by default. On writes the full transcript to its own \"…-transcript.md\" in the meeting's folder; applies at each meeting's next delivery.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
