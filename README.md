@@ -4,7 +4,7 @@ Local-first macOS meeting transcription and notes. Blaise records your system
 audio and microphone, transcribes the conversation on-device (Portuguese/English
 code-switching is a first-class case, not an afterthought), and writes structured
 notes with your action items pulled out and made impossible to miss. Your audio
-never leaves the machine.
+stays on the machine unless you explicitly enable audio delivery to a destination.
 
 ![Blaise — the Estúdio library view: the meeting list with a selected meeting's notes (demo data)](assets/screenshot-estudio.png)
 
@@ -44,6 +44,16 @@ never leaves the machine.
   Blaise for speaker naming. It captures display names and speaking times only — no
   audio, no captions, no chat — and delivers them encrypted to the app on
   localhost. It is entirely optional; Blaise works without it.
+- **Optional direct Google Calendar.** If macOS Calendar is not a reliable view of
+  your Google calendars, Blaise can connect to Google Calendar directly using a
+  read-only OAuth grant. Upcoming meetings feed the menu bar, the top of the
+  meeting list, one-click recording, and calendar-aware end detection.
+- **Optional Slack Huddles roster.** While you're in a Slack huddle, Blaise learns
+  the participants and call lifecycle natively over Slack's Socket Mode API and
+  feeds them into the same speaker-naming and auto-record flow as Meet. It reads
+  presence metadata only — who is in the huddle and when — never messages, never
+  audio; the two tokens stay in your Keychain. It is entirely optional (see
+  [`docs/slack_huddles_contract.md`](docs/slack_huddles_contract.md) for setup).
 - **Search and library.** Full-text search across every transcript and note, with
   accent-insensitive matching.
 
@@ -51,8 +61,13 @@ never leaves the machine.
 
 Blaise is local-first by design, and the privacy boundary is stated honestly:
 
-- **Your audio never leaves the machine.** Recording, retention, and transcription
-  are all on-device. There is no upload path for audio.
+- **Your audio stays on the machine by default.** Recording, retention, and
+  transcription are all on-device. The promise, stated exactly:
+  there is no upload path for audio unless you explicitly enable audio delivery to a destination.
+  That toggle ("Include audio recordings", Settings → Evidence Store) is off by
+  default; turning it on copies a meeting's recordings to the delivery destination,
+  and a destination that syncs (iCloud or a network folder) then means the audio
+  leaves this machine.
 - **One optional cloud call: notes synthesis.** By default, notes are written by
   Claude (Anthropic's Sonnet model) under **your own API key**, which means the
   meeting *transcript* — not the audio — is sent to Anthropic for that one step.
@@ -61,6 +76,10 @@ Blaise is local-first by design, and the privacy boundary is stated honestly:
 - **Spend tracking and a ceiling are built in.** Blaise tracks what the notes step
   costs and enforces a configurable monthly ceiling, so the cloud step can never
   run away.
+- **Integration tokens stay local.** The optional Google Calendar and Slack Huddles
+  integrations read metadata only (event times and attendees; huddle presence — never
+  huddle messages or audio). Their credentials live in the macOS Keychain and never
+  leave the machine except as Blaise's own API calls to the respective service.
 - **Fully offline mode.** Select the local MLX notes engine and Blaise synthesises
   notes entirely on-device. If neither a cloud key nor a local model is available,
   the meeting is transcribed and stored with notes marked *pending* — nothing is
@@ -109,13 +128,22 @@ It reads only participant display names and speaking times from the Meet page an
 delivers them encrypted to Blaise on `127.0.0.1` — no audio, captions, or chat,
 and nothing leaves your machine. Entirely optional.
 
+### Optional Google Calendar
+
+Apple Calendar access remains the zero-network path. For a direct Google Calendar
+connection, create a Google OAuth **Desktop app** client ID, paste it in Settings
+→ Automation → Calendars, and press Connect. Blaise requests
+`https://www.googleapis.com/auth/calendar.readonly`, stores the refresh token in
+the macOS Keychain, and reads calendar events only.
+
 ## First-run setup
 
 On first launch Blaise walks you through:
 
 1. **Permissions.** macOS prompts for Microphone, System Audio Recording,
    Calendar (for one-click recording suggestions from upcoming events), and
-   Notifications. Grant them once.
+   Notifications. Grant them once. Direct Google Calendar can be connected later
+   from Settings and does not replace the local Calendar permission.
 2. **Identity.** Your name, the nicknames people call you in meetings, and your
    email (used to match you against calendar attendees). Your name is what the
    action-items section is rendered with.
