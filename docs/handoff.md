@@ -21,12 +21,17 @@ Per meeting, into a per-meeting directory:
   <meeting-id>/                       one directory per meeting
     <version_hash>.json               the canonical record (immutable)
     <slug-of-title>.md                optional human-facing Markdown sidecar
+    <slug-of-title>-transcript.md     optional transcript sidecar (own toggle, default off)
 ```
 
 - **`<meeting-id>`** — a 26-character ULID, unique per meeting.
 - **`<version_hash>.json`** — the canonical JSON record (schema below). Its file
   name is the **SHA-256 of its exact bytes**, so the name *is* an integrity
   check: `shasum -a 256 <file>` must equal the name.
+- **`<slug>-transcript.md`** — an optional second Markdown file (its own toggle,
+  default off, Local Folder destinations): the full transcript beside the notes
+  sidecar. Frontmatter carries `kind: transcript` (and no version_hash); overwritten
+  in place on re-delivery; never touched by payload cleanup.
 - **`<slug>.md`** — an optional, Obsidian-ready Markdown file (YAML frontmatter +
   the rendered notes), governed by a Settings toggle (default on). Convenience
   only; the `.json` is the source of truth. One current sidecar per meeting (a
