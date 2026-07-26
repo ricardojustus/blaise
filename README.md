@@ -3,8 +3,9 @@
 Local-first macOS meeting transcription and notes. Blaise records your system
 audio and microphone, transcribes the conversation on-device (Portuguese/English
 code-switching is a first-class case, not an afterthought), and writes structured
-notes with your action items pulled out and made impossible to miss. Your audio
-stays on the machine unless you explicitly enable audio delivery to a destination.
+notes with your action items pulled out and made impossible to miss. Audio never
+leaves the app unless you explicitly enable the opt-in audio handoff, which is
+off by default.
 
 ![Blaise — the Estúdio library view: the meeting list with a selected meeting's notes (demo data)](assets/screenshot-estudio.png)
 
@@ -54,6 +55,21 @@ stays on the machine unless you explicitly enable audio delivery to a destinatio
   presence metadata only — who is in the huddle and when — never messages, never
   audio; the two tokens stay in your Keychain. It is entirely optional (see
   [`docs/slack_huddles_contract.md`](docs/slack_huddles_contract.md) for setup).
+- **Confirm who was in the meeting** (optional, off by default). When Blaise cannot
+  work out the participants from your calendar or a roster, it can ask you as the
+  meeting stops. The names land before the notes are written, so speaker labels and
+  action-item owners come out right instead of needing correction afterwards.
+  Transcription and audio retention never wait on your answer — only the notes do —
+  and a meeting waiting on you stays marked in the library until you answer it.
+- **Transcript as its own Markdown file** (optional, off by default). Alongside the
+  delivered payload, Blaise can write the full transcript as a separate `.md` file
+  so it is readable in any notes app. It follows whichever delivery destination you
+  have configured.
+- **Keep one current file per meeting, or keep every version.** By default every
+  delivered version of a meeting is kept at your destination, so anything
+  referencing an older payload can still find it. An optional setting instead
+  removes the superseded payload when a correction or regeneration is delivered,
+  leaving exactly one current file per meeting.
 - **Search and library.** Full-text search across every transcript and note, with
   accent-insensitive matching.
 
@@ -61,13 +77,15 @@ stays on the machine unless you explicitly enable audio delivery to a destinatio
 
 Blaise is local-first by design, and the privacy boundary is stated honestly:
 
-- **Your audio stays on the machine by default.** Recording, retention, and
-  transcription are all on-device. The promise, stated exactly:
-  there is no upload path for audio unless you explicitly enable audio delivery to a destination.
-  That toggle ("Include audio recordings", Settings → Evidence Store) is off by
-  default; turning it on copies a meeting's recordings to the delivery destination,
-  and a destination that syncs (iCloud or a network folder) then means the audio
-  leaves this machine.
+- **Audio never leaves the app by default** — it stays on this machine unless you
+  explicitly enable the opt-in audio handoff. Recording, retention, and
+  transcription are all on-device: there is
+  no upload path for audio unless you explicitly enable audio delivery to a destination.
+  The toggle ("Include audio recordings",
+  Settings → Evidence Store) is off by default; turning it on copies a meeting's
+  recordings to your delivery destination, and if that destination syncs (iCloud
+  or a network folder) the audio then leaves this machine. That is the whole
+  exception, stated plainly so you can decide it deliberately.
 - **One optional cloud call: notes synthesis.** By default, notes are written by
   Claude (Anthropic's Sonnet model) under **your own API key**, which means the
   meeting *transcript* — not the audio — is sent to Anthropic for that one step.
