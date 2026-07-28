@@ -120,8 +120,14 @@ Blaise is local-first by design, and the privacy boundary is stated honestly:
 
 ### From source
 
-Requirements: **macOS 26 or later** and **Xcode 26**. A release build takes a
-few minutes.
+Requirements: **macOS 15.6.1 (Sequoia) or later** to run, **Xcode 26** to
+build (the app compiles against the macOS 26 SDK regardless of the machine it
+will run on). A release build takes a few minutes.
+
+On macOS 15 every feature works; only the macOS 26 Liquid Glass styling
+degrades — the recording/warning capsules render as translucent material
+instead of glass, and list edges scroll without the soft fade. See the
+changelog for the details.
 
 ```sh
 scripts/build_app.sh   # release build → dist/Blaise.app, prints the app path

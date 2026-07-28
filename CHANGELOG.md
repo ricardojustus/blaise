@@ -2,6 +2,33 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [1.6.0] — 28/07/2026
+
+Blaise now runs on macOS Sequoia. The minimum OS drops from macOS 26 to 15.6.1 with no
+functional loss — only the Liquid Glass styling degrades on macOS 15.
+
+### Changed
+- **Minimum macOS lowered from 26 (Tahoe) to 15.6.1 (Sequoia).** Every feature runs on
+  Sequoia: capture (Core Audio process taps need only macOS 14.4), transcription,
+  diarization, notes, calendar, Slack Huddles, handoff, and the Meet extension are all
+  unaffected. What degrades on macOS 15 is purely visual — the macOS 26 Liquid Glass
+  APIs don't exist there, so:
+  - the recording/warning capsules (`glassEffect`) fall back to an ultra-thin material
+    with the same tinting; Reduce Transparency behaves as before on both versions;
+  - the library list and meeting detail lose the soft top scroll-edge fade
+    (`scrollEdgeEffectStyle`), scrolling under the toolbar with a plain edge instead;
+  - the transparent toolbar spacer no longer needs `sharedBackgroundVisibility(.hidden)`
+    (macOS 15 draws no toolbar-item background to hide).
+  Building still requires Xcode 26 / the macOS 26 SDK; the produced app now runs on
+  15.6.1+ (`LSMinimumSystemVersion` updated to match). Caveat: macOS 26 is what the
+  maintainers run daily; 15.6.1 is compile-verified with availability checks but has not
+  yet had a full manual pass on Sequoia hardware — reports welcome.
+- Toolchain compatibility: the pipeline's run context and the Meet-events pending sweep
+  are adjusted so the project compiles under Xcode 26.3 (Swift 6.2.4), whose stricter
+  region-isolation analysis rejected the previous code. No behavior change.
+- `scripts/env.sh` now finds versioned Xcode installs (e.g. `Xcode_26.3.app`) when
+  `/Applications/Xcode.app` does not exist.
+
 ## [1.5.1] — 26/07/2026
 
 The signed release. No feature changes — this build exists so macOS opens Blaise without

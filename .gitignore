@@ -65,3 +65,6 @@ granola-temp-*
 .asr-venv/
 .asr-out/
 .c6-notes-dataroot/
+
+# Vendored uv (fetched + SHA-verified by scripts/fetch_uv.sh)
+vendor/uv/

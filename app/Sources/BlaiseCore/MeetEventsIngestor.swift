@@ -647,19 +647,22 @@ public struct MeetEventsIngestor: Sendable, MeetEventsSweeping, MeetBatchIngesti
     /// caller's status-dependent dispatch must target the receivers.
     @discardableResult
     public func sweep(meetingCode: String) async -> [MeetingID] {
+        // GRDB's async `read` requires a Sendable result and `Row` is not
+        // Sendable — copy the two columns out inside the closure.
         guard
             let rows = try? await database.pool.read({ db in
                 try Row.fetchAll(
                     db,
                     sql: "SELECT id, batch_json FROM meet_events_pending WHERE meeting_code = ?",
-                    arguments: [meetingCode])
+                    arguments: [meetingCode]
+                ).map { (id: $0["id"] as Int64, json: $0["batch_json"] as String) }
             })
         else { return [] }
         var matched = 0
         var receivers: [MeetingID] = []
         for row in rows {
-            let rowID: Int64 = row["id"]
-            let json: String = row["batch_json"]
+            let rowID = row.id
+            let json = row.json
             guard
                 let batch = try? JSONDecoder().decode(MeetWireBatch.self, from: Data(json.utf8)),
                 let meetingID = try? await matchMeeting(for: batch)
