@@ -1,0 +1,24 @@
+[
+  {
+    "end_seconds" : 0.9,
+    "ord" : 0,
+    "speaker_label" : "S0",
+    "start_seconds" : 0,
+    "text" : "Olá, vamos começar."
+  },
+  {
+    "end_seconds" : 1.9,
+    "ord" : 1,
+    "speaker_label" : "S1",
+    "start_seconds" : 1,
+    "text" : "O Fábio vai mandar o contrato."
+  },
+  {
+    "end_seconds" : 2.4,
+    "ord" : 2,
+    "speaker_label" : "user",
+    "speaker_name" : "Sam",
+    "start_seconds" : 1.2,
+    "text" : "Perfeito, eu reviso isso ainda hoje à tarde."
+  }
+]
