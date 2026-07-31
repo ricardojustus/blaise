@@ -74,8 +74,7 @@ struct AnchorPersistenceTests {
             eventIdentifier: "evt-fiction-1", title: "Sprint review", start: at(0), end: at(1800),
             location: "meet.google.com/qrs-tuvw-xyz",
             attendees: [.init(name: "Alex Doe", email: "alex@example.test")])
-        let suggestions = CalendarSuggestionBuilder.suggestions(
-            from: [event], now: at(0), userEmail: "me@example.test")
+        let suggestions = CalendarSuggestionBuilder.suggestions(from: [event], now: at(0))
         let suggestion = try! #require(suggestions.first)
         #expect(suggestion.end == at(1800))
         #expect(suggestion.eventIdentifier == "evt-fiction-1")
@@ -457,7 +456,7 @@ struct UpcomingMeetingsTests {
         let later = event(id: "evt-later", title: "This afternoon", startHour: 15, endHour: 16,
             link: "meet.google.com/abc-defg-hij")
         let rows = UpcomingMeetings.rows(
-            from: [past, nowish, later], now: noonSP, userEmail: "me@example.test")
+            from: [past, nowish, later], now: noonSP)
         #expect(rows.map(\.eventIdentifier) == ["evt-now", "evt-later"], "the 09–10 meeting has ended")
         // A meeting with no Meet link still surfaces.
         #expect(rows.contains { $0.eventIdentifier == "evt-now" && $0.meetingCode == nil })
@@ -468,8 +467,7 @@ struct UpcomingMeetingsTests {
         let later = event(id: "evt-later", title: "Afternoon", startHour: 15, endHour: 16,
             link: "meet.google.com/abc-defg-hij")
         let rows = UpcomingMeetings.rows(
-            from: [later], now: noonSP, recordedCodes: ["abc-defg-hij"],
-            userEmail: "me@example.test")
+            from: [later], now: noonSP, recordedCodes: ["abc-defg-hij"])
         #expect(rows.isEmpty, "an already-recorded code's row disappears")
     }
 
@@ -478,22 +476,25 @@ struct UpcomingMeetingsTests {
         let later = event(id: "evt-later", title: "Afternoon", startHour: 15, endHour: 16,
             link: "meet.google.com/abc-defg-hij")
         let row = try! #require(
-            UpcomingMeetings.rows(from: [later], now: noonSP, userEmail: "me@example.test").first)
+            UpcomingMeetings.rows(from: [later], now: noonSP).first)
         #expect(row.anchor.eventIdentifier == "evt-later")
         #expect(row.anchor.scheduledEnd == later.end)
         #expect(row.offersLaunchAndRecord, "a Meet-linked row also offers Launch & Record")
         #expect(row.source == .meet)
     }
 
-    @Test("the user is self-excluded from the prefilled attendees")
-    func selfExcluded() {
+    @Test("a row's prefilled attendees are the event list LITERAL — a start from here persists them")
+    func attendeesStoredLiteral() {
         let m = event(id: "evt-m", title: "Team", startHour: 15, endHour: 16,
             attendees: [.init(name: "Me", email: "me@example.test"),
                 .init(name: "Robin Cole", email: "robin@example.test")])
         let row = try! #require(
-            UpcomingMeetings.rows(from: [m], now: noonSP, userEmail: "me@example.test").first)
-        #expect(row.attendeeCount == 1)
-        #expect(row.attendees.map(\.name) == ["Robin Cole"])
+            UpcomingMeetings.rows(from: [m], now: noonSP).first)
+        // The user is kept: this list is persisted when the row starts a
+        // recording, and the counting rule subtracts him structurally.
+        #expect(row.attendeeCount == 2)
+        #expect(row.attendees.map(\.name) == ["Me", "Robin Cole"])
+        #expect(Attendee.othersCount(in: row.attendees) == 1)
     }
 
     @Test("day-rollover trigger fires across a calendar-day boundary")
@@ -505,7 +506,7 @@ struct UpcomingMeetingsTests {
 
     @Test("empty input → empty list (the section collapses, no chrome)")
     func emptyCollapses() {
-        #expect(UpcomingMeetings.rows(from: [], now: noonSP, userEmail: "me@example.test").isEmpty)
+        #expect(UpcomingMeetings.rows(from: [], now: noonSP).isEmpty)
     }
 }
 

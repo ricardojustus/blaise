@@ -554,7 +554,7 @@ struct CalendarSuggestionTests {
             event(title: "No link no attendees", startOffset: 0),
         ]
         let suggestions = CalendarSuggestionBuilder.suggestions(
-            from: events, now: now, userEmail: "sam.rivera@vexatron.test")
+            from: events, now: now)
         // Soon + Within-2h surface; beyond the look-ahead, before the look-back,
         // and the no-link/no-attendees event are all excluded.
         #expect(suggestions.map(\.title) == ["Soon", "Within 2h"])
@@ -572,32 +572,75 @@ struct CalendarSuggestionTests {
                 attendees: [.init(name: "Fábio Souza", email: "fabio@vexatron.test")]),
         ]
         let suggestions = CalendarSuggestionBuilder.suggestions(
-            from: events, now: now, userEmail: "sam.rivera@vexatron.test")
+            from: events, now: now)
         #expect(suggestions.map(\.source) == [.zoom, .teams, .inPerson])
     }
 
-    @Test("The user is excluded from prefilled attendees (identifying email, case-insensitive)")
-    func selfExclusion() {
+    @Test("an unrecognized-platform link classifies online; the predicate stays narrow")
+    func onlineSourceInference() {
+        let attendee = CalendarEventSnapshot.AttendeeSnapshot(
+            name: "Fábio Souza", email: "fabio@vexatron.test")
         let events = [
             event(
-                title: "Board", startOffset: 0,
-                attendees: [
-                    .init(name: "Sam Rivera", email: "sam.rivera@vexatron.test"),
-                    .init(name: "Fábio Souza", email: "fabio@vexatron.test"),
-                ])
+                title: "Unrecognized platform", startOffset: 0,
+                location: "https://calls.vexatron.example/quoll-harbor",
+                attendees: [attendee]),
+            event(
+                title: "Link in the notes", startOffset: 60,
+                notes: "Dial in: https://vc.quollharbor.example/room/7",
+                attendees: [attendee]),
+            event(
+                title: "No URL at all", startOffset: 120,
+                location: "Quoll Harbor, room 3 — bring the vexatron-labs deck",
+                attendees: [attendee]),
+            event(
+                title: "Recognized", startOffset: 180,
+                location: "https://acme.zoom.us/j/99", attendees: [attendee]),
         ]
-        let suggestions = CalendarSuggestionBuilder.suggestions(
-            from: events, now: now, userEmail: "sam.rivera@vexatron.test")
-        #expect(suggestions.count == 1)
-        #expect(suggestions[0].attendees.map(\.name) == ["Fábio Souza"])
-        #expect(suggestions[0].attendees.allSatisfy { $0.source == .calendar })
+        let suggestions = CalendarSuggestionBuilder.suggestions(from: events, now: now)
+        #expect(suggestions.map(\.source) == [.online, .online, .inPerson, .zoom])
     }
 
-    @Test("G3 AC2: empty identity (pre-onboarding) → self-exclusion no-ops, keeps every attendee")
-    func selfExclusionNoOpsWithEmptyIdentity() {
-        // A pre-onboarding user has an empty identifying email. Self-exclusion
-        // must NOT then drop every email-less attendee (nor anyone): with no
-        // identity, there is no self to exclude.
+    @Test("a recognized host with no branch of its own classifies online, never in-person")
+    func recognizedHostWithoutABranchClassifiesOnline() {
+        let attendee = CalendarEventSnapshot.AttendeeSnapshot(
+            name: "Fábio Souza", email: "fabio@vexatron.test")
+        let events = [
+            event(
+                title: "Slack huddle", startOffset: 0,
+                location: "https://app.slack.com/huddle/T0QUOLL/C0VEX",
+                attendees: [attendee]),
+            event(
+                title: "Meet lookup alias", startOffset: 60,
+                location: "https://meet.google.com/lookup/quollharbor",
+                attendees: [attendee]),
+            event(
+                title: "Slack plus an unrelated link", startOffset: 120,
+                location: "https://app.slack.com/huddle/T0QUOLL/C0VEX",
+                notes: "Backup bridge: https://calls.vexatron.example/quoll",
+                attendees: [attendee]),
+            event(
+                title: "Canonical meet", startOffset: 180,
+                location: "https://meet.google.com/abc-defg-hij", attendees: [attendee]),
+        ]
+        let suggestions = CalendarSuggestionBuilder.suggestions(from: events, now: now)
+        #expect(suggestions.map(\.source) == [.online, .online, .online, .meet])
+        #expect(suggestions[3].meetingCode == "abc-defg-hij")
+    }
+
+    @Test("the correlation-code derivation still yields meet and slack only")
+    func meetingCodeDerivationUnchanged() {
+        #expect(MeetingSource(forMeetingCode: "abc-defg-hij") == .meet)
+        #expect(
+            MeetingSource(forMeetingCode: "\(SlackHuddle.meetingCodePrefix)C0QUOLL")
+                == .slack)
+    }
+
+    @Test("Prefilled attendees are the event list LITERAL — the user is kept, not filtered out")
+    func literalAttendeeList() {
+        // The user-implicit counting rule: the persisted list is never filtered
+        // by identity (matching fails pre-onboarding and on alias emails); the
+        // count subtracts him structurally instead.
         let events = [
             event(
                 title: "Board", startOffset: 0,
@@ -607,11 +650,53 @@ struct CalendarSuggestionTests {
                     .init(name: "Sem Email", email: nil),
                 ])
         ]
-        let suggestions = CalendarSuggestionBuilder.suggestions(
-            from: events, now: now, userEmail: "")
+        let suggestions = CalendarSuggestionBuilder.suggestions(from: events, now: now)
         #expect(suggestions.count == 1)
-        // Nobody excluded — including the user's own calendar name and the
-        // email-less attendee.
+        // Nobody dropped — the user's own calendar row and the email-less
+        // attendee both survive.
         #expect(suggestions[0].attendees.map(\.name) == ["Sam Rivera", "Fábio Souza", "Sem Email"])
+        #expect(suggestions[0].attendees.allSatisfy { $0.source == .calendar })
+        // …and the derivation, not a filter, is what removes the user.
+        #expect(Attendee.othersCount(in: suggestions[0].attendees) == 2)
+    }
+}
+
+// MARK: - The user-implicit counting rule (room_treatment v9 §9.2)
+
+@Suite("Attendee.othersCount")
+struct AttendeeCountingTests {
+    private func calendar(_ name: String) -> Attendee { Attendee(name: name, source: .calendar) }
+    private func manual(_ name: String) -> Attendee { Attendee(name: name, source: .manual) }
+    private func roster(_ name: String) -> Attendee {
+        Attendee(name: name, source: .meetExtension)
+    }
+
+    @Test("calendar-sourced list includes the user → exactly one subtracted")
+    func calendarSubtractsOne() {
+        #expect(Attendee.othersCount(in: [calendar("Sam Rivera")]) == 0)
+        #expect(
+            Attendee.othersCount(in: [
+                calendar("Sam Rivera"), calendar("Fábio Souza"), calendar("Dana Okonkwo"),
+            ]) == 2)
+    }
+
+    @Test("manual and roster lists are others-only → counted as they stand")
+    func othersOnlySourcesCountLiterally() {
+        #expect(Attendee.othersCount(in: [manual("Fábio Souza"), manual("Dana Okonkwo")]) == 2)
+        #expect(Attendee.othersCount(in: [roster("Fábio Souza"), roster("Dana Okonkwo")]) == 2)
+    }
+
+    @Test("mixed list subtracts exactly once, whatever the mix")
+    func mixedSubtractsOnce() {
+        #expect(
+            Attendee.othersCount(in: [
+                calendar("Sam Rivera"), calendar("Fábio Souza"), manual("Dana Okonkwo"),
+                roster("Marco Vidal"),
+            ]) == 3)
+    }
+
+    @Test("empty list → zero")
+    func emptyIsZero() {
+        #expect(Attendee.othersCount(in: []) == 0)
     }
 }

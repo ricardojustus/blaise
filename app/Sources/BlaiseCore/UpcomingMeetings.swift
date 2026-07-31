@@ -23,6 +23,7 @@ public struct UpcomingMeetingRow: Sendable, Equatable, Identifiable {
     public var meetingCode: String?
     public var attendees: [Attendee]
     public var urlString: String?
+    public var joinedLinkText: String?
 
     /// Stable identity for SwiftUI list diffing (the deferred render).
     public var id: String { PreMeetingScheduler.eventKey(snapshotKey) }
@@ -41,7 +42,8 @@ public struct UpcomingMeetingRow: Sendable, Equatable, Identifiable {
 
     public init(
         eventIdentifier: String, title: String, start: Date, end: Date, attendeeCount: Int,
-        source: MeetingSource, meetingCode: String?, attendees: [Attendee], urlString: String?
+        source: MeetingSource, meetingCode: String?, attendees: [Attendee], urlString: String?,
+        joinedLinkText: String? = nil
     ) {
         self.eventIdentifier = eventIdentifier
         self.title = title
@@ -52,6 +54,7 @@ public struct UpcomingMeetingRow: Sendable, Equatable, Identifiable {
         self.meetingCode = meetingCode
         self.attendees = attendees
         self.urlString = urlString
+        self.joinedLinkText = joinedLinkText
     }
 }
 
@@ -65,20 +68,19 @@ public enum UpcomingMeetings {
     ///   §4b list is not Meet-gated). An event with neither attendees nor a link
     ///   is still a real meeting — it surfaces (the user can always Record).
     ///
-    /// `userEmail` self-excludes the user from each row's prefilled attendees
-    /// (case-insensitive; empty identity no-ops, G3). Sorted by start then
-    /// title. Empty when nothing remains (the deferred section collapses to
-    /// nothing — no "no meetings" chrome).
+    /// Each row's prefilled attendees are the event's list LITERAL — a row that
+    /// starts a recording persists them, and every persisted list is literal
+    /// (the user is implicit; `Attendee.othersCount` subtracts him structurally
+    /// rather than by email match). `attendeeCount` therefore counts the user
+    /// too. Sorted by start then title. Empty when nothing remains (the
+    /// deferred section collapses to nothing — no "no meetings" chrome).
     public static func rows(
         from events: [CalendarEventSnapshot],
         now: Date,
         recordedCodes: Set<String> = [],
-        userEmail: String,
         calendar: Calendar = localCalendar
     ) -> [UpcomingMeetingRow] {
-        let userEmailFolded = userEmail.lowercased()
-        let selfExcludes = !userEmailFolded.isEmpty
-        return events
+        events
             .filter { event in
                 // Today (now's calendar day) AND end still in the future.
                 calendar.isDate(event.start, inSameDayAs: now) && event.end > now
@@ -91,13 +93,13 @@ public enum UpcomingMeetings {
                 if let code, recordedCodes.contains(code) { return nil }
                 let source = CalendarSuggestionBuilder.source(forLinkText: linkText, code: code)
                 let attendees = event.attendees
-                    .filter { !selfExcludes || ($0.email ?? "").lowercased() != userEmailFolded }
                     .map { Attendee(name: $0.name, email: $0.email, source: .calendar) }
                 return UpcomingMeetingRow(
                     eventIdentifier: event.eventIdentifier, title: event.title,
                     start: event.start, end: event.end, attendeeCount: attendees.count,
                     source: source, meetingCode: code, attendees: attendees,
-                    urlString: meetURLString(event: event, linkText: linkText, code: code))
+                    urlString: meetURLString(event: event, linkText: linkText, code: code),
+                    joinedLinkText: linkText)
             }
             .sorted { ($0.start, $0.title) < ($1.start, $1.title) }
     }

@@ -36,9 +36,9 @@ private struct TestBoom: Error {}
 
         // Regenerate REUSES the persisted diarization (the diarizer is NOT
         // called again) and the rename still applies by label.
-        let diarizeCallsBefore = harness.diarizer.state.withLock { $0.attendeeCounts.count }
+        let diarizeCallsBefore = harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count }
         try await harness.pipeline.regenerate(meetingID: meeting.id)
-        let diarizeCallsAfter = harness.diarizer.state.withLock { $0.attendeeCounts.count }
+        let diarizeCallsAfter = harness.diarizer.state.withLock { $0.expectedSpeakerCounts.count }
         #expect(diarizeCallsAfter == diarizeCallsBefore, "regenerate must reuse persisted diarization")
 
         let afterSegs = try await segments(harness, meeting.id)
@@ -156,9 +156,10 @@ private struct TestBoom: Error {}
 
         // A SUCCEEDING additionalWrites commits the rename row + renamed segments
         // together.
-        let row = SpeakerRenameStore.makeRow(
+        let row = try SpeakerRenameStore.makeRow(
             meetingID: meeting.id, speakerLabel: "S0", name: "Atomic",
-            diarization: PipelineMockData.diarization, now: msDate())
+            diarization: PipelineMockData.diarization, now: msDate(),
+            ownerIdentitySet: .empty)
         _ = try await harness.database.persistTranscript(
             meetingID: meeting.id,
             segments: SpeakerRenameStore.applyRenames([row], to: before),

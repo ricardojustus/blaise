@@ -2,6 +2,33 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [1.5.2] — 31/07/2026
+
+Speakers sharing your mic. Until now Blaise assumed everything on the microphone was you;
+this release detects when that isn't true and attributes speech honestly.
+
+### Added
+- **Shared-mic detection.** When more than one voice comes through the mic in an online
+  meeting, Blaise notices — durable capture-time facts plus your voice print — and stops
+  attributing the whole mic track to you. Other in-room voices get their own neutral,
+  renameable speaker labels and are counted properly in the notes.
+- **Voice Print.** A local voice profile built quietly from a few of your own meetings
+  (numeric embeddings, on-device only, never sent anywhere, frozen once identified), with a
+  Settings → Voice Print section showing status. "Voice identification" is on by default;
+  off deletes the profile entirely. Collection happens as meetings are processed —
+  Regenerate a few existing solo meetings to seed it without waiting.
+- **In-person room treatment.** An explicit In-Person source pick always separates the
+  room's speakers on the mic track; link-less meetings get the same treatment automatically
+  once the voice print is ready.
+
+### Changed
+- Meetings joined by link on unrecognized platforms are classified as online meetings.
+- The in-app record button mirrors the menu-bar source picker.
+
+### Fixed
+- Speaker over-counting: the diarizer no longer invents extra speakers beyond its own
+  estimate (contributed by @arthursoares, #6).
+
 ## [1.5.1] — 26/07/2026
 
 The signed release. No feature changes — this build exists so macOS opens Blaise without

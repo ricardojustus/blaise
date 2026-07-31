@@ -152,6 +152,9 @@ struct ParticipantConfirmSheet: View {
             )
             .font(.caption)
             .foregroundStyle(.secondary)
+            Text("You're included automatically — add the other participants.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             if model.voiceCount > 0 {
                 Label(
                     "Blaise heard \(model.voiceCount) distinct voice\(model.voiceCount == 1 ? "" : "s")",

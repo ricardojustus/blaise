@@ -47,6 +47,15 @@ import Testing
         #expect(!SLabelNeutralizer.containsLabel("owner is Dana Okonkwo"))
         #expect(!SLabelNeutralizer.containsLabel("the season was great"))  // "Season" embeds no label
     }
+
+    @Test func micLabelsRequireMeetingGrounding() {
+        #expect(
+            SLabelNeutralizer.containsLabel(
+                "M1 Max said yes", groundedMLabels: ["M1"]))
+        #expect(
+            !SLabelNeutralizer.containsLabel(
+                "M4 Max is fast", groundedMLabels: ["M1"]))
+    }
 }
 
 // MARK: - The fictional S-label-bearing fixture (Vexatron / Quoll Harbor)
@@ -194,6 +203,70 @@ enum SLabelFixture {
         for field in SLabelFixture.allFields(out) {
             #expect(!SLabelNeutralizer.containsLabel(field))
         }
+    }
+
+    @Test func groundedMicLabelsNeutralizeButNonLiveProductNamesRemain() {
+        let notes = NotesStructured(
+            summary: "M1 Max said yes; M4 Max stayed in the benchmark.",
+            detailedNotes: "M0 agreed with **M1**.",
+            decisions: [], actionItems: [], userActionItems: [])
+        let out = SLabelNeutralizer.neutralize(
+            notes: notes, labelMap: [:], language: "en",
+            groundedMLabels: ["M0", "M1"]).notes
+        #expect(!out.summary.contains("M1"))
+        #expect(out.summary.contains("M4 Max"))
+        #expect(
+            !SLabelNeutralizer.containsLabel(
+                out.detailedNotes, groundedMLabels: ["M0", "M1"]))
+    }
+
+    /// A grounded M label that RESOLVES to a name must go through layer 1 — it
+    /// is excluded from layer 2 precisely because the map resolves it, so a
+    /// layer-1 detector blind to the M namespace ships the raw label.
+    @Test func resolvedGroundedMicLabelIsSubstitutedInEveryField() {
+        let notes = NotesStructured(
+            title: "Quoll Harbor sync with M1 and M2",
+            summary: "M1 walked through the Vexatron Labs migration; M4 Max stayed on the desk.",
+            detailedNotes: "**M1** owns the rollout; S0 agreed. M2 deferred.",
+            decisions: ["M1 ships the Quoll Harbor build"],
+            actionItems: [
+                ActionItem(owner: "M1", text: "send M1 the Vexatron Labs contract, cc M2")
+            ],
+            userActionItems: [
+                ActionItem(owner: "M1", text: "confirm the budget line with M1 and M2")
+            ])
+        let grounded: Set<String> = ["M1", "M2"]
+        let (out, _) = SLabelNeutralizer.neutralize(
+            notes: notes,
+            labelMap: ["M1": "Dana Okonkwo", "S0": "Sam Rivera"],
+            language: "en", groundedMLabels: grounded)
+
+        #expect(out.summary.hasPrefix("Dana Okonkwo walked through"))
+        #expect(out.summary.contains("M4 Max"))  // non-live product mention untouched
+        #expect(out.detailedNotes.contains("**Dana Okonkwo** owns the rollout; Sam Rivera agreed."))
+        #expect(out.detailedNotes.contains("a participant deferred."))  // unresolved M2 → layer 2
+        #expect(out.decisions[0].hasPrefix("Dana Okonkwo ships"))
+        // Both layers on the same field: M1 resolves through layer 1, the
+        // unresolved M2 falls to layer 2's neutral descriptor.
+        #expect(out.title == "Quoll Harbor sync with Dana Okonkwo and a participant")
+        #expect(out.actionItems[0].owner == "Dana Okonkwo")
+        #expect(
+            out.actionItems[0].text
+                == "send Dana Okonkwo the Vexatron Labs contract, cc a participant")
+        #expect(out.userActionItems[0].owner == "Dana Okonkwo")
+        #expect(
+            out.userActionItems[0].text
+                == "confirm the budget line with Dana Okonkwo and a participant")
+        for field in SLabelFixture.allFields(out) {
+            #expect(!SLabelNeutralizer.containsLabel(field, groundedMLabels: grounded))
+        }
+    }
+
+    @Test func descriptorsRemainDistinctPastThree() {
+        let text = "M0 M1 M2 M3 M4"
+        let out = SLabelNeutralizer.neutralizeText(
+            text, groundedMLabels: ["M0", "M1", "M2", "M3", "M4"])
+        #expect(out == "a participant another participant a third participant participant 4 participant 5")
     }
 }
 
@@ -364,5 +437,39 @@ enum SLabelFixture {
                 neutralizeSites[i] < build,
                 "forward build at line \(build + 1) is not preceded by a neutralize")
         }
+    }
+
+    /// §5.7's "at EVERY seam" clause, mechanically: an M label is only a label
+    /// against the meeting's grounded set, so a neutralize-family call that
+    /// omits `groundedMLabels:` silently disables M neutralization for its
+    /// surface. Scans each call's own argument list (to its balancing paren).
+    @Test func everyNeutralizeSeamPassesTheGroundedMicSet() {
+        let source = Self.pipelineSource
+        #expect(!source.isEmpty, "could not read ProcessingPipeline.swift")
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        // A call SITE is a line opening `neutralize(`/`neutralizeText(` with an
+        // unbalanced paren — doc-comment mentions and closed one-liners are not
+        // sites. The argument list runs until the paren balance returns to zero.
+        var checked = 0
+        for (index, line) in lines.enumerated() {
+            guard line.contains("SLabelNeutralizer.neutralize(")
+                || line.contains("SLabelNeutralizer.neutralizeText(")
+            else { continue }
+            var depth = 0
+            var window: [String] = []
+            for candidate in lines[index...] {
+                window.append(candidate)
+                depth += candidate.filter { $0 == "(" }.count
+                depth -= candidate.filter { $0 == ")" }.count
+                if depth <= 0 { break }
+            }
+            guard window.count > 1 else { continue }  // not a multi-line call site
+            checked += 1
+            #expect(
+                window.joined(separator: "\n").contains("groundedMLabels:"),
+                "neutralize seam at line \(index + 1) does not pass groundedMLabels:")
+        }
+        #expect(checked == 8, "expected 8 neutralize-family seams, found \(checked)")
     }
 }

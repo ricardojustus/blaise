@@ -86,6 +86,13 @@ Blaise is local-first by design, and the privacy boundary is stated honestly:
   recordings to your delivery destination, and if that destination syncs (iCloud
   or a network folder) the audio then leaves this machine. That is the whole
   exception, stated plainly so you can decide it deliberately.
+- **Voice identification is local and deletable.** Blaise builds a small voice
+  print of you — numeric voice embeddings drawn from a few of your own meetings —
+  so it can tell your speech apart from other people sharing your mic and
+  attribute lines correctly. It is not the audio itself, it is stored only on
+  this machine, and it is never sent anywhere. The toggle (Settings → Voice
+  Print, "Voice identification", on by default) deletes the voice print entirely
+  when turned off.
 - **One optional cloud call: notes synthesis.** By default, notes are written by
   Claude (Anthropic's Sonnet model) under **your own API key**, which means the
   meeting *transcript* — not the audio — is sent to Anthropic for that one step.

@@ -253,7 +253,7 @@ private struct DetailContent: View {
                     TranscriptPane(
                         meeting: meeting,
                         segments: model.segments, renames: model.speakerRenames,
-                        hasDiarizationArtifact: model.hasDiarizationArtifact,
+                        artifactPresence: model.diarizationArtifactPresence,
                         scrollTarget: $scrollTarget, searchTerms: searchTerms,
                         portuguese: (meeting.dominantLanguage ?? "").lowercased().hasPrefix("pt"))
                 }
@@ -1241,7 +1241,7 @@ private struct TranscriptPane: View {
     var renames: [String: SpeakerRename] = [:]
     /// G2 §4 (L-6): whether a persisted diarization artifact exists (governs the
     /// rename popover's honest "applies after regenerate" copy).
-    var hasDiarizationArtifact = true
+    var artifactPresence = DiarizationArtifactPresence(system: true, mic: true)
     @Binding var scrollTarget: Int64?
     var searchTerms: [String] = []
     /// Copy-button labels follow the meeting's dominant language, matching
@@ -1329,7 +1329,7 @@ private struct TranscriptPane: View {
                             TranscriptRow(
                                 meeting: meeting, segment: segment,
                                 rename: renames[segment.speakerLabel],
-                                hasDiarizationArtifact: hasDiarizationArtifact,
+                                artifactPresence: artifactPresence,
                                 searchTerms: searchTerms,
                                 highlighted: segment.id == scrollTarget)
                                 .id(segment.id ?? -1)  // non-optional: must match scrollTo(Int64)
@@ -1378,7 +1378,7 @@ private struct TranscriptRow: View {
     /// label unnamed + a re-confirmation prompt).
     var rename: SpeakerRename?
     /// G2 §4 (L-6): whether a persisted diarization artifact exists.
-    var hasDiarizationArtifact = true
+    var artifactPresence = DiarizationArtifactPresence(system: true, mic: true)
     var searchTerms: [String] = []
     let highlighted: Bool
 
@@ -1450,7 +1450,8 @@ private struct TranscriptRow: View {
             SpeakerRenamePopover(
                 meeting: meeting, speakerLabel: segment.speakerLabel,
                 currentName: segment.speakerName,
-                hasDiarizationArtifact: hasDiarizationArtifact,
+                hasDiarizationArtifact: artifactPresence.containsArtifact(
+                    for: segment.speakerLabel),
                 pipeline: appEnv.pipeline, isPresented: $showRename)
                 .frame(width: 300)
         }

@@ -1,6 +1,17 @@
 import Foundation
 import GRDB
 
+public enum SpeakerRenameError: Error, LocalizedError, Equatable {
+    case ownerIdentityRequiresStamp
+
+    public var errorDescription: String? {
+        switch self {
+        case .ownerIdentityRequiresStamp:
+            return "This microphone speaker can only be identified as you by room treatment."
+        }
+    }
+}
+
 /// G2 §4: one user-authored speaker rename per (meeting_id, speaker_label).
 public struct SpeakerRename: Codable, Sendable, Equatable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "speaker_rename"
@@ -84,11 +95,12 @@ public enum SpeakerRenameStore {
     /// re-confirms against real diarization.
     public static func upsert(
         _ db: Database, meetingID: MeetingID, speakerLabel: String, name: String,
-        diarization: DiarizationOutput, now: Date
+        diarization: DiarizationOutput, now: Date,
+        ownerIdentitySet: OwnerIdentitySet
     ) throws {
         try makeRow(
             meetingID: meetingID, speakerLabel: speakerLabel, name: name,
-            diarization: diarization, now: now
+            diarization: diarization, now: now, ownerIdentitySet: ownerIdentitySet
         ).save(db)
     }
 
@@ -98,8 +110,12 @@ public enum SpeakerRenameStore {
     /// discipline as `upsert` (H-6: no derivable anchor ⇒ `stale = 1`, anchor 0).
     public static func makeRow(
         meetingID: MeetingID, speakerLabel: String, name: String,
-        diarization: DiarizationOutput, now: Date
-    ) -> SpeakerRename {
+        diarization: DiarizationOutput, now: Date,
+        ownerIdentitySet: OwnerIdentitySet
+    ) throws -> SpeakerRename {
+        if DiarizationLabel.isMicCluster(speakerLabel), ownerIdentitySet.contains(name) {
+            throw SpeakerRenameError.ownerIdentityRequiresStamp
+        }
         // NH-E: the reserved `unattributed` label has no cluster to anchor to, so
         // it is written label-literal (un-staled, anchor 0) and applied by direct
         // label match — never pre-staled by a failed anchor derivation (the
@@ -129,13 +145,17 @@ public enum SpeakerRenameStore {
     /// All within ONE transaction; the caller commits THIS before persisting
     /// the fresh diarization artifact (R4-H1 ordering rule).
     public static func remapForFreshDiarization(
-        _ db: Database, meetingID: MeetingID, fresh: DiarizationOutput, now: Date
+        _ db: Database, meetingID: MeetingID, fresh: DiarizationOutput, now: Date,
+        namespacePrefix: Character = "S"
     ) throws {
         let allRows = try all(db, meetingID: meetingID)
         // NH-E: anchorless (`unattributed`) rows are LABEL-LITERAL — left
         // completely untouched by the fallback (no re-map, no re-key, no stale
         // flip). They are not in the re-map set and not deleted below.
-        let rows = allRows.filter { !$0.stale && !$0.isAnchorless }
+        let rows = allRows.filter {
+            !$0.stale && !$0.isAnchorless
+                && DiarizationLabel.isIndexed($0.speakerLabel, prefix: namespacePrefix)
+        }
         guard !rows.isEmpty else { return }
         // Pre-existing stale rows keep their original key untouched; a re-keyed
         // row must NOT land on one of them. Anchorless rows are excluded — their
@@ -143,12 +163,20 @@ public enum SpeakerRenameStore {
         let existingStaleKeys = Set(
             allRows.filter { $0.stale && !$0.isAnchorless }.map(\.speakerLabel))
 
-        // Which fresh cluster contains each row's anchor instant?
+        // Which fresh cluster contains each row's anchor instant? Only clusters
+        // in the row's OWN namespace are candidates — a re-key never crosses
+        // namespaces, so a fresh artifact carrying a wrong-prefix label at that
+        // instant leaves the row unmapped (and therefore stale), never re-keyed
+        // onto the other track's cluster.
         func containingLabel(_ anchorMs: Int64) -> String? {
             let t = Double(anchorMs) / 1000.0
             let hits = Set(
                 fresh.segments
-                    .filter { $0.startSeconds <= t && t <= $0.endSeconds }
+                    .filter {
+                        $0.startSeconds <= t && t <= $0.endSeconds
+                            && DiarizationLabel.isIndexed(
+                                $0.speakerLabel, prefix: namespacePrefix)
+                    }
                     .map(\.speakerLabel))
             // A single containing cluster only (overlapping segments of one
             // cluster are fine; two distinct clusters = ambiguous → no map).

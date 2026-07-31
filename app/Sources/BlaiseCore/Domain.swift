@@ -8,7 +8,11 @@ public typealias HandoffID = String
 // MARK: - Meeting
 
 public enum MeetingSource: String, Codable, Sendable, CaseIterable {
-    case meet, zoom, teams, inPerson, imported, slack
+    /// `online` = a meeting whose calendar entry carries a link on an
+    /// unrecognized platform, so `inPerson` means genuinely link-free. Both are
+    /// labels only: the room-treatment ladder keys on capture facts, never on
+    /// this enum.
+    case meet, zoom, teams, inPerson, imported, slack, online
 
     /// C15: derive the source from a correlation `meetingCode`. Slack huddle
     /// batches carry `slack:<callID>` (see `SlackHuddle.meetingCode`); every
@@ -58,6 +62,19 @@ public struct Attendee: Codable, Sendable, Equatable {
         self.name = name
         self.email = email
         self.source = source
+    }
+
+    /// The USER-IMPLICIT COUNTING RULE: how many people OTHER than the user an
+    /// attendee list stands for. Lists are stored literal; the user is never
+    /// matched by identity (matching fails pre-onboarding and on alias emails).
+    /// A `.calendar`-sourced list includes the user structurally (his calendars
+    /// invite him), so exactly one is subtracted however mixed the list;
+    /// `.meetExtension` rosters already skip self and `.manual` lists are
+    /// others-only by UI convention (the participant sheet states it), so those
+    /// count as they stand.
+    public static func othersCount(in attendees: [Attendee]) -> Int {
+        let includesUser = attendees.contains { $0.source == .calendar }
+        return includesUser ? attendees.count - 1 : attendees.count
     }
 }
 

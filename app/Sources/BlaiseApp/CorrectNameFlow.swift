@@ -27,6 +27,7 @@ struct SpeakerRenamePopover: View {
 
     @State private var name: String = ""
     @State private var working = false
+    @State private var rejection: String?
 
     /// NH-E: the reserved `unattributed` label is renameable and its rename
     /// applies IMMEDIATELY to every unattributed segment (no cluster to
@@ -53,16 +54,26 @@ struct SpeakerRenamePopover: View {
             Text(scopeCopy)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+            if let rejection {
+                Text(rejection)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { isPresented = false }
                 Button("Rename") {
+                    rejection = nil
                     working = true
                     Task {
-                        _ = try? await pipeline.renameSpeaker(
-                            meetingID: meeting.id, speakerLabel: speakerLabel, to: name)
+                        do {
+                            _ = try await pipeline.renameSpeaker(
+                                meetingID: meeting.id, speakerLabel: speakerLabel, to: name)
+                            isPresented = false
+                        } catch {
+                            rejection = error.localizedDescription
+                        }
                         working = false
-                        isPresented = false
                     }
                 }
                 .keyboardShortcut(.defaultAction)

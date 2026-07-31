@@ -83,7 +83,7 @@ struct StubASREngine: ASREngine {
 struct StubDiarizer: Diarizing {
     func prepare() async throws {}
     func availability() async -> EngineAvailability { .available }
-    func diarize(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput {
+    func diarize(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput {
         DiarizationOutput(
             segments: [
                 DiarizedSegment(speakerLabel: "S0", startSeconds: 0.0, endSeconds: 4.2),

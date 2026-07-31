@@ -8,7 +8,7 @@ public enum PipelineVersion {
     /// output — the Tier-1 byte-pin enforces honesty (an unbumped
     /// output-changing edit fails the pin). Travels in
     /// `NotesProvenance.pipelineVersion` (C7-owned constant).
-    public static let current = "1.0"
+    public static let current = "1.2"
 }
 
 // MARK: - Crash hooks (debug-only deterministic kill points)
@@ -203,6 +203,9 @@ public struct PipelineRunRecord: Codable, Sendable {
     /// text under the user's label). Counts raw ASR segments, NOT merged
     /// turns. nil when none dropped or not a two-track run.
     public var echoDroppedSegments: Int?
+    /// Captured-room treatment observability. Distances remain confined to the
+    /// derived room-treatment artifact.
+    public var roomTreatment: RoomTreatmentCounters?
     /// #101 (D10): how many grounded person-mention hints the digest run carried
     /// (presence-gated; 0 means no hint block was rendered). Provenance only —
     /// the hint text lives in the LLM USER MESSAGE, never in the artifact.
@@ -241,6 +244,7 @@ public actor ProcessingPipeline {
     private let resolver: EngineResolver
     private let settings: SettingsStore
     private let diarizer: any Diarizing
+    private let voiceProfileStore: VoiceProfileStore
     /// G1 §3: the vocabulary stack is rebuilt at EACH run start (the user
     /// glossary is hot-reloaded between runs). Tests/regression paths pass a
     /// constant provider over a `fixture()` stack. Returns the full `UserLoad`
@@ -322,6 +326,7 @@ public actor ProcessingPipeline {
         vocabularyProvider: @escaping @Sendable () -> PipelineVocabulary.UserLoad,
         handoffKicker: any HandoffKicking = NoopHandoffKicker(),
         meetEventsSweeper: any MeetEventsSweeping = NoopMeetEventsSweeper(),
+        voiceProfileStore: VoiceProfileStore? = nil,
         tempDirectory: URL = FileManager.default.temporaryDirectory,
         now: @escaping @Sendable () -> Date = { Date() },
         duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
@@ -332,6 +337,7 @@ public actor ProcessingPipeline {
         self.settings = SettingsStore(database: database)
         self.resolver = EngineResolver(registry: registry, settings: settings)
         self.diarizer = diarizer
+        self.voiceProfileStore = voiceProfileStore ?? VoiceProfileStore(paths: database.paths)
         self.vocabularyProvider = vocabularyProvider
         self.handoffKicker = handoffKicker
         self.meetEventsSweeper = meetEventsSweeper
@@ -350,6 +356,7 @@ public actor ProcessingPipeline {
         vocabulary: PipelineVocabulary,
         handoffKicker: any HandoffKicking = NoopHandoffKicker(),
         meetEventsSweeper: any MeetEventsSweeping = NoopMeetEventsSweeper(),
+        voiceProfileStore: VoiceProfileStore? = nil,
         tempDirectory: URL = FileManager.default.temporaryDirectory,
         now: @escaping @Sendable () -> Date = { Date() },
         duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
@@ -362,7 +369,8 @@ public actor ProcessingPipeline {
                     vocabulary: vocabulary, diagnostics: GlossaryDiagnostics(), loadedAt: now())
             },
             handoffKicker: handoffKicker,
-            meetEventsSweeper: meetEventsSweeper, tempDirectory: tempDirectory, now: now,
+            meetEventsSweeper: meetEventsSweeper, voiceProfileStore: voiceProfileStore,
+            tempDirectory: tempDirectory, now: now,
             duringParticipantParkCommit: duringParticipantParkCommit,
             duringRunEntryAsk: duringRunEntryAsk)
     }
@@ -488,9 +496,9 @@ public actor ProcessingPipeline {
     }
 
     /// Captured-meeting variant (C11; C7 v3.2 body amendment): two retained
-    /// tracks, ASR per track, mic track labeled `user`/named UserIdentity at
-    /// creation, system track diarized+merged, interleave with the pinned
-    /// tie-break, correction onward unchanged. process()-class semantics
+    /// tracks, ASR + diarization per track, room treatment before the mic
+    /// merge, interleave with the pinned tie-break, correction onward
+    /// unchanged. process()-class semantics
     /// (status = processing at entry; failure → failed).
     @discardableResult
     public func processCaptured(meetingID: MeetingID) async throws -> PipelineRunRecord {
@@ -774,7 +782,8 @@ public actor ProcessingPipeline {
             // derive from this one neutralized value.
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
             notes.structured = SLabelNeutralizer.neutralize(
-                notes: notes.structured, labelMap: labelMap, language: notes.language).notes
+                notes: notes.structured, labelMap: labelMap, language: notes.language,
+                groundedMLabels: Self.groundedMicLabels(in: segments)).notes
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: title,
                 userName: user.name)
@@ -825,20 +834,26 @@ public actor ProcessingPipeline {
         guard !name.isEmpty else { return false }
         return try await chain.run {
             let timestamp = self.now()
-            let diarization = await self.loadPersistedDiarization(meetingID: meetingID)
-                ?? DiarizationOutput(segments: [], speakerCount: 0)
+            guard let meeting = try await MeetingRepository(database: self.database)
+                .fetch(meetingID)
+            else { throw BlaiseDatabaseError.meetingNotFound(meetingID) }
+            let user = await self.userIdentity()
+            let ownerIdentitySet = OwnerIdentitySet(
+                user: user, attendees: meeting.attendees)
+            let diarization = await self.persistedDiarization(
+                meetingID: meetingID, for: speakerLabel)
             // M1: build the rename row ONCE and commit it ATOMICALLY with the
             // transcript it is applied to (a separate upfront upsert opened a
             // crash window: row committed but the transcript still old, which the
             // live rename-render in MeetingDetailView then showed while the notes
             // lagged). The row is applied to the segments in memory below and
             // saved inside `persistTranscript`'s transaction.
-            let renameRow = SpeakerRenameStore.makeRow(
+            let renameRow = try SpeakerRenameStore.makeRow(
                 meetingID: meetingID, speakerLabel: speakerLabel, name: name,
-                diarization: diarization, now: timestamp)
+                diarization: diarization, now: timestamp,
+                ownerIdentitySet: ownerIdentitySet)
 
-            guard let meeting = try await MeetingRepository(database: self.database)
-                .fetch(meetingID), meeting.status == .ready,
+            guard meeting.status == .ready,
                 !NotesPendingClass.isPending(meeting.lastProcessingError),
                 var notes = try await NotesRepository(database: self.database)
                     .fetch(meetingID: meetingID)
@@ -896,7 +911,6 @@ public actor ProcessingPipeline {
             guard let finalMeeting = try await MeetingRepository(database: self.database)
                 .fetch(meetingID)
             else { return false }
-            let user = await self.userIdentity()
             let finalSegments = try await TranscriptRepository(database: self.database)
                 .segments(meetingID: meetingID)
             // G13: this is where "I name S0 in a note and it populates" works —
@@ -904,7 +918,8 @@ public actor ProcessingPipeline {
             // and any still-unresolved label is neutralized (layer 2).
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: finalSegments)
             notes.structured = SLabelNeutralizer.neutralize(
-                notes: notes.structured, labelMap: labelMap, language: notes.language).notes
+                notes: notes.structured, labelMap: labelMap, language: notes.language,
+                groundedMLabels: Self.groundedMicLabels(in: finalSegments)).notes
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: finalMeeting.title,
                 userName: user.name)
@@ -1001,6 +1016,8 @@ public actor ProcessingPipeline {
                     text: digest, original: original, replacement: effective).text
             }
             let user = await self.userIdentity()
+            let ownerIdentitySet = OwnerIdentitySet(
+                user: user, attendees: meeting.attendees)
             var segments = try await TranscriptRepository(database: self.database)
                 .segments(meetingID: meetingID)
 
@@ -1025,7 +1042,9 @@ public actor ProcessingPipeline {
                 // UserIdentity, not from rename rows, so skipping is correct.
                 guard segment.speakerLabel != TranscriptSegment.userLabel,
                     let name = segment.speakerName, !name.isEmpty,
-                    VocabNormalization.canonicalMode(name) == originalFold
+                    VocabNormalization.canonicalMode(name) == originalFold,
+                    !(DiarizationLabel.isMicCluster(segment.speakerLabel)
+                        && ownerIdentitySet.contains(effective))
                 else { return nil }
                 return segment.speakerLabel
             })
@@ -1034,8 +1053,6 @@ public actor ProcessingPipeline {
                 let dominantLanguage = meeting.dominantLanguage
             {
                 if !effective.isEmpty {
-                    let diarization = await self.loadPersistedDiarization(meetingID: meetingID)
-                        ?? DiarizationOutput(segments: [], speakerCount: 0)
                     // M1: build the rename rows ONCE, apply them to segments in
                     // memory, and commit them ATOMICALLY with the transcript
                     // persist (no window where the rows exist but the transcript
@@ -1043,10 +1060,17 @@ public actor ProcessingPipeline {
                     let existing = try await self.database.pool.read { db in
                         try SpeakerRenameStore.all(db, meetingID: meetingID)
                     }
-                    let newRows = matchingLabels.sorted().map { label in
-                        SpeakerRenameStore.makeRow(
+                    var diarizationsByLabel: [String: DiarizationOutput] = [:]
+                    for label in matchingLabels {
+                        diarizationsByLabel[label] = await self.persistedDiarization(
+                            meetingID: meetingID, for: label)
+                    }
+                    let newRows = try matchingLabels.sorted().map { label in
+                        try SpeakerRenameStore.makeRow(
                             meetingID: meetingID, speakerLabel: label, name: effective,
-                            diarization: diarization, now: timestamp)
+                            diarization: diarizationsByLabel[label]
+                                ?? DiarizationOutput(segments: [], speakerCount: 0),
+                            now: timestamp, ownerIdentitySet: ownerIdentitySet)
                     }
                     let newLabels = Set(newRows.map(\.speakerLabel))
                     let effective = existing.filter { !newLabels.contains($0.speakerLabel) } + newRows
@@ -1090,7 +1114,8 @@ public actor ProcessingPipeline {
             // renders the corrected speaker name into notes owners too.
             let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
             notes.structured = SLabelNeutralizer.neutralize(
-                notes: edited, labelMap: labelMap, language: notes.language).notes
+                notes: edited, labelMap: labelMap, language: notes.language,
+                groundedMLabels: Self.groundedMicLabels(in: segments)).notes
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: meeting.title,
                 userName: user.name)
@@ -1162,6 +1187,8 @@ public actor ProcessingPipeline {
         /// (toggle off / failed before derivation); the persist step then keeps
         /// the empty default.
         var resolvedScopedAliasBindings: [AliasPair]?
+        var harvestCandidate: VoiceProfileCandidate?
+        var harvestPendingAppend: VoiceProfilePendingAppend?
 
         init(meetingID: MeetingID, regeneration: Bool) {
             self.currentStage = regeneration ? .transcode : .ingest
@@ -1253,7 +1280,9 @@ public actor ProcessingPipeline {
                     captured: captured, context: context, vocabulary: vocabulary)
             }
             cancelTokens[meetingID]?.cancelTask = { stageTask.cancel() }
-            let record = try await stageTask.value
+            _ = try await stageTask.value
+            await appendHarvestCandidateIfEligible(context)
+            let record = context.record
             emit(.runCompleted(meetingID))
             return record
         } catch {
@@ -1277,6 +1306,21 @@ public actor ProcessingPipeline {
         }
     }
 
+    private func appendHarvestCandidateIfEligible(_ context: RunContext) async {
+        guard let candidate = context.harvestCandidate,
+            let pending = context.harvestPendingAppend
+        else { return }
+        guard let result = try? await voiceProfileStore.append(
+            candidate, pending: pending, now: now())
+        else { return }
+        switch result {
+        case .collecting, .accepted:
+            context.record.roomTreatment?.harvestAppended = 1
+        case .invalidated, .frozen:
+            break
+        }
+    }
+
     /// What stages 1–5 produce, in either variant: the merged (and, for
     /// captured meetings, interleaved) segments plus what stage 8 needs.
     private struct FrontResult {
@@ -1285,6 +1329,7 @@ public actor ProcessingPipeline {
         var provenance: ASRProvenance
         var detectedLanguage: String?
         var audioDuration: Double
+        var roomDegradations: [String] = []
         /// Both retained tracks fed a captured run (clears a surviving
         /// capture-recovery note at the terminal write).
         var capturedBothTracks = false
@@ -1301,12 +1346,18 @@ public actor ProcessingPipeline {
         var meeting = meetingAtEntry
         let meetingID = meeting.id
         let user = await userIdentity()
+        var ownerIdentitySet = OwnerIdentitySet(user: user, attendees: meeting.attendees)
+        let profileSnapshot = captured ? await voiceProfileStore.runSnapshot() : nil
+        if captured {
+            context.harvestPendingAppend = await voiceProfileStore.pendingAppend()
+        }
 
         let front: FrontResult
         if captured {
             front = try await runCapturedFront(
                 meeting: meeting, tempSystemWAV: tempWAV, tempMicWAV: tempMicWAV,
-                context: context, user: user)
+                context: context, user: user,
+                profileSnapshot: profileSnapshot)
         } else {
             front = try await runFileFirstFront(
                 meeting: meeting, sourceWAV: sourceWAV, tempWAV: tempWAV, context: context)
@@ -1357,7 +1408,8 @@ public actor ProcessingPipeline {
                 eventNames: eventNames,
                 userName: user.name,
                 suppression: vocabulary.suppression,
-                commonNames: vocabulary.commonNames)
+                commonNames: vocabulary.commonNames,
+                ownerIdentitySet: ownerIdentitySet)
             // C4 v6: per-segment refinement over the same timeline — corrects
             // cluster bleed (one acoustic cluster spanning two people) and names
             // multi-speaker blobs the cluster pass left unresolved. No-op without
@@ -1378,6 +1430,7 @@ public actor ProcessingPipeline {
             !fresh.attendees.isEmpty
         {
             meeting.attendees = fresh.attendees
+            ownerIdentitySet = OwnerIdentitySet(user: user, attendees: meeting.attendees)
         }
 
         // 9. notes — NO availability pre-gate (C2 amendment for this slot):
@@ -1448,7 +1501,8 @@ public actor ProcessingPipeline {
         // labels and the payload). User renames apply last and outrank this.
         let labelContext = await nameSubstitutionContext(
             meeting: meeting, segments: segments, vocabulary: vocabulary)
-        segments = applyStoreToSpeakerLabels(segments, context: labelContext)
+        segments = applyStoreToSpeakerLabels(
+            segments, context: labelContext, ownerIdentitySet: ownerIdentitySet)
 
         // G2 §4: apply durable speaker-rename rows AFTER naming (a user rename
         // outranks mechanical/LLM names). Non-stale rows apply by speaker_label
@@ -1501,7 +1555,8 @@ public actor ProcessingPipeline {
             }
             await writeTerminalNote(
                 meetingID: meetingID, fallback: nil,
-                clearCaptureRecovery: front.capturedBothTracks)
+                clearCaptureRecovery: front.capturedBothTracks,
+                degradations: front.roomDegradations)
             return context.record
         }
 
@@ -1545,7 +1600,8 @@ public actor ProcessingPipeline {
         await writeTerminalNote(
             meetingID: meetingID,
             fallback: context.record.fallback,
-            clearCaptureRecovery: front.capturedBothTracks)
+            clearCaptureRecovery: front.capturedBothTracks,
+            degradations: front.roomDegradations)
         return context.record
     }
 
@@ -1590,10 +1646,14 @@ public actor ProcessingPipeline {
         // 4. diarize — same temp WAV. A regenerate reuses the first run's
         // persisted diarization (deterministic naming; see
         // diarizeReusingPersisted).
-        let attendeeCount = meeting.attendees.isEmpty ? nil : meeting.attendees.count
+        // File-first mixed track: the user's own voice is IN this audio, so the
+        // point estimate is the others-count plus him (C4 v5.5 + the
+        // user-implicit counting rule). No attendee knowledge → no constraint.
+        let expectedSpeakerCount = meeting.attendees.isEmpty
+            ? nil : Attendee.othersCount(in: meeting.attendees) + 1
         let diarization = try await stage(.diarize, context, meetingID) {
             try await self.diarizeReusingPersisted(
-                meetingID: meetingID, audioURL: tempWAV, attendeeCount: attendeeCount,
+                meetingID: meetingID, audioURL: tempWAV, expectedSpeakerCount: expectedSpeakerCount,
                 regeneration: context.record.regeneration)
         }
         context.record.diarizationSegmentCount = diarization.segments.count
@@ -1621,10 +1681,10 @@ public actor ProcessingPipeline {
 
     // MARK: - Stages 1–5, captured (two-track) variant — C7 v3.2 body amendment
 
-    /// Two retained tracks: ASR per track (same engine, two passes); the MIC
-    /// track's segments are created with `speakerLabel = "user"` AND
-    /// `speakerName = UserIdentity.name`; the SYSTEM track runs
-    /// diarization+merge as today; interleave by start time with the pinned
+    /// Two retained tracks: ASR and diarization per track; SOLO keeps the
+    /// legacy hard-user mic merge, while ROOM keeps M clusters and applies
+    /// owner stamps before downstream resolution. The SYSTEM track runs
+    /// its existing merge; interleave by start time with the pinned
     /// tie-break (start, then track — mic first —, then original ord; ord
     /// re-sequenced globally; per-track invariants hold PER track,
     /// cross-track overlap legal). A partially-recovered capture (one
@@ -1632,7 +1692,7 @@ public actor ProcessingPipeline {
     /// never a silent loss.
     private func runCapturedFront(
         meeting: Meeting, tempSystemWAV: URL, tempMicWAV: URL, context: RunContext,
-        user: UserIdentity
+        user: UserIdentity, profileSnapshot: VoiceProfileSnapshot?
     ) async throws -> FrontResult {
         let meetingID = meeting.id
         let paths = database.paths
@@ -1720,17 +1780,124 @@ public actor ProcessingPipeline {
         context.record.detectedLanguage = systemASR?.detectedLanguage ?? micASR?.detectedLanguage
         context.record.asrProvenance = provenance
 
-        // 4. diarize — SYSTEM track only (the mic track is by definition the
-        // user; never diarized). Skipped entirely when only the mic track
-        // survived a partial recovery.
+        let captureFactsRead = loadCaptureFacts(meeting: meeting)
+        let persistedRoomTreatment = context.record.regeneration
+            ? loadPersistedRoomTreatment(meetingID: meetingID) : nil
+        // 4. diarize — both tracks share the stage boundary. The system output
+        // remains the only input to speaker resolution; the mic result feeds
+        // room treatment and the mic merge.
         var diarization = DiarizationOutput(segments: [], speakerCount: 0)
-        if systemPresent {
-            let attendeeCount = meeting.attendees.isEmpty ? nil : meeting.attendees.count
-            diarization = try await stage(.diarize, context, meetingID) {
-                try await self.diarizeReusingPersisted(
-                    meetingID: meetingID, audioURL: tempSystemWAV, attendeeCount: attendeeCount,
-                    regeneration: context.record.regeneration)
+        var micDiarization: DiarizationResultWithCentroids?
+        var roomEvaluation: RoomTreatmentEvaluation?
+        var roomDegradations: [String] = []
+        try await stage(.diarize, context, meetingID) {
+            var systemCentroids: [String: [Float]] = [:]
+            if systemPresent {
+                let others = Attendee.othersCount(in: meeting.attendees)
+                let expectedSpeakerCount = others == 0 ? nil : others
+                let system = try await self.diarizeSystemReusingPersisted(
+                    meetingID: meetingID, audioURL: tempSystemWAV,
+                    expectedSpeakerCount: expectedSpeakerCount,
+                    regeneration: context.record.regeneration,
+                    persistedCentroids: persistedRoomTreatment?.clusterCentroids.system)
+                diarization = system.output
+                systemCentroids = system.centroids
             }
+
+            guard micPresent else {
+                // The ladder is inert without a mic track, but the capture-facts
+                // read still happened — a system-only recovery must not be
+                // §6.5-blind about it.
+                var counters = RoomTreatmentCounters()
+                counters.captureFactsWriteFailed =
+                    captureFactsRead.disposition == .persisted ? 0 : 1
+                context.record.roomTreatment = counters
+                return
+            }
+            let micClock = ContinuousClock()
+            let micStart = micClock.now
+            do {
+                if context.record.regeneration, let persistedRoomTreatment {
+                    micDiarization = DiarizationResultWithCentroids(
+                        output: persistedRoomTreatment.micDiarization,
+                        centroids: persistedRoomTreatment.clusterCentroids.mic)
+                } else {
+                    micDiarization = try await self.diarizeFreshMic(
+                        meetingID: meetingID, audioURL: tempMicWAV,
+                        expectedSpeakerCount: self.expectedMicSpeakerCount(
+                            meeting: meeting, facts: captureFactsRead.facts,
+                            profile: profileSnapshot))
+                }
+            } catch is CancellationError {
+                throw EngineError.cancelled
+            } catch EngineError.cancelled {
+                throw EngineError.cancelled
+            } catch {
+                var counters = RoomTreatmentCounters()
+                let elapsed = micClock.now - micStart
+                counters.micDiarizeSeconds =
+                    Double(elapsed.components.seconds)
+                    + Double(elapsed.components.attoseconds) / 1e18
+                counters.micDiarizeFailed = 1
+                counters.captureFactsWriteFailed =
+                    captureFactsRead.disposition == .persisted ? 0 : 1
+                context.record.roomTreatment = counters
+                try? FileManager.default.removeItem(
+                    at: self.database.paths.roomTreatmentURL(meetingID))
+                if meeting.source == .inPerson,
+                    captureFactsRead.facts.sourceProvenance == .explicit
+                {
+                    roomDegradations.append(
+                        "in-person treatment unavailable: speaker separation failed")
+                }
+                return
+            }
+
+            guard let micDiarization else { return }
+            let micClusters = Self.roomSpeechClusters(from: micDiarization)
+            // Rename authority gates the owner stamp (§5.6): a read that fails
+            // must fail the stage, never present itself as "no renames" — a
+            // fabricated empty set stamps over the user's explicit word, and a
+            // later successful read cannot repair it (the label no longer
+            // matches the rename row's key).
+            let currentRenames = try await self.database.pool.read { db in
+                try SpeakerRenameStore.all(db, meetingID: meetingID)
+            }
+            let renamedMicClusters = Set(
+                currentRenames.filter {
+                    !$0.stale && DiarizationLabel.isMicCluster($0.speakerLabel)
+                }.map(\.speakerLabel))
+            var evaluation = RoomTreatment.evaluate(
+                source: meeting.source,
+                captureFacts: captureFactsRead.facts,
+                micClusters: micClusters,
+                systemCentroids: systemCentroids,
+                systemSpeechIntervals: diarization.segments.map {
+                    SpeechInterval(
+                        startSeconds: $0.startSeconds, endSeconds: $0.endSeconds)
+                },
+                profile: profileSnapshot,
+                persistedRenameClusters: renamedMicClusters)
+            let elapsed = micClock.now - micStart
+            evaluation.counters.micDiarizeSeconds =
+                Double(elapsed.components.seconds)
+                + Double(elapsed.components.attoseconds) / 1e18
+            evaluation.counters.captureFactsWriteFailed =
+                captureFactsRead.disposition == .persisted ? 0 : 1
+            roomEvaluation = evaluation
+            context.record.roomTreatment = evaluation.counters
+            // Derived data degrades, it never fails the run (§6.4): an absent
+            // artifact re-derives fresh on the next regeneration.
+            try? self.persistRoomTreatment(evaluation.artifact, meetingID: meetingID)
+
+            context.harvestCandidate = VoiceProfileHarvest.candidate(
+                meetingID: meetingID,
+                meetingDate: meeting.startedAt,
+                source: meeting.source,
+                captureFacts: captureFactsRead.facts,
+                micClusters: micClusters,
+                modelID: FluidAudioDiarizer.diarizerID,
+                language: micASR?.detectedLanguage ?? provenance.languageHint ?? "und")
         }
         context.record.diarizationSegmentCount = diarization.segments.count
         context.record.speakerCount = diarization.speakerCount
@@ -1779,18 +1946,32 @@ public actor ProcessingPipeline {
                     }
                     micRaw = suppressed.kept
                 }
-                micSegments = SpeakerMerger.merge(
-                    asr: micRaw, diarization: [], meetingID: meetingID
-                ).segments.map { segment in
-                    var named = segment
-                    named.speakerLabel = TranscriptSegment.userLabel
-                    // G3: a pre-onboarding (empty) identity contributes no
-                    // self-name, so the mic turn stays nameless (speakerName ==
-                    // nil) rather than persisting an empty speaker name. The
-                    // "You" UI fallback (micAwareSpeakerLabel) and the
-                    // payload-owner / prompt "the user" handling all key on nil.
-                    named.speakerName = user.name.isEmpty ? nil : user.name
-                    return named
+                let roomMode = roomEvaluation?.artifact.gateVerdict == .room
+                let micTurns = SpeakerMerger.merge(
+                    asr: micRaw,
+                    diarization: roomMode ? (micDiarization?.output.segments ?? []) : [],
+                    meetingID: meetingID
+                ).segments
+                if roomMode, let stamps = roomEvaluation?.artifact.ownerStamps {
+                    micSegments = micTurns.map { segment in
+                        var attributed = segment
+                        if stamps[segment.speakerLabel]?.decision == .user,
+                            stamps[segment.speakerLabel]?.suppressedByRename != true
+                        {
+                            attributed.speakerLabel = TranscriptSegment.userLabel
+                            attributed.speakerName = user.name.isEmpty ? nil : user.name
+                        } else if DiarizationLabel.isMicCluster(segment.speakerLabel) {
+                            attributed.speakerName = nil
+                        }
+                        return attributed
+                    }
+                } else {
+                    micSegments = micTurns.map { segment in
+                        var named = segment
+                        named.speakerLabel = TranscriptSegment.userLabel
+                        named.speakerName = user.name.isEmpty ? nil : user.name
+                        return named
+                    }
                 }
             }
             return TwoTrackInterleaver.interleave(mic: micSegments, system: systemSegments)
@@ -1803,6 +1984,7 @@ public actor ProcessingPipeline {
             provenance: provenance,
             detectedLanguage: context.record.detectedLanguage,
             audioDuration: audioDuration,
+            roomDegradations: roomDegradations,
             // C14: a stitch with a missing-track part or row-less residue is
             // NOT a both-tracks run — its capture-recovery note must survive.
             capturedBothTracks: systemPresent && micPresent && stitched.complete)
@@ -1946,13 +2128,14 @@ public actor ProcessingPipeline {
     /// one. `process()` (first run) and meetings predating the artifact always
     /// diarize fresh.
     private func diarizeReusingPersisted(
-        meetingID: MeetingID, audioURL: URL, attendeeCount: Int?, regeneration: Bool
+        meetingID: MeetingID, audioURL: URL, expectedSpeakerCount: Int?, regeneration: Bool
     ) async throws -> DiarizationOutput {
         if regeneration, let reused = loadPersistedDiarization(meetingID: meetingID) {
             logger.info("regenerate: reusing persisted diarization (\(reused.segments.count) segments) — naming stays deterministic")
             return reused
         }
-        let fresh = try await diarizer.diarize(audioURL: audioURL, attendeeCount: attendeeCount)
+        let fresh = try await diarizer.diarize(
+            audioURL: audioURL, expectedSpeakerCount: expectedSpeakerCount)
         // G2 §4 (R4-H1 ordering): on the MISSING-ARTIFACT fallback, re-map +
         // re-key the speaker-rename rows by anchor against this FRESH
         // clustering and COMMIT that BEFORE persisting the fresh artifact — a
@@ -1968,16 +2151,128 @@ public actor ProcessingPipeline {
         // keys, which the v5.1 ordering rule says can NEVER happen).
         try await database.pool.write { db in
             try SpeakerRenameStore.remapForFreshDiarization(
-                db, meetingID: meetingID, fresh: fresh, now: now)
+                db, meetingID: meetingID, fresh: fresh, now: now,
+                namespacePrefix: "S")
         }
         persistDiarization(fresh, meetingID: meetingID)
         return fresh
+    }
+
+    private func diarizeSystemReusingPersisted(
+        meetingID: MeetingID, audioURL: URL, expectedSpeakerCount: Int?,
+        regeneration: Bool, persistedCentroids: [String: [Float]]?
+    ) async throws -> DiarizationResultWithCentroids {
+        if regeneration, let reused = loadPersistedDiarization(meetingID: meetingID) {
+            return DiarizationResultWithCentroids(
+                output: reused, centroids: persistedCentroids ?? [:])
+        }
+        let fresh = try await diarizer.diarizeWithCentroids(
+            audioURL: audioURL, expectedSpeakerCount: expectedSpeakerCount,
+            namespacePrefix: "S")
+        let timestamp = now()
+        try await database.pool.write { db in
+            try SpeakerRenameStore.remapForFreshDiarization(
+                db, meetingID: meetingID, fresh: fresh.output, now: timestamp,
+                namespacePrefix: "S")
+        }
+        persistDiarization(fresh.output, meetingID: meetingID)
+        return fresh
+    }
+
+    private func diarizeFreshMic(
+        meetingID: MeetingID, audioURL: URL, expectedSpeakerCount: Int?
+    ) async throws -> DiarizationResultWithCentroids {
+        let fresh = try await diarizer.diarizeWithCentroids(
+            audioURL: audioURL, expectedSpeakerCount: expectedSpeakerCount,
+            namespacePrefix: "M")
+        let timestamp = now()
+        try await database.pool.write { db in
+            try SpeakerRenameStore.remapForFreshDiarization(
+                db, meetingID: meetingID, fresh: fresh.output, now: timestamp,
+                namespacePrefix: "M")
+        }
+        return fresh
+    }
+
+    private func expectedMicSpeakerCount(
+        meeting: Meeting, facts: CaptureFacts, profile: VoiceProfileSnapshot?
+    ) -> Int? {
+        let profileUsable = profile?.references.isEmpty == false
+        let roomRow =
+            (meeting.source == .inPerson && facts.sourceProvenance == .explicit)
+            || (profileUsable && (meeting.source == .inPerson || facts.linkClass == .none))
+        guard roomRow, !meeting.attendees.isEmpty else { return nil }
+        // A degenerate count is no estimate: an attendee list that resolves to
+        // zero others would cap the mic clusterer at one speaker, collapsing the
+        // whole room into a single cluster — the exact misattribution room
+        // treatment exists to remove. Unconstrained instead, mirroring the
+        // system track's rule.
+        let others = Attendee.othersCount(in: meeting.attendees)
+        guard others > 0 else { return nil }
+        return others + 1
+    }
+
+    private func loadCaptureFacts(meeting: Meeting) -> CaptureFactsReadResult {
+        let data = try? Data(contentsOf: database.paths.captureFactsURL(meeting.id))
+        return CaptureFacts.resolve(
+            encoded: data, legacySource: meeting.source,
+            legacyMeetingCode: meeting.meetingCode)
+    }
+
+    private func loadPersistedRoomTreatment(
+        meetingID: MeetingID
+    ) -> RoomTreatmentArtifact? {
+        guard let data = try? Data(
+            contentsOf: database.paths.roomTreatmentURL(meetingID))
+        else { return nil }
+        return try? JSONDecoder().decode(RoomTreatmentArtifact.self, from: data)
+    }
+
+    private func persistRoomTreatment(
+        _ artifact: RoomTreatmentArtifact, meetingID: MeetingID
+    ) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(artifact).write(
+            to: database.paths.roomTreatmentURL(meetingID), options: .atomic)
+    }
+
+    private static func roomSpeechClusters(
+        from result: DiarizationResultWithCentroids
+    ) -> [RoomSpeechCluster] {
+        var order: [String] = []
+        var intervals: [String: [SpeechInterval]] = [:]
+        for segment in result.output.segments {
+            if intervals[segment.speakerLabel] == nil {
+                order.append(segment.speakerLabel)
+            }
+            intervals[segment.speakerLabel, default: []].append(
+                SpeechInterval(
+                    startSeconds: segment.startSeconds,
+                    endSeconds: segment.endSeconds))
+        }
+        return order.map { label in
+            RoomSpeechCluster(
+                label: label, intervals: intervals[label] ?? [],
+                centroid: result.centroids[label])
+        }
     }
 
     private func loadPersistedDiarization(meetingID: MeetingID) -> DiarizationOutput? {
         let url = database.paths.diarizationURL(meetingID)
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(DiarizationOutput.self, from: data)
+    }
+
+    private func persistedDiarization(
+        meetingID: MeetingID, for speakerLabel: String
+    ) -> DiarizationOutput {
+        if DiarizationLabel.isMicCluster(speakerLabel) {
+            return loadPersistedRoomTreatment(meetingID: meetingID)?.micDiarization
+                ?? DiarizationOutput(segments: [], speakerCount: 0)
+        }
+        return loadPersistedDiarization(meetingID: meetingID)
+            ?? DiarizationOutput(segments: [], speakerCount: 0)
     }
 
     private func persistDiarization(_ output: DiarizationOutput, meetingID: MeetingID) {
@@ -2368,7 +2663,8 @@ public actor ProcessingPipeline {
             eventNames: eventNames,
             userName: user.name,
             suppression: vocabulary.suppression,
-            commonNames: vocabulary.commonNames)
+            commonNames: vocabulary.commonNames,
+            ownerIdentitySet: OwnerIdentitySet(user: user, attendees: meeting.attendees))
     }
 
     // MARK: - G2 §3 name-substitution pass (generate / regenerate / pending-resume)
@@ -2443,7 +2739,8 @@ public actor ProcessingPipeline {
     /// reaches the transcript labels and the evidence payload, not just notes.
     /// Returns the segments with corrected names (only named segments change).
     private func applyStoreToSpeakerLabels(
-        _ segments: [TranscriptSegment], context: NameSubstitution.Context
+        _ segments: [TranscriptSegment], context: NameSubstitution.Context,
+        ownerIdentitySet: OwnerIdentitySet
     ) -> [TranscriptSegment] {
         guard !context.store.isEmpty || !context.polishCanonicals.isEmpty else { return segments }
         // Resolve each distinct existing name once.
@@ -2455,6 +2752,11 @@ public actor ProcessingPipeline {
         guard !corrected.isEmpty else { return segments }
         return segments.map { segment in
             guard let name = segment.speakerName, let fixed = corrected[name] else { return segment }
+            if DiarizationLabel.isMicCluster(segment.speakerLabel),
+                ownerIdentitySet.contains(fixed)
+            {
+                return segment
+            }
             var copy = segment
             copy.speakerName = fixed
             return copy
@@ -2505,6 +2807,12 @@ public actor ProcessingPipeline {
             map[row.speakerLabel] = row.name
         }
         return map
+    }
+
+    private static func groundedMicLabels(
+        in segments: [TranscriptSegment]
+    ) -> Set<String> {
+        Set(segments.map(\.speakerLabel).filter(DiarizationLabel.isMicCluster))
     }
 
     // MARK: - G14 memory-digest generation (the second synthesis call)
@@ -2647,8 +2955,13 @@ public actor ProcessingPipeline {
             // map resolves known speakers to names; an unknown becomes a neutral
             // descriptor — never an invented identity.
             let labelMap = await slabelMap(meetingID: meetingID, segments: segments)
+            let persistedSegments =
+                (try? await TranscriptRepository(database: database)
+                    .segments(meetingID: meetingID)) ?? []
+            let groundedMLabels = Self.groundedMicLabels(in: persistedSegments)
             let clean = SLabelNeutralizer.neutralizeText(
-                result.digest, labelMap: labelMap, language: dominantLanguage)
+                result.digest, labelMap: labelMap, language: dominantLanguage,
+                groundedMLabels: groundedMLabels)
 
             // Deterministic final-mile normalization (NOT env-gated; pure; runs as
             // the LAST step on WHATEVER digest is ultimately returned — after the
@@ -2715,7 +3028,8 @@ public actor ProcessingPipeline {
                                 request, draftDigest: clean, purpose: purpose)
                         }
                         let auditedClean = SLabelNeutralizer.neutralizeText(
-                            audited.digest, labelMap: labelMap, language: dominantLanguage)
+                            audited.digest, labelMap: labelMap, language: dominantLanguage,
+                            groundedMLabels: groundedMLabels)
                         return .produced(dateCorrected(auditedClean))
                     } catch {
                         logger.warning(
@@ -2746,7 +3060,8 @@ public actor ProcessingPipeline {
                             request, draftDigest: clean, purpose: purpose)
                     }
                     transcriptDigest = SLabelNeutralizer.neutralizeText(
-                        verified.digest, labelMap: labelMap, language: dominantLanguage)
+                        verified.digest, labelMap: labelMap, language: dominantLanguage,
+                        groundedMLabels: groundedMLabels)
                 } catch {
                     logger.warning(
                         "digest verify pass failed for \(meetingID, privacy: .public): \(Self.describe(error), privacy: .public) — falling back to the unverified draft digest")
@@ -2775,7 +3090,8 @@ public actor ProcessingPipeline {
                             request, draftDigest: transcriptDigest, purpose: purpose)
                     }
                     let reconciledClean = SLabelNeutralizer.neutralizeText(
-                        reconciled.digest, labelMap: labelMap, language: dominantLanguage)
+                        reconciled.digest, labelMap: labelMap, language: dominantLanguage,
+                        groundedMLabels: groundedMLabels)
                     return .produced(dateCorrected(reconciledClean))
                 } catch {
                     logger.warning(
@@ -2886,7 +3202,8 @@ public actor ProcessingPipeline {
                 meetingID: meetingID, segments: finalizeSegments)
             let neutralized = SLabelNeutralizer.neutralize(
                 notes: notesResult.structured, labelMap: labelMap,
-                language: dominantLanguage).notes
+                language: dominantLanguage,
+                groundedMLabels: Self.groundedMicLabels(in: finalizeSegments)).notes
             // The human markdown H1 must carry the promoted (trimmed, ≤80-char)
             // title — the SAME bytes as `meeting.title` and the payload — not the
             // raw, untruncated `NotesStructured.title`. The renderer derives the
@@ -3216,7 +3533,10 @@ public actor ProcessingPipeline {
             // user renames (a misheard label is outranked by a store row).
             let labelContext = await nameSubstitutionContext(
                 meeting: meeting, segments: finalSegments, vocabulary: vocabulary)
-            finalSegments = applyStoreToSpeakerLabels(finalSegments, context: labelContext)
+            finalSegments = applyStoreToSpeakerLabels(
+                finalSegments, context: labelContext,
+                ownerIdentitySet: OwnerIdentitySet(
+                    user: user, attendees: meeting.attendees))
 
             // G2 §4: apply durable speaker-rename rows (artifact-present direct
             // apply; the resume never re-diarizes, so labels are stable).
@@ -3605,7 +3925,8 @@ public actor ProcessingPipeline {
     /// - a fallback note is set only when no capture-recovery note survives
     ///   (the two classes never combine; the recovery fact wins).
     private func writeTerminalNote(
-        meetingID: MeetingID, fallback: NotesFallbackRecord?, clearCaptureRecovery: Bool
+        meetingID: MeetingID, fallback: NotesFallbackRecord?,
+        clearCaptureRecovery: Bool, degradations: [String] = []
     ) async {
         try? await database.pool.write { db in
             let current = try String.fetchOne(
@@ -3615,8 +3936,15 @@ public actor ProcessingPipeline {
             if clearCaptureRecovery, note?.hasPrefix(CaptureRecovery.notePrefix) == true {
                 note = nil
             }
-            if let fallback, note == nil {
-                note = "fallback: \(fallback.reason)"
+            if note?.hasPrefix(CaptureRecovery.notePrefix) != true {
+                var components: [String] = []
+                for degradation in degradations where !components.contains(degradation) {
+                    components.append(degradation)
+                }
+                if let fallback {
+                    components.append("fallback: \(fallback.reason)")
+                }
+                note = components.isEmpty ? nil : components.joined(separator: "; ")
             }
             if note != current {
                 try db.execute(

@@ -439,10 +439,40 @@ struct LibraryView: View {
             .help("End the paused meeting and process it")
             .accessibilityLabel("End and process the paused meeting")
         } else {
-            Button {
-                Task { await appEnv.toggleRecording() }
+            // The menu-bar picker's source list, mirrored here. The primary
+            // action stays the ⌥⌘R quick-start; the ⌥⌘R shortcut itself is
+            // registered on the menu-bar item only (a second registration
+            // would conflict).
+            Menu {
+                // Read inside the menu content, never in the toolbar body: a
+                // pasteboard read raises the system paste indicator, so it must
+                // happen when the menu is presented — not on every re-render.
+                let clipboardCode = NSPasteboard.general.string(forType: .string)
+                    .flatMap { MeetLinkParser.meetingCode(from: $0) }
+                Button(clipboardCode.map { "Google Meet (\($0) from clipboard)" } ?? "Google Meet") {
+                    Task {
+                        await appEnv.startRecording(
+                            source: .meet, meetingCode: clipboardCode,
+                            sourceProvenance: .explicit)
+                    }
+                }
+                Button("Zoom") {
+                    Task { await appEnv.startRecording(source: .zoom, sourceProvenance: .explicit) }
+                }
+                Button("Teams") {
+                    Task { await appEnv.startRecording(source: .teams, sourceProvenance: .explicit) }
+                }
+                Button("Slack") { Task { await appEnv.startSlackRecording() } }
+                Button("In Person") {
+                    Task {
+                        await appEnv.startRecording(
+                            source: .inPerson, sourceProvenance: .explicit)
+                    }
+                }
             } label: {
                 Label("Record", systemImage: "record.circle")
+            } primaryAction: {
+                Task { await appEnv.toggleRecording() }
             }
             .help(recordHelp(status.state))
             .accessibilityLabel("Start recording")
@@ -579,6 +609,7 @@ private struct UpcomingMeetingRowView: View {
         case .zoom, .teams: return "person.2.wave.2"
         case .slack: return "bubble.left.and.bubble.right"
         case .inPerson: return "person.2"
+        case .online: return "globe"
         case .imported: return "waveform"
         }
     }

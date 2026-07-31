@@ -27,7 +27,7 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S0", name: "Alice",
-                diarization: d, now: msDate())
+                diarization: d, now: msDate(), ownerIdentitySet: .empty)
         }
         let rows = try await db.pool.read { try SpeakerRenameStore.all($0, meetingID: meeting.id) }
         #expect(rows.count == 1)
@@ -64,7 +64,7 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S0", name: "Alice",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
         }
         // Fresh clustering: the same speaker is now labeled S2, covering 0..18
         // (contains 10s); a different speaker is S0.
@@ -88,7 +88,7 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S0", name: "Alice",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
         }
         // Fresh clustering: no segment covers 10s (a silence gap there).
         let fresh = diar([("S0", 0, 5), ("S1", 15, 30)])
@@ -114,10 +114,10 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S0", name: "Alice",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S1", name: "Bob",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
         }
         // Fresh clustering MERGED them into one cluster S0 covering both anchors.
         let fresh = diar([("S0", 0, 30)])
@@ -145,10 +145,10 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S0", name: "Alice",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S1", name: "Bob",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
         }
         // Fresh: a cluster "S0" covers 20..30 (contains Bob's 25000 anchor); no
         // cluster covers Alice's 5000 anchor (a gap there) → Alice goes stale,
@@ -186,10 +186,10 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S0", name: "Alice",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S1", name: "Bob",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
             // Eve: a pre-existing stale row holding key "S5".
             try SpeakerRename(
                 meetingID: meeting.id, speakerLabel: "S5", anchorMs: 0, stale: true,
@@ -227,7 +227,7 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S3", name: "Alice",
-                diarization: empty, now: msDate())
+                diarization: empty, now: msDate(), ownerIdentitySet: .empty)
         }
         let rows = try await db.pool.read { try SpeakerRenameStore.all($0, meetingID: meeting.id) }
         #expect(rows.count == 1)
@@ -251,7 +251,7 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S0", name: "Alice",
-                diarization: old, now: msDate())
+                diarization: old, now: msDate(), ownerIdentitySet: .empty)
         }
         let fresh = diar([("S0", 0, 5), ("S1", 15, 30)]) // gap at 10s → stale
         try await db.pool.write { conn in
@@ -262,12 +262,93 @@ private func diar(_ segs: [(String, Double, Double)]) -> DiarizationOutput {
         try await db.pool.write { conn in
             try SpeakerRenameStore.upsert(
                 conn, meetingID: meeting.id, speakerLabel: "S1", name: "Alice",
-                diarization: fresh, now: msDate())
+                diarization: fresh, now: msDate(), ownerIdentitySet: .empty)
         }
         let rows = try await db.pool.read { try SpeakerRenameStore.all($0, meetingID: meeting.id) }
         // The S1 row is fresh (stale=0); the old stale S0 row remains until the
         // next fallback (the user re-confirmed onto the correct cluster).
         let s1 = try #require(rows.first { $0.speakerLabel == "S1" })
         #expect(s1.stale == false)
+    }
+
+    @Test func micRenameToOwnerIdentityIsRejectedAtStoreBoundary() {
+        let ownerSet = OwnerIdentitySet(
+            user: UserIdentity(
+                name: "Sam Rivera", aliases: ["Samuel Rivera"],
+                email: "sam.rivera@vexatron.test"),
+            attendees: [])
+        #expect(throws: SpeakerRenameError.ownerIdentityRequiresStamp) {
+            _ = try SpeakerRenameStore.makeRow(
+                meetingID: "01J00000000000000000000001",
+                speakerLabel: "M0", name: "Samuel Rivera",
+                diarization: diar([("M0", 0, 10)]), now: msDate(),
+                ownerIdentitySet: ownerSet)
+        }
+    }
+
+    @Test func freshRemapNeverCrossesNamespaces() async throws {
+        let db = try makeDatabase()
+        let meeting = makeMeeting()
+        try await MeetingRepository(database: db).create(meeting)
+        try await db.pool.write { conn in
+            try SpeakerRenameStore.upsert(
+                conn, meetingID: meeting.id, speakerLabel: "S0", name: "Dana Okonkwo",
+                diarization: diar([("S0", 0, 20)]), now: msDate(), ownerIdentitySet: .empty)
+            try SpeakerRenameStore.upsert(
+                conn, meetingID: meeting.id, speakerLabel: "M0", name: "Quinn Harbor",
+                diarization: diar([("M0", 0, 20)]), now: msDate(), ownerIdentitySet: .empty)
+            try SpeakerRenameStore.remapForFreshDiarization(
+                conn, meetingID: meeting.id,
+                fresh: diar([("M2", 0, 18), ("M0", 19, 30)]),
+                now: msDate(), namespacePrefix: "M")
+        }
+        let rows = try await db.pool.read {
+            try SpeakerRenameStore.all($0, meetingID: meeting.id)
+        }
+        #expect(rows.first { $0.name == "Dana Okonkwo" }?.speakerLabel == "S0")
+        #expect(rows.first { $0.name == "Quinn Harbor" }?.speakerLabel == "M2")
+    }
+
+    /// The TARGET side of the same rule: a fresh artifact whose only cluster at
+    /// the row's anchor belongs to the OTHER namespace must stale the row, never
+    /// re-key it across the namespace boundary.
+    @Test func freshRemapStalesRatherThanCrossIntoAnotherNamespace() async throws {
+        let db = try makeDatabase()
+        let micMeeting = makeMeeting()
+        try await MeetingRepository(database: db).create(micMeeting)
+        try await db.pool.write { conn in
+            try SpeakerRenameStore.upsert(
+                conn, meetingID: micMeeting.id, speakerLabel: "M0", name: "Quinn Harbor",
+                diarization: diar([("M0", 0, 10)]), now: msDate(), ownerIdentitySet: .empty)
+            // The fresh mic artifact carries only an S-prefixed cluster over the
+            // M0 row's 5 s anchor.
+            try SpeakerRenameStore.remapForFreshDiarization(
+                conn, meetingID: micMeeting.id, fresh: diar([("S7", 0, 10)]),
+                now: msDate(), namespacePrefix: "M")
+        }
+        var rows = try await db.pool.read {
+            try SpeakerRenameStore.all($0, meetingID: micMeeting.id)
+        }
+        var row = try #require(rows.first { $0.name == "Quinn Harbor" })
+        #expect(row.speakerLabel == "M0")
+        #expect(row.stale)
+
+        // Symmetric: an S row against a fresh M-only artifact.
+        let systemMeeting = makeMeeting()
+        try await MeetingRepository(database: db).create(systemMeeting)
+        try await db.pool.write { conn in
+            try SpeakerRenameStore.upsert(
+                conn, meetingID: systemMeeting.id, speakerLabel: "S0", name: "Dana Okonkwo",
+                diarization: diar([("S0", 0, 10)]), now: msDate(), ownerIdentitySet: .empty)
+            try SpeakerRenameStore.remapForFreshDiarization(
+                conn, meetingID: systemMeeting.id, fresh: diar([("M3", 0, 10)]),
+                now: msDate(), namespacePrefix: "S")
+        }
+        rows = try await db.pool.read {
+            try SpeakerRenameStore.all($0, meetingID: systemMeeting.id)
+        }
+        row = try #require(rows.first { $0.name == "Dana Okonkwo" })
+        #expect(row.speakerLabel == "S0")
+        #expect(row.stale)
     }
 }

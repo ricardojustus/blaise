@@ -214,23 +214,10 @@ public enum EvidencePayloadBuilder {
     /// `UserIdentity.email`; else `"speaker"`.
     static func speakerSource(of segment: TranscriptSegment, meeting: Meeting, user: UserIdentity) -> String {
         if segment.speakerLabel == "user" { return "microphone" }
+        if DiarizationLabel.isMicCluster(segment.speakerLabel) { return "speaker" }
         guard let name = segment.speakerName else { return "speaker" }
-        let folded = VocabNormalization.canonicalMode(name)
-        // G3: a pre-onboarding (empty) identity contributes no name/alias/email
-        // forms, so the "microphone" match no-ops honestly — the durable
-        // `speakerLabel == "user"` path above still tags live mic segments.
-        let userForms = Set(([user.name] + user.aliases)
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .map { VocabNormalization.canonicalMode($0) })
-        if userForms.contains(folded) { return "microphone" }
-        let userEmail = user.email.lowercased()
-        if !userEmail.isEmpty {
-            for attendee in meeting.attendees
-            where VocabNormalization.canonicalMode(attendee.name) == folded {
-                if attendee.email?.lowercased() == userEmail { return "microphone" }
-            }
-        }
-        return "speaker"
+        return OwnerIdentitySet(user: user, attendees: meeting.attendees).contains(name)
+            ? "microphone" : "speaker"
     }
 
     private static func actionItemValue(_ item: ActionItem) -> CanonicalJSONValue {

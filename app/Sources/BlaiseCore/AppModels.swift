@@ -443,6 +443,20 @@ public final class LibraryModel {
 
 // MARK: - DetailModel
 
+public struct DiarizationArtifactPresence: Sendable, Equatable {
+    public var system: Bool
+    public var mic: Bool
+
+    public init(system: Bool, mic: Bool) {
+        self.system = system
+        self.mic = mic
+    }
+
+    public func containsArtifact(for speakerLabel: String) -> Bool {
+        DiarizationLabel.isMicCluster(speakerLabel) ? mic : system
+    }
+}
+
 /// Drives one meeting's detail pane: ValueObservation over the meeting row,
 /// its notes, and its transcript segments.
 @MainActor @Observable
@@ -465,9 +479,12 @@ public final class MeetingDetailModel {
     /// meeting. When it does NOT, a rename cannot derive an anchor and parks as
     /// `stale` (applied only after the next regenerate) — the rename popover
     /// shows truthful copy in that case rather than promising immediate effect.
-    public var hasDiarizationArtifact: Bool {
-        let url = database.paths.diarizationURL(meetingID)
-        return FileManager.default.fileExists(atPath: url.path)
+    public var diarizationArtifactPresence: DiarizationArtifactPresence {
+        DiarizationArtifactPresence(
+            system: FileManager.default.fileExists(
+                atPath: database.paths.diarizationURL(meetingID).path),
+            mic: FileManager.default.fileExists(
+                atPath: database.paths.roomTreatmentURL(meetingID).path))
     }
 
     /// G2 §5 (L-5): the distinct resolved speaker names on the transcript — a

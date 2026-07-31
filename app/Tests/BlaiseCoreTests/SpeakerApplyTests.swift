@@ -40,7 +40,8 @@ private func apply(
         eventNames: events,
         userName: user,
         suppression: suppression,
-        commonNames: commonNames)
+        commonNames: commonNames,
+        ownerIdentitySet: .empty)
 }
 
 @Suite struct SpeakerApplyTests {

@@ -145,10 +145,10 @@ import Testing
         try await database.pool.write { db in
             try SpeakerRenameStore.upsert(
                 db, meetingID: meetingID, speakerLabel: "S0", name: "Alice",
-                diarization: orig, now: msDate())
+                diarization: orig, now: msDate(), ownerIdentitySet: .empty)
             try SpeakerRenameStore.upsert(
                 db, meetingID: meetingID, speakerLabel: TranscriptSegment.unattributed,
-                name: "Convidada", diarization: orig, now: msDate())
+                name: "Convidada", diarization: orig, now: msDate(), ownerIdentitySet: .empty)
         }
         // Fresh clustering: the S0 speaker is now labeled S1 (covers the S0 anchor).
         let fresh = DiarizationOutput(

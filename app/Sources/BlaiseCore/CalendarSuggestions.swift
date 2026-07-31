@@ -81,10 +81,12 @@ public struct MeetingSuggestion: Sendable, Equatable {
     /// G11 §1: the matched event's identifier — persisted as `calendar_event_id`
     /// at start. nil for a manual/ad-hoc suggestion.
     public var eventIdentifier: String?
+    public var joinedLinkText: String?
 
     public init(
         title: String, start: Date, source: MeetingSource, meetingCode: String?,
-        attendees: [Attendee], end: Date? = nil, eventIdentifier: String? = nil
+        attendees: [Attendee], end: Date? = nil, eventIdentifier: String? = nil,
+        joinedLinkText: String? = nil
     ) {
         self.title = title
         self.start = start
@@ -93,6 +95,7 @@ public struct MeetingSuggestion: Sendable, Equatable {
         self.attendees = attendees
         self.end = end
         self.eventIdentifier = eventIdentifier
+        self.joinedLinkText = joinedLinkText
     }
 }
 
@@ -135,19 +138,19 @@ public enum CalendarSuggestionBuilder {
 
     /// Builds suggestions from event snapshots: current + upcoming events (a
     /// short look-back through a 2-hour look-ahead) that
-    /// have attendees or a meeting link. The user (matched by `userEmail`,
-    /// case-insensitive) is excluded from the prefilled attendees — the user is
-    /// not his own attendee. Source inferred from the link (meet code →
-    /// .meet; zoom/teams hosts recognized; else in-person). Carries the
-    /// event's `end`/`eventIdentifier` for the §1 anchor.
+    /// have attendees or a meeting link. The prefilled attendee list is the
+    /// event's list LITERAL — the user is not filtered out of it; he is implicit
+    /// in every meeting and the counting rule subtracts him structurally
+    /// (`Attendee.othersCount`), which email matching could not do reliably.
+    /// Source inferred from the link: a meet code → .meet, a zoom/teams host →
+    /// .zoom/.teams, any other http(s) link or bare recognized-host mention —
+    /// unrecognized platform or a recognized one with no branch of its own — →
+    /// .online, and only a genuinely link-free event → .inPerson. Carries the event's
+    /// `end`/`eventIdentifier` for the §1 anchor.
     public static func suggestions(
-        from events: [CalendarEventSnapshot], now: Date, userEmail: String
+        from events: [CalendarEventSnapshot], now: Date
     ) -> [MeetingSuggestion] {
-        // G3: a pre-onboarding (empty) identity carries no email — attendee
-        // self-exclusion no-ops rather than dropping every email-less attendee.
-        let userEmailFolded = userEmail.lowercased()
-        let selfExcludes = !userEmailFolded.isEmpty
-        return events
+        events
             .filter {
                 let delta = $0.start.timeIntervalSince(now)
                 return delta >= -lookbackSeconds && delta <= lookaheadSeconds
@@ -162,12 +165,12 @@ public enum CalendarSuggestionBuilder {
                 guard !event.attendees.isEmpty || hasLink else { return nil }
                 let source = source(forLinkText: linkText, code: code)
                 let attendees = event.attendees
-                    .filter { !selfExcludes || ($0.email ?? "").lowercased() != userEmailFolded }
                     .map { Attendee(name: $0.name, email: $0.email, source: .calendar) }
                 return MeetingSuggestion(
                     title: event.title, start: event.start, source: source,
                     meetingCode: code, attendees: attendees,
-                    end: event.end, eventIdentifier: event.eventIdentifier)
+                    end: event.end, eventIdentifier: event.eventIdentifier,
+                    joinedLinkText: linkText)
             }
             .sorted { ($0.start, $0.title) < ($1.start, $1.title) }
     }
@@ -244,6 +247,15 @@ public enum CalendarSuggestionBuilder {
             return .zoom
         } else if linkText.localizedCaseInsensitiveContains("teams.microsoft.com") {
             return .teams
+        } else if CaptureLinkClassifier.containsGenericLink(in: linkText) {
+            // An http(s) link on an unrecognized platform: still an online
+            // meeting. `.inPerson` is reserved for a genuinely link-free event.
+            return .online
+        } else if CaptureLinkClassifier.containsRecognizedLink(in: linkText) {
+            // A recognized platform with no branch above — a Slack huddle link,
+            // or a meet.google.com URL carrying no parseable code. Still an
+            // online meeting: a link-bearing event must never read `.inPerson`.
+            return .online
         } else {
             return .inPerson
         }

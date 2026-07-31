@@ -251,6 +251,9 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
     /// `awaitQuiescence` actually waits (the real encode is too fast to
     /// observe). Production always uses the default. C14: part-indexed.
     private let finalizer: @Sendable (MeetingPaths, MeetingID, Int) -> CaptureRecovery.FinalizeOutcome
+    private let captureFactsWriter: @Sendable (CaptureFacts, URL) throws -> Void
+    private var captureFactsWriteFailed = 0
+    private var pendingCaptureFacts: [MeetingID: CaptureFacts] = [:]
 
     /// G9 AC3 crash-test seam (G7 pattern): a hook run BETWEEN the part-close
     /// write and the status write inside the pause/resume single
@@ -273,6 +276,9 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         finalizer: @escaping @Sendable (MeetingPaths, MeetingID, Int) -> CaptureRecovery.FinalizeOutcome = {
             CaptureRecovery.finalizeTracks(paths: $0, meetingID: $1, part: $2)
         },
+        captureFactsWriter: @escaping @Sendable (CaptureFacts, URL) throws -> Void = {
+            try CaptureFacts.write($0, to: $1)
+        },
         transactionHook: (@Sendable () throws -> Void)? = nil,
         endFlipHook: (@Sendable () async -> Void)? = nil
     ) {
@@ -282,6 +288,7 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         self.now = now
         self.observer = observer
         self.finalizer = finalizer
+        self.captureFactsWriter = captureFactsWriter
         self.transactionHook = transactionHook
         self.endFlipHook = endFlipHook
     }
@@ -293,6 +300,10 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
     }
 
     public var isRecording: Bool { active != nil }
+
+    public func captureFactsWriteFailedCount() -> Int {
+        captureFactsWriteFailed
+    }
 
     /// Returns once no stop+encode is in flight. The quit intercept calls
     /// this so termination waits for ANY in-flight finalization — its own
@@ -360,6 +371,22 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         attendees: [Attendee] = [],
         anchor: CalendarAnchor? = nil
     ) async throws -> Meeting {
+        try await start(
+            source: source, title: title, meetingCode: meetingCode, attendees: attendees,
+            anchor: anchor,
+            captureFacts: CaptureFacts.derive(
+                source: source, meetingCode: meetingCode, sourceProvenance: .classified))
+    }
+
+    @discardableResult
+    public func start(
+        source: MeetingSource,
+        title: String? = nil,
+        meetingCode: String? = nil,
+        attendees: [Attendee] = [],
+        anchor: CalendarAnchor? = nil,
+        captureFacts: CaptureFacts
+    ) async throws -> Meeting {
         // The universal refusal predicate (H-2/M-9): (a) a LIVE session
         // exists, or (b) ANY meeting is durably `paused`. Grace-window and
         // finalize-in-flight meetings (status still `recording`, no live
@@ -407,6 +434,13 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         try await CaptureParts.insertPart(
             database, meetingID: meeting.id, partIndex: 1,
             startedAtMs: Int64(startedAt.timeIntervalSince1970 * 1000))
+        var captureFactsWritePending = false
+        do {
+            try captureFactsWriter(captureFacts, database.paths.captureFactsURL(meeting.id))
+        } catch {
+            captureFactsWritePending = true
+            logger.error("capture facts start write failed for \(meeting.id): \(error)")
+        }
 
         let startInfo: CaptureStartInfo
         do {
@@ -440,6 +474,9 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
             throw error
         }
 
+        if captureFactsWritePending {
+            pendingCaptureFacts[meeting.id] = captureFacts
+        }
         active = ActiveSession(meeting: meeting, partIndex: 1)
         emit(.started(meetingID: meeting.id, at: startedAt))
         if startInfo.micStreams == 0 {
@@ -577,6 +614,15 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         let outcome = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(returning: finalizer(paths, pausedID, partIndex))
+            }
+        }
+        if let captureFacts = pendingCaptureFacts.removeValue(forKey: meeting.id) {
+            do {
+                try captureFactsWriter(
+                    captureFacts, database.paths.captureFactsURL(meeting.id))
+            } catch {
+                captureFactsWriteFailed += 1
+                logger.error("capture facts stop retry failed for \(meeting.id): \(error)")
             }
         }
         if let note = outcome.recoveryNote {
@@ -931,6 +977,15 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         let outcome = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 continuation.resume(returning: finalizer(paths, stoppedID, partIndex))
+            }
+        }
+        if let captureFacts = pendingCaptureFacts.removeValue(forKey: meeting.id) {
+            do {
+                try captureFactsWriter(
+                    captureFacts, database.paths.captureFactsURL(meeting.id))
+            } catch {
+                captureFactsWriteFailed += 1
+                logger.error("capture facts stop retry failed for \(meeting.id): \(error)")
             }
         }
         if let note = outcome.recoveryNote {

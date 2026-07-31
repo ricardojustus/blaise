@@ -254,8 +254,10 @@ public enum SpeakerResolver {
         let allowedFolded = Set(eventNames.map { VocabNormalization.canonicalMode($0) })
 
         return segments.map { segment in
-            // The reserved mic track is immune (named at creation).
-            guard segment.speakerLabel != TranscriptSegment.userLabel else { return segment }
+            // Mic-origin segments are outside the system active-speaker timeline.
+            guard segment.speakerLabel != TranscriptSegment.userLabel,
+                !DiarizationLabel.isMicCluster(segment.speakerLabel)
+            else { return segment }
             let duration = segment.endSeconds - segment.startSeconds
             guard duration > 0 else { return segment }
 
@@ -345,7 +347,8 @@ extension SpeakerResolution {
         eventNames: Set<String>,
         userName: String,
         suppression: Set<String>,
-        commonNames: Set<String>
+        commonNames: Set<String>,
+        ownerIdentitySet: OwnerIdentitySet
     ) -> [TranscriptSegment] {
         let logger = Logger(subsystem: BlaiseBundle.identifier, category: "speaker.apply")
         let existingLabels = Set(segments.map(\.speakerLabel))
@@ -371,6 +374,10 @@ extension SpeakerResolution {
             // Rule 2: allowed-name.
             let folded = VocabNormalization.canonicalMode(name)
             if allowedFolded.contains(folded) {
+                if DiarizationLabel.isMicCluster(label), ownerIdentitySet.contains(name) {
+                    logger.info("dropped mapping \(label): mic owner identity requires an owner stamp")
+                    continue
+                }
                 validated[label] = name
                 continue
             }
@@ -381,6 +388,10 @@ extension SpeakerResolution {
                 !nameTokens.isEmpty && !blocked && longEnough
                 && segmentTokens.contains { Self.containsContiguous($0, nameTokens) }
             if verbatim {
+                if DiarizationLabel.isMicCluster(label), ownerIdentitySet.contains(name) {
+                    logger.info("dropped mapping \(label): mic owner identity requires an owner stamp")
+                    continue
+                }
                 validated[label] = name
             } else {
                 logger.info("dropped mapping \(label): name not allowed (not in sets, not transcript-verbatim)")

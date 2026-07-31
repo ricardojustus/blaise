@@ -173,6 +173,18 @@ public struct MeetingPaths: Sendable {
         meetingDirectory(meetingID).appendingPathComponent("diarization.json")
     }
 
+    public func captureFactsURL(_ meetingID: MeetingID) -> URL {
+        meetingDirectory(meetingID).appendingPathComponent("capture_facts.json")
+    }
+
+    public func roomTreatmentURL(_ meetingID: MeetingID) -> URL {
+        meetingDirectory(meetingID).appendingPathComponent("room_treatment.json")
+    }
+
+    public var voiceProfileDirectory: URL {
+        rootURL.appendingPathComponent("voice_profile", isDirectory: true)
+    }
+
     public func transcriptURL(_ meetingID: MeetingID) -> URL {
         meetingDirectory(meetingID).appendingPathComponent("transcript.json")
     }

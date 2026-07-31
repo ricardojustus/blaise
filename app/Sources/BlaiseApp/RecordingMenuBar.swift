@@ -198,7 +198,7 @@ final class CalendarSuggestionProvider {
 
     /// User-initiated (the menu's "Show Calendar Suggestions" action): the
     /// one place the EventKit prompt can fire.
-    func requestAccessAndLoad(userEmail: String) async {
+    func requestAccessAndLoad() async {
         let store = store ?? EKEventStore()
         self.store = store
         let granted = (try? await store.requestFullAccessToEvents()) ?? false
@@ -207,21 +207,19 @@ final class CalendarSuggestionProvider {
             // appleEnabled=false can't leave the just-granted source silent.
             if !appleEnabled { appleEnabled = true; persistApple() }
             refreshAppleCalendars()
-            await refresh(userEmail: userEmail)
+            await refresh()
         }
     }
 
     /// Refreshes the menu suggestions plus the main-window/menu upcoming rows.
     /// EventKit is read only when already granted; Google Calendar is read only
     /// when the user has connected and enabled it in Settings.
-    func refresh(
-        userEmail: String, recordedCodes: Set<String> = [], now: Date = Date()
-    ) async {
+    func refresh(recordedCodes: Set<String> = [], now: Date = Date()) async {
         let suggestionSnapshots = await eventSnapshots(
             from: now.addingTimeInterval(-CalendarSuggestionBuilder.lookbackSeconds),
             to: now.addingTimeInterval(CalendarSuggestionBuilder.lookaheadSeconds))
         suggestions = CalendarSuggestionBuilder.suggestions(
-            from: suggestionSnapshots, now: now, userEmail: userEmail)
+            from: suggestionSnapshots, now: now)
 
         let calendar = UpcomingMeetings.localCalendar
         let startOfDay = calendar.startOfDay(for: now)
@@ -229,8 +227,7 @@ final class CalendarSuggestionProvider {
             ?? now.addingTimeInterval(24 * 3600)
         let upcomingSnapshots = await eventSnapshots(from: startOfDay, to: endOfDay)
         upcomingRows = UpcomingMeetings.rows(
-            from: upcomingSnapshots, now: now, recordedCodes: recordedCodes,
-            userEmail: userEmail, calendar: calendar)
+            from: upcomingSnapshots, now: now, recordedCodes: recordedCodes, calendar: calendar)
     }
 
     /// Raw snapshots over an arbitrary window (C14 `PreMeetingScheduler`
@@ -598,13 +595,26 @@ struct RecordingMenuView: View {
 
         Menu {
             Button(clipboardCode.map { "Google Meet (\($0) from clipboard)" } ?? "Google Meet") {
-                Task { await appEnv.startRecording(source: .meet, meetingCode: clipboardCode) }
+                Task {
+                    await appEnv.startRecording(
+                        source: .meet, meetingCode: clipboardCode,
+                        sourceProvenance: .explicit)
+                }
             }
             .keyboardShortcut("r", modifiers: [.option, .command])
-            Button("Zoom") { Task { await appEnv.startRecording(source: .zoom) } }
-            Button("Teams") { Task { await appEnv.startRecording(source: .teams) } }
+            Button("Zoom") {
+                Task { await appEnv.startRecording(source: .zoom, sourceProvenance: .explicit) }
+            }
+            Button("Teams") {
+                Task { await appEnv.startRecording(source: .teams, sourceProvenance: .explicit) }
+            }
             Button("Slack") { Task { await appEnv.startSlackRecording() } }
-            Button("In Person") { Task { await appEnv.startRecording(source: .inPerson) } }
+            Button("In Person") {
+                Task {
+                    await appEnv.startRecording(
+                        source: .inPerson, sourceProvenance: .explicit)
+                }
+            }
         } label: {
             Label("Start Recording", systemImage: "record.circle")
                 .frame(maxWidth: .infinity)
@@ -648,7 +658,7 @@ struct RecordingMenuView: View {
             EmptyView()
         case .notDetermined:
             Button("Connect Apple Calendar…") {
-                Task { await calendar.requestAccessAndLoad(userEmail: appEnv.userEmail) }
+                Task { await calendar.requestAccessAndLoad() }
             }
             .buttonStyle(.plain)
             .font(.caption)

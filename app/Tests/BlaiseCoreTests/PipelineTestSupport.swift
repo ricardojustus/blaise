@@ -1,5 +1,6 @@
 import Foundation
 import Synchronization
+import Testing
 @testable import BlaiseCore
 
 // C7 unit-test support: configurable mock engines/diarizer for stage
@@ -171,8 +172,20 @@ final class PipelineMockASR: ASREngine, @unchecked Sendable {
 final class PipelineMockDiarizer: Diarizing, @unchecked Sendable {
     struct State {
         var output = PipelineMockData.diarization
+        var micOutput = DiarizationOutput(
+            segments: [
+                DiarizedSegment(
+                    speakerLabel: "M0", startSeconds: 0, endSeconds: 2.5)
+            ],
+            speakerCount: 1)
+        var systemCentroids: [String: [Float]] = [
+            "S0": [1, 0], "S1": [0.8, 0.2],
+        ]
+        var micCentroids: [String: [Float]] = ["M0": [0, 1]]
         var error: EngineError?
-        var attendeeCounts: [Int?] = []
+        var micError: EngineError?
+        var expectedSpeakerCounts: [Int?] = []
+        var namespacePrefixes: [String] = []
     }
 
     let state = Mutex(State())
@@ -180,11 +193,29 @@ final class PipelineMockDiarizer: Diarizing, @unchecked Sendable {
     func prepare() async throws {}
     func availability() async -> EngineAvailability { .available }
 
-    func diarize(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput {
+    func diarize(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput {
         try state.withLock { state in
-            state.attendeeCounts.append(attendeeCount)
+            state.expectedSpeakerCounts.append(expectedSpeakerCount)
+            state.namespacePrefixes.append("S")
             if let error = state.error { throw error }
             return state.output
+        }
+    }
+
+    func diarizeWithCentroids(
+        audioURL: URL, expectedSpeakerCount: Int?, namespacePrefix: String
+    ) async throws -> DiarizationResultWithCentroids {
+        try state.withLock { state in
+            state.expectedSpeakerCounts.append(expectedSpeakerCount)
+            state.namespacePrefixes.append(namespacePrefix)
+            if namespacePrefix == "M" {
+                if let error = state.micError { throw error }
+                return DiarizationResultWithCentroids(
+                    output: state.micOutput, centroids: state.micCentroids)
+            }
+            if let error = state.error { throw error }
+            return DiarizationResultWithCentroids(
+                output: state.output, centroids: state.systemCentroids)
         }
     }
 }
@@ -316,6 +347,7 @@ struct PipelineHarness {
     let pipeline: ProcessingPipeline
     let asr: PipelineMockASR
     let diarizer: PipelineMockDiarizer
+    let voiceProfileStore: VoiceProfileStore
     let notesPrimary: PipelineMockNotes
     let notesFallback: PipelineMockNotes
 
@@ -344,6 +376,25 @@ struct PipelineHarness {
                 arguments: [id]) ?? -1
         }
     }
+
+    func seedUsableVoiceProfile(embedding: [Float] = [1, 0]) async throws {
+        for (index, meetingID) in [
+            "01J00000000000000000000001",
+            "01J00000000000000000000002",
+        ].enumerated() {
+            let candidate = VoiceProfileCandidate(
+                meetingID: meetingID,
+                meetingDate: msDate(1_770_000_000 + Double(index)),
+                modelID: FluidAudioDiarizer.diarizerID,
+                embedding: embedding,
+                speechSeconds: 90,
+                language: "en")
+            let pending = try #require(await voiceProfileStore.pendingAppend())
+            _ = try await voiceProfileStore.append(
+                candidate, pending: pending, now: msDate())
+        }
+        #expect(await voiceProfileStore.runSnapshot() != nil)
+    }
 }
 
 func makePipelineHarness(
@@ -362,6 +413,7 @@ func makePipelineHarness(
     let database = try BlaiseDatabase(rootURL: dataRoot)
     let asr = PipelineMockASR()
     let diarizer = PipelineMockDiarizer()
+    let voiceProfileStore = VoiceProfileStore(paths: database.paths)
     let primary = PipelineMockNotes(
         id: "pipeline-mock-notes-primary", loadProfile: primaryLoadProfile)
     let fallback = PipelineMockNotes(
@@ -387,6 +439,7 @@ func makePipelineHarness(
             diarizer: diarizer,
             vocabularyProvider: vocabularyProvider,
             handoffKicker: kicker,
+            voiceProfileStore: voiceProfileStore,
             tempDirectory: tempDir,
             now: now,
             duringParticipantParkCommit: duringParticipantParkCommit,
@@ -398,6 +451,7 @@ func makePipelineHarness(
             diarizer: diarizer,
             vocabulary: try VocabFixtures.pipelineVocabulary(),
             handoffKicker: kicker,
+            voiceProfileStore: voiceProfileStore,
             tempDirectory: tempDir,
             now: now,
             duringParticipantParkCommit: duringParticipantParkCommit,
@@ -405,7 +459,8 @@ func makePipelineHarness(
     }
     return PipelineHarness(
         dataRoot: dataRoot, tempDir: tempDir, database: database, pipeline: pipeline,
-        asr: asr, diarizer: diarizer, notesPrimary: primary, notesFallback: fallback)
+        asr: asr, diarizer: diarizer, voiceProfileStore: voiceProfileStore,
+        notesPrimary: primary, notesFallback: fallback)
 }
 
 extension PipelineError {

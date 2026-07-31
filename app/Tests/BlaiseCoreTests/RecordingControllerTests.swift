@@ -81,19 +81,124 @@ private struct ControllerHarness {
     let kicks: Recorder<MeetingID>
 }
 
-private func makeControllerHarness() throws -> ControllerHarness {
+private func makeControllerHarness(
+    captureFactsWriter: @escaping @Sendable (CaptureFacts, URL) throws -> Void = {
+        try CaptureFacts.write($0, to: $1)
+    }
+) throws -> ControllerHarness {
     let database = try makeDatabase()
     let engine = MockCaptureEngine()
     let kicks = Recorder<MeetingID>()
     let controller = RecordingController(
         database: database, engine: engine,
         processKicker: { kicks.append($0) },
-        now: { msDate() })
+        now: { msDate() },
+        captureFactsWriter: captureFactsWriter)
     return ControllerHarness(database: database, engine: engine, controller: controller, kicks: kicks)
 }
 
 @Suite("C11 recording controller")
 struct RecordingControllerTests {
+    private struct FactsWriteFailure: Error {}
+
+    @Test("capture facts write at start preserves an explicit source pick")
+    func captureFactsWrittenAtStart() async throws {
+        let harness = try makeControllerHarness()
+        let expected = CaptureFacts(
+            sourceProvenance: .explicit, linkClass: .none)
+        let meeting = try await harness.controller.start(
+            source: .inPerson, captureFacts: expected)
+
+        let data = try Data(contentsOf: harness.database.paths.captureFactsURL(meeting.id))
+        #expect(try JSONDecoder().decode(CaptureFacts.self, from: data) == expected)
+    }
+
+    @Test("capture facts start failure retries at stop without blocking capture")
+    func captureFactsRetryAtStop() async throws {
+        let attempts = Mutex(0)
+        let harness = try makeControllerHarness { facts, url in
+            let attempt = attempts.withLock {
+                $0 += 1
+                return $0
+            }
+            if attempt == 1 { throw FactsWriteFailure() }
+            try CaptureFacts.write(facts, to: url)
+        }
+        let meeting = try await harness.controller.start(source: .meet)
+        #expect(!FileManager.default.fileExists(
+            atPath: harness.database.paths.captureFactsURL(meeting.id).path))
+
+        _ = try await harness.controller.stop()
+
+        #expect(attempts.withLock { $0 } == 2)
+        #expect(FileManager.default.fileExists(
+            atPath: harness.database.paths.captureFactsURL(meeting.id).path))
+        #expect(await harness.controller.captureFactsWriteFailedCount() == 0)
+    }
+
+    @Test("capture facts start failure retries at pause after tracks land")
+    func captureFactsRetryAtPause() async throws {
+        let attempts = Mutex(0)
+        let harness = try makeControllerHarness { facts, url in
+            let attempt = attempts.withLock {
+                $0 += 1
+                return $0
+            }
+            if attempt == 1 { throw FactsWriteFailure() }
+            try CaptureFacts.write(facts, to: url)
+        }
+        let expected = CaptureFacts(
+            sourceProvenance: .explicit, linkClass: .none)
+        let meeting = try await harness.controller.start(
+            source: .inPerson, captureFacts: expected)
+
+        _ = try await harness.controller.pause()
+
+        let factsURL = harness.database.paths.captureFactsURL(meeting.id)
+        #expect(FileManager.default.fileExists(atPath: factsURL.path))
+        let data = try Data(contentsOf: factsURL)
+        #expect(try JSONDecoder().decode(CaptureFacts.self, from: data) == expected)
+        #expect(await harness.controller.captureFactsWriteFailedCount() == 0)
+    }
+
+    @Test("capture facts pause retry failure is counted once and end still processes")
+    func captureFactsTerminalFailureAtPause() async throws {
+        let attempts = Mutex(0)
+        let harness = try makeControllerHarness { _, _ in
+            attempts.withLock { $0 += 1 }
+            throw FactsWriteFailure()
+        }
+        let meeting = try await harness.controller.start(
+            source: .inPerson,
+            captureFacts: CaptureFacts(
+                sourceProvenance: .explicit, linkClass: .none))
+
+        _ = try await harness.controller.pause()
+        let ended = try await harness.controller.endPaused(meetingID: meeting.id)
+
+        #expect(await harness.controller.captureFactsWriteFailedCount() == 1)
+        #expect(attempts.withLock { $0 } == 2)
+        #expect(ended.id == meeting.id)
+        #expect(ended.status == .processing)
+        let stored = try #require(
+            try await MeetingRepository(database: harness.database).fetch(meeting.id))
+        #expect(stored.status == .processing)
+    }
+
+    @Test("both capture facts writes failing are counted and recording still completes")
+    func captureFactsTerminalFailure() async throws {
+        let harness = try makeControllerHarness { _, _ in throw FactsWriteFailure() }
+        let meeting = try await harness.controller.start(
+            source: .inPerson,
+            captureFacts: CaptureFacts(sourceProvenance: .explicit, linkClass: .none))
+        let stopped = try await harness.controller.stop()
+
+        #expect(await harness.controller.captureFactsWriteFailedCount() == 1)
+        #expect(stopped.id == meeting.id)
+        #expect(stopped.endedAt != nil)
+        #expect(harness.engine.state.withLock { $0.stopCalls } == 1)
+    }
+
     @Test("start: Meeting row (source, code, recording status) + live session registered")
     func start() async throws {
         let harness = try makeControllerHarness()
@@ -111,6 +216,11 @@ struct RecordingControllerTests {
         #expect(stored.startedAt == msDate())
         #expect(stored.endedAt == nil)
         #expect(stored.attendees.map(\.name) == ["Fábio Souza"])
+        let factsData = try Data(
+            contentsOf: harness.database.paths.captureFactsURL(meeting.id))
+        let facts = try JSONDecoder().decode(CaptureFacts.self, from: factsData)
+        #expect(facts.sourceProvenance == .classified)
+        #expect(facts.linkClass == .recognized)
 
         // The C10 seam, live: the listener's live-correlation case activates.
         let session = try #require(await harness.controller.currentSession())

@@ -13,7 +13,53 @@ import os
 public protocol Diarizing: Sendable {
     func prepare() async throws
     func availability() async -> EngineAvailability
-    func diarize(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput
+    /// `expectedSpeakerCount` is the caller's best POINT ESTIMATE of distinct
+    /// speakers audible in THIS audio track (nil = unknown). Callers own the
+    /// track topology: a captured system track excludes the user (= remote
+    /// attendee count); a file-first mixed track includes them (= attendees
+    /// + 1). Never pad the estimate — the offline clusterer saturates its
+    /// ceiling on meeting-platform audio, so every unit of slack becomes a
+    /// fabricated speaker (C4 v5.5, measured on three 1:1 field recordings).
+    func diarize(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput
+    func diarizeWithCentroids(
+        audioURL: URL, expectedSpeakerCount: Int?, namespacePrefix: String
+    ) async throws -> DiarizationResultWithCentroids
+}
+
+public extension Diarizing {
+    func diarizeWithCentroids(
+        audioURL: URL, expectedSpeakerCount: Int?, namespacePrefix: String = "S"
+    ) async throws -> DiarizationResultWithCentroids {
+        let output = try await diarize(
+            audioURL: audioURL, expectedSpeakerCount: expectedSpeakerCount)
+        var labels: [String: String] = [:]
+        let segments = output.segments.map { segment in
+            let normalized = labels[segment.speakerLabel] ?? {
+                let value = "\(namespacePrefix)\(labels.count)"
+                labels[segment.speakerLabel] = value
+                return value
+            }()
+            return DiarizedSegment(
+                speakerLabel: normalized,
+                startSeconds: segment.startSeconds,
+                endSeconds: segment.endSeconds)
+        }
+        return DiarizationResultWithCentroids(
+            output: DiarizationOutput(segments: segments, speakerCount: labels.count),
+            centroids: [:])
+    }
+}
+
+/// Runtime-only adapter result. Centroids deliberately have no Codable
+/// conformance so they cannot drift into pipeline evidence surfaces.
+public struct DiarizationResultWithCentroids: Sendable, Equatable {
+    public let output: DiarizationOutput
+    public let centroids: [String: [Float]]
+
+    public init(output: DiarizationOutput, centroids: [String: [Float]]) {
+        self.output = output
+        self.centroids = centroids
+    }
 }
 
 public struct DiarizationOutput: Codable, Sendable, Equatable {
@@ -33,9 +79,8 @@ public struct DiarizationOutput: Codable, Sendable, Equatable {
 }
 
 public struct DiarizedSegment: Codable, Sendable, Equatable {
-    /// Normalized to `"S<n>"` (n = 0-based cluster index in first-appearance
-    /// order) by the `Diarizing` implementation, whatever the library's
-    /// native labels.
+    /// Normalized to the caller's `<prefix><n>` namespace (n = 0-based cluster
+    /// index in first-appearance order), whatever the library's native labels.
     public let speakerLabel: String
     public let startSeconds: Double
     public let endSeconds: Double
@@ -151,8 +196,22 @@ public actor FluidAudioDiarizer: Diarizing {
         try await chain.run { try await self.prepareBody() }
     }
 
-    public func diarize(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput {
-        try await chain.run { try await self.diarizeBody(audioURL: audioURL, attendeeCount: attendeeCount) }
+    public func diarize(audioURL: URL, expectedSpeakerCount: Int?) async throws -> DiarizationOutput {
+        try await chain.run {
+            try await self.diarizeBody(
+                audioURL: audioURL, expectedSpeakerCount: expectedSpeakerCount,
+                namespacePrefix: "S").output
+        }
+    }
+
+    public func diarizeWithCentroids(
+        audioURL: URL, expectedSpeakerCount: Int?, namespacePrefix: String = "S"
+    ) async throws -> DiarizationResultWithCentroids {
+        try await chain.run {
+            try await self.diarizeBody(
+                audioURL: audioURL, expectedSpeakerCount: expectedSpeakerCount,
+                namespacePrefix: namespacePrefix)
+        }
     }
 
     // MARK: - Bodies (un-chained; diarizeBody calls prepareBody directly,
@@ -202,7 +261,9 @@ public actor FluidAudioDiarizer: Diarizing {
         }
     }
 
-    private func diarizeBody(audioURL: URL, attendeeCount: Int?) async throws -> DiarizationOutput {
+    private func diarizeBody(
+        audioURL: URL, expectedSpeakerCount: Int?, namespacePrefix: String
+    ) async throws -> DiarizationResultWithCentroids {
         if Task.isCancelled { throw EngineError.cancelled }
         try await prepareBody()
         guard case .real(let models) = models else {
@@ -217,15 +278,14 @@ public actor FluidAudioDiarizer: Diarizing {
         }
         let audioDuration = wavInfo.duration
 
-        // Speaker-count constraint when the attendee count is known: pyannote
-        // semantics, never `exactly` (the count is a hint, not ground truth).
         var config = OfflineDiarizerConfig.default
-        if let attendeeCount {
-            config = config.withSpeakers(min: 1, max: attendeeCount + 1)
+        if let bounds = Self.clusteringBounds(expectedSpeakerCount: expectedSpeakerCount) {
+            config = config.withSpeakers(min: bounds.min, max: bounds.max)
         }
 
         if Task.isCancelled { throw EngineError.cancelled }
         let raw: [(speakerLabel: String, startSeconds: Double, endSeconds: Double)]
+        let centroids: [String: [Float]]
         do {
             let manager = OfflineDiarizerManager(config: config)
             manager.initialize(models: models)
@@ -233,6 +293,7 @@ public actor FluidAudioDiarizer: Diarizing {
             raw = result.segments.map {
                 ($0.speakerId, Double($0.startTimeSeconds), Double($0.endTimeSeconds))
             }
+            centroids = result.speakerDatabase ?? [:]
         } catch is CancellationError {
             throw EngineError.cancelled
         } catch OfflineDiarizationError.noSpeechDetected {
@@ -243,17 +304,36 @@ public actor FluidAudioDiarizer: Diarizing {
             // captured-meeting merge proceed honestly. (Found by the user's
             // an early touchpoint recording.)
             logger.info("diarization: no speech in track — 0 segments, 0 speakers (valid silence)")
-            return DiarizationOutput(segments: [], speakerCount: 0)
+            return DiarizationResultWithCentroids(
+                output: DiarizationOutput(segments: [], speakerCount: 0), centroids: [:])
         } catch {
             if Task.isCancelled { throw EngineError.cancelled }
             throw EngineError.transient("diarization failed: \(error)")
         }
         if Task.isCancelled { throw EngineError.cancelled }
 
-        let output = Self.normalizedOutput(raw, audioDuration: audioDuration)
+        let result = Self.normalizedResult(
+            raw, centroids: centroids, audioDuration: audioDuration,
+            namespacePrefix: namespacePrefix)
         logger.info(
-            "diarization: \(output.segments.count)/\(raw.count) segments, \(output.speakerCount) speakers")
-        return output
+            "diarization[\(namespacePrefix, privacy: .public)]: \(result.output.segments.count)/\(raw.count) segments, \(result.output.speakerCount) speakers, expected \(expectedSpeakerCount.map(String.init) ?? "nil", privacy: .public)")
+        return result
+    }
+
+    // MARK: - Clustering bounds decision (C4 v5.5)
+
+    /// Speaker bounds for the clusterer when the caller has a count estimate.
+    /// `max` = the estimate EXACTLY, no padding: FluidAudio's offline path
+    /// re-partitions with K-Means whenever VBx's detected count leaves the
+    /// bounds, and on meeting-platform system audio it saturates the ceiling
+    /// every run — measured on three field 1:1s, `max: 2` split the single
+    /// remote speaker into two balanced phantom clusters on every run while
+    /// `max: 1` was correct on every run (the old attendee-count-plus-one
+    /// rule was this bug). `min` stays 1: a silent invitee is common, and an
+    /// inflated floor would fabricate speakers the same way.
+    static func clusteringBounds(expectedSpeakerCount: Int?) -> (min: Int, max: Int)? {
+        guard let expectedSpeakerCount, expectedSpeakerCount >= 1 else { return nil }
+        return (min: 1, max: expectedSpeakerCount)
     }
 
     // MARK: - Output post-processing (C4-owned)
@@ -267,6 +347,17 @@ public actor FluidAudioDiarizer: Diarizing {
         _ raw: [(speakerLabel: String, startSeconds: Double, endSeconds: Double)],
         audioDuration: Double
     ) -> DiarizationOutput {
+        normalizedResult(
+            raw, centroids: [:], audioDuration: audioDuration,
+            namespacePrefix: "S").output
+    }
+
+    static func normalizedResult(
+        _ raw: [(speakerLabel: String, startSeconds: Double, endSeconds: Double)],
+        centroids: [String: [Float]],
+        audioDuration: Double,
+        namespacePrefix: String
+    ) -> DiarizationResultWithCentroids {
         let sorted = raw.sorted {
             ($0.startSeconds, $0.endSeconds, $0.speakerLabel)
                 < ($1.startSeconds, $1.endSeconds, $1.speakerLabel)
@@ -285,13 +376,19 @@ public actor FluidAudioDiarizer: Diarizing {
             if let existing = labelMap[segment.label] {
                 normalized = existing
             } else {
-                normalized = "S\(labelMap.count)"
+                normalized = "\(namespacePrefix)\(labelMap.count)"
                 labelMap[segment.label] = normalized
             }
             segments.append(
                 DiarizedSegment(
                     speakerLabel: normalized, startSeconds: segment.start, endSeconds: segment.end))
         }
-        return DiarizationOutput(segments: segments, speakerCount: labelMap.count)
+        let normalizedCentroids = Dictionary(
+            uniqueKeysWithValues: labelMap.compactMap { native, normalized in
+                centroids[native].map { (normalized, $0) }
+            })
+        return DiarizationResultWithCentroids(
+            output: DiarizationOutput(segments: segments, speakerCount: labelMap.count),
+            centroids: normalizedCentroids)
     }
 }

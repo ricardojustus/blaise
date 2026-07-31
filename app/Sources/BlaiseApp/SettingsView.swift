@@ -212,8 +212,7 @@ struct AutomationTab: View {
                     LabeledContent("Apple Calendar") {
                         Button("Enable") {
                             Task {
-                                await appEnv.calendarSuggestions.requestAccessAndLoad(
-                                    userEmail: appEnv.userEmail)
+                                await appEnv.calendarSuggestions.requestAccessAndLoad()
                                 await appEnv.calendarSourcesChanged()
                             }
                         }
@@ -708,6 +707,12 @@ struct IdentityHandoffTab: View {
     @State private var queue: QueuePanelModel?
     @State private var processing: ProcessingQueueModel?
     @State private var revealedSecret: String?
+    @State private var voiceIdentificationEnabled = VoiceIdentificationSettings.defaultEnabled
+    @State private var voicePrintStatus = ""
+    @State private var voiceSettingsLoaded = false
+    /// The last flip's task: each flip awaits it before persisting and applying,
+    /// so two rapid flips commit in the order the user made them.
+    @State private var voiceFlipTask: Task<Void, Never>?
 
     var body: some View {
         Form {
@@ -725,6 +730,7 @@ struct IdentityHandoffTab: View {
                 // not wait for a relaunch.
                 IdentitySection(model: identity, onSaved: { appEnv.applyOnboardedIdentity() })
             }
+            voicePrintSection
             extensionSecretSection
             if let handoff {
                 HandoffSection(model: handoff)
@@ -756,7 +762,46 @@ struct IdentityHandoffTab: View {
                 await processingModel.refresh()
                 processing = processingModel
             }
+            if !voiceSettingsLoaded {
+                voiceIdentificationEnabled = await VoiceIdentificationSettings.isEnabled(
+                    in: appEnv.settings)
+                await refreshVoicePrintStatus()
+                voiceSettingsLoaded = true
+            }
         }
+    }
+
+    private var voicePrintSection: some View {
+        Section("Voice Print") {
+            if voiceSettingsLoaded {
+                Toggle("Voice identification", isOn: $voiceIdentificationEnabled)
+                    .onChange(of: voiceIdentificationEnabled) { _, newValue in
+                        // The load itself assigns the toggle; only a user flip writes.
+                        guard voiceSettingsLoaded else { return }
+                        let previousFlip = voiceFlipTask
+                        voiceFlipTask = Task {
+                            await previousFlip?.value
+                            await VoiceIdentificationSettings.flip(
+                                enabled: newValue, in: appEnv.settings,
+                                applyingTo: appEnv.voiceProfileStore)
+                            await refreshVoicePrintStatus()
+                        }
+                    }
+            }
+            Text(voicePrintStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(
+                "Blaise learns your voice from your own recordings, so it can tell your speech from someone else's when a meeting is recorded through your microphone. Turning this off deletes the voice print."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private func refreshVoicePrintStatus() async {
+        voicePrintStatus = VoiceIdentificationSettings.statusText(
+            await appEnv.voiceProfileStore.status())
     }
 
     private var extensionSecretSection: some View {

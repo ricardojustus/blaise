@@ -4,7 +4,10 @@ import Testing
 
 // Regression pin (retargeted to the CC-BY ICSI Bmr001 5-minute excerpt):
 // - Tier 1 (always-on, no models): committed inputs → normalizer → merge →
-//   correct → languageStats in-process → BYTE-compare vs the intermediate pin.
+//   correct → languageStats → name resolution in-process → BYTE-compare vs
+//   BOTH committed pins (intermediate: post-correct segments; final: dominant
+//   language + ASR provenance + the named segments, whose naming is a no-op
+//   for this event-less file-first fixture — which is what the pin holds).
 //   Skips cleanly until the ICSI pins are minted (pinsExist() guard).
 // - Tier 2 LIGHT (gated BLAISE_TEST_FULL_SAMPLE=1): an AUDIO SMOKE — import the
 //   committed ICSI wav, run the full pipeline, assert structural transcript
@@ -49,6 +52,63 @@ import Testing
             }
             previous = bytes
         }
+    }
+
+    @Test func tier1ByteStableAgainstFinalPin() throws {
+        guard RegressionPin.pinsExist() else {
+            recordTestSkip(
+                "tier1ByteStableAgainstFinalPin",
+                reason: "ICSI regression pins not yet minted (fixtures/icsi_sample/*.json absent)")
+            return
+        }
+        let manifest = try PinManifest.load()
+        let envelope = try RawASREnvelope.load(from: RegressionPin.rawASRURL)
+        let diarization = try JSONDecoder().decode(
+            DiarizationOutput.self, from: Data(contentsOf: RegressionPin.diarizationURL))
+        let vocabulary = try VocabFixtures.pipelineVocabulary()
+
+        let (tier1Segments, dominantLanguage) = Tier1Chain.run(
+            envelope: envelope,
+            diarization: diarization,
+            audioDuration: manifest.audio.duration,
+            vocabulary: vocabulary)
+
+        // Stage 8 (resolveSpeakers), applied exactly as the pipeline applies
+        // it. The fixture is a file-first import: no stored active-speaker
+        // events, so there is no timeline — and no recording start to place
+        // one against. "Sam Rivera" is the user identity the mint ran under.
+        let hints = SpeakerHints(activeSpeakerEvents: nil, recordingStartEpochMillis: nil)
+        var segments = SpeakerResolver.resolve(
+            diarization: diarization.segments,
+            hints: hints,
+            audioDuration: manifest.audio.duration
+        ).apply(
+            to: tier1Segments,
+            attendeeNames: Set(RegressionPin.fabricatedAttendees.map(\.name)),
+            eventNames: [],
+            userName: "Sam Rivera",
+            suppression: vocabulary.suppression,
+            commonNames: vocabulary.commonNames,
+            ownerIdentitySet: .empty)
+        segments = SpeakerResolver.refineWithPerSegmentTimeline(
+            segments: segments,
+            diarization: diarization.segments,
+            hints: hints,
+            audioDuration: manifest.audio.duration,
+            eventNames: [])
+        #expect(segments.count == manifest.finalSegmentCount)
+
+        let reproduced = PinnedTranscript(
+            dominantLanguage: dominantLanguage,
+            asrProvenance: envelope.provenance,
+            segments: segments.map(PinnedSegment.init))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let pinned = try decoder.decode(
+            PinnedTranscript.self, from: Data(contentsOf: RegressionPin.finalURL))
+        let reproducedBytes = try pinBytes(reproduced)
+        let pinnedBytes = try pinBytes(pinned)
+        #expect(reproducedBytes == pinnedBytes, "final transcript diverged from the pin — a deterministic stage changed, or file-first naming stopped being a no-op; fix it or bump PipelineVersion and re-mint deliberately")
     }
 
     @Test func pipelineVersionFormat() {

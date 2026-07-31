@@ -16,14 +16,17 @@ extension PipelineHarness {
         status: MeetingStatus = .failed,
         attendees: [Attendee] = [Attendee(name: "Sam", email: "sam.rivera@vexatron.test", source: .manual)],
         processingNote: String? = nil,
-        captured: Bool = false
+        captured: Bool = false,
+        source: MeetingSource = .meet,
+        captureFacts: CaptureFacts? = nil,
+        encodeTracks: Bool = true
     ) async throws -> Meeting {
         let meeting = Meeting(
             id: ULID.generate(),
             title: "Reunião capturada",
             startedAt: msDate(),
             endedAt: msDate(1_770_000_120),
-            source: .meet,
+            source: source,
             status: status,
             attendees: attendees,
             processingNote: processingNote,
@@ -32,12 +35,22 @@ extension PipelineHarness {
             updatedAt: msDate())
         try database.paths.createMeetingDirectory(meeting.id)
         try await MeetingRepository(database: database).create(meeting)
+        if let captureFacts {
+            try CaptureFacts.write(
+                captureFacts, to: database.paths.captureFactsURL(meeting.id))
+        }
         for track in tracks {
-            let wav = dataRoot.appendingPathComponent("track-\(UUID().uuidString).wav")
-            try writeTestWAV(to: wav)
-            try AudioTranscoder.encodeToM4A(
-                wav: wav, destination: track.retainedURL(database.paths, meetingID: meeting.id))
-            try FileManager.default.removeItem(at: wav)
+            let destination = track.retainedURL(database.paths, meetingID: meeting.id)
+            if encodeTracks {
+                let wav = dataRoot.appendingPathComponent("track-\(UUID().uuidString).wav")
+                try writeTestWAV(to: wav)
+                try AudioTranscoder.encodeToM4A(wav: wav, destination: destination)
+                try FileManager.default.removeItem(at: wav)
+            } else {
+                // New room-treatment tests can bypass the platform encoder
+                // while still exercising AVAudioFile's retained-track decode.
+                try writeTestWAV(to: destination)
+            }
         }
         return meeting
     }
@@ -234,14 +247,15 @@ struct ProcessCapturedTests {
         #expect(again.capturedTracks == ["system"])
     }
 
-    @Test("mic-only survivor: transcript proceeds from the mic track; no diarization")
+    @Test("mic-only survivor: transcript proceeds from the mic track with room evidence")
     func micOnlySurvivor() async throws {
         let harness = try await makePipelineHarness()
         let meeting = try await harness.plantCapturedMeeting(tracks: [.mic])
 
         let record = try await harness.pipeline.processCaptured(meetingID: meeting.id)
         #expect(record.capturedTracks == ["mic"])
-        #expect(harness.diarizer.state.withLock { $0.attendeeCounts }.isEmpty)
+        #expect(harness.diarizer.state.withLock { $0.expectedSpeakerCounts } == [nil])
+        #expect(harness.diarizer.state.withLock { $0.namespacePrefixes } == ["M"])
 
         let segments = try await harness.segments(meeting.id)
         #expect(!segments.isEmpty)
@@ -367,6 +381,72 @@ struct ProcessCapturedTests {
         #expect(try await harness.database.count("meeting_speaker_event") == 3)
     }
 
+    @Test("C4 v5.5 + user-implicit counting: system track forwards the others-count, file-first forwards others + 1, no-others forwards nil")
+    func expectedSpeakerCountTopology() async throws {
+        let harness = try await makePipelineHarness()
+        func counts() -> [Int?] { harness.diarizer.state.withLock { $0.expectedSpeakerCounts } }
+        // Others-only list (`.manual`, as the participant sheet collects it):
+        // the user is NOT in it.
+        let manualPair = [
+            Attendee(name: "Marco Vidal", email: nil, source: .manual),
+            Attendee(name: "Anna Reyes", email: nil, source: .manual),
+        ]
+        // Calendar list, stored literal: the user IS in it (his calendars
+        // invite him), so the counting rule subtracts exactly one.
+        let calendarTrio = [
+            Attendee(name: "Sam Rivera", email: "sam.rivera@vexatron.test", source: .calendar),
+            Attendee(name: "Marco Vidal", email: nil, source: .calendar),
+            Attendee(name: "Anna Reyes", email: nil, source: .calendar),
+        ]
+        // Mixed: one subtraction total, not one per calendar row.
+        let mixedTrio = [
+            Attendee(name: "Sam Rivera", email: "sam.rivera@vexatron.test", source: .calendar),
+            Attendee(name: "Marco Vidal", email: nil, source: .calendar),
+            Attendee(name: "Dana Okonkwo", email: nil, source: .manual),
+        ]
+
+        // Captured, manual list of N: only the system track is diarized and the
+        // user is on the mic track → the estimate is N.
+        let capturedManual = try await harness.plantCapturedMeeting(
+            tracks: [.system, .mic], attendees: manualPair)
+        _ = try await harness.pipeline.processCaptured(meetingID: capturedManual.id)
+        #expect(counts() == [2, nil])
+
+        // File-first, manual list of N: the user speaks in the mixed track → N + 1.
+        let importedManual = try await harness.importTestMeeting(attendees: manualPair)
+        _ = try await harness.pipeline.process(meetingID: importedManual.id)
+        #expect(counts() == [2, nil, 3])
+
+        // Captured, calendar list of N → N − 1.
+        let capturedCalendar = try await harness.plantCapturedMeeting(
+            tracks: [.system, .mic], attendees: calendarTrio)
+        _ = try await harness.pipeline.processCaptured(meetingID: capturedCalendar.id)
+        #expect(counts() == [2, nil, 3, 2, nil])
+
+        // File-first, calendar list of N → (N − 1) + 1 = N.
+        let importedCalendar = try await harness.importTestMeeting(attendees: calendarTrio)
+        _ = try await harness.pipeline.process(meetingID: importedCalendar.id)
+        #expect(counts() == [2, nil, 3, 2, nil, 3])
+
+        // Captured, mixed list of N (calendar + manual) → exactly one subtracted.
+        let capturedMixed = try await harness.plantCapturedMeeting(
+            tracks: [.system, .mic], attendees: mixedTrio)
+        _ = try await harness.pipeline.processCaptured(meetingID: capturedMixed.id)
+        #expect(counts() == [2, nil, 3, 2, nil, 3, 2, nil])
+
+        // No attendee knowledge → no constraint (nil), never a guessed bound.
+        let unknown = try await harness.plantCapturedMeeting(
+            tracks: [.system, .mic], attendees: [])
+        _ = try await harness.pipeline.processCaptured(meetingID: unknown.id)
+        #expect(counts() == [2, nil, 3, 2, nil, 3, 2, nil, nil, nil])
+
+        // …and the same on the file-first path: an empty list forwards nil, it
+        // never becomes a bound of 1.
+        let importedEmpty = try await harness.importTestMeeting(attendees: [])
+        _ = try await harness.pipeline.process(meetingID: importedEmpty.id)
+        #expect(counts() == [2, nil, 3, 2, nil, 3, 2, nil, nil, nil, nil])
+    }
+
     @Test("file-first process() is untouched: no capturedTracks, single ASR pass")
     func fileFirstUntouched() async throws {
         let harness = try await makePipelineHarness()
@@ -408,7 +488,8 @@ struct ApplyRuleZeroTests {
             eventNames: [],
             userName: "Sam",
             suppression: suppression,
-            commonNames: commonNames)
+            commonNames: commonNames,
+            ownerIdentitySet: .empty)
         #expect(result[0].speakerName == "Sam")  // immune
         #expect(result[1].speakerName == "Fábio Souza")  // normal path intact
     }

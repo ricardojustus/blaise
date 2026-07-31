@@ -40,10 +40,7 @@ private func makeRealDiarizer() async throws -> FluidAudioDiarizer {
         // An in-person recording has a legitimately SILENT system track
         // (everyone is on the mic track). FluidAudio throws
         // noSpeechDetected on it; the diarizer must map that to an empty
-        // output, not a stage failure. Found by an early touchpoint
-        // recording (2026-06-10): the meeting failed "diarize: diarization
-        // failed: noSpeechDetected" with the user's speech fully
-        // transcribed on the mic track.
+        // output, not a stage failure.
         let silent = FileManager.default.temporaryDirectory
             .appendingPathComponent("silent-\(UUID().uuidString).wav")
         let sampleRate = 16_000
@@ -62,7 +59,7 @@ private func makeRealDiarizer() async throws -> FluidAudioDiarizer {
 
         let diarizer = try await makeRealDiarizer()
         try await diarizer.prepare()
-        let output = try await diarizer.diarize(audioURL: silent, attendeeCount: nil)
+        let output = try await diarizer.diarize(audioURL: silent, expectedSpeakerCount: nil)
         #expect(output.segments.isEmpty)
         #expect(output.speakerCount == 0)
     }
@@ -90,7 +87,7 @@ private func makeRealDiarizer() async throws -> FluidAudioDiarizer {
             FluidAudioDiarizer.modelsPresent(
                 at: fluidAudioModelsParent.appendingPathComponent(
                     FluidAudioDiarizer.repoFolderName, isDirectory: true)))
-        let output = try await diarizer.diarize(audioURL: icsiClip, attendeeCount: nil)
+        let output = try await diarizer.diarize(audioURL: icsiClip, expectedSpeakerCount: nil)
         let elapsed = Date().timeIntervalSince(prepared)
         print(
             "[integration] diarizer icsi: \(output.segments.count) segments, \(output.speakerCount) speakers; prepare \(String(format: "%.1f", prepared.timeIntervalSince(started))) s, diarize \(String(format: "%.1f", elapsed)) s"
@@ -175,7 +172,7 @@ private func makeRealDiarizer() async throws -> FluidAudioDiarizer {
 
         let diarizer = try await makeRealDiarizer()
         let diarStart = Date()
-        let diarization = try await diarizer.diarize(audioURL: icsiClip, attendeeCount: nil)
+        let diarization = try await diarizer.diarize(audioURL: icsiClip, expectedSpeakerCount: nil)
         let diarElapsed = Date().timeIntervalSince(diarStart)
 
         let merged = SpeakerMerger.merge(

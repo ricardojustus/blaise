@@ -870,14 +870,22 @@ public enum NameSubstitution {
     /// replaced by the mapped name. A label with no entry is left for layer 2.
     /// Sibling to `apply`/`applyNoteCorrection`; operates field-by-field,
     /// right-to-left within a field so earlier ranges stay valid.
+    ///
+    /// `groundedMLabels` is the detector's M-namespace grounding: an M label is
+    /// only a label when the meeting's persisted segments carry that cluster, so
+    /// this layer must be given the same set the caller filtered `labelMap` with
+    /// — otherwise a named live M label is invisible here AND excluded from
+    /// layer 2, and reaches the reader raw.
     public static func applyLabelSubstitution(
-        notes: NotesStructured, labelMap: [String: String]
+        notes: NotesStructured, labelMap: [String: String],
+        groundedMLabels: Set<String> = []
     ) -> NotesStructured {
         guard !labelMap.isEmpty else { return notes }
         var out = notes
 
         func substitute(_ value: String) -> String {
-            let ranges = SLabelNeutralizer.labelRanges(in: value)
+            let ranges = SLabelNeutralizer.labelRanges(
+                in: value, groundedMLabels: groundedMLabels)
             guard !ranges.isEmpty else { return value }
             var result = value
             for range in ranges.reversed() {

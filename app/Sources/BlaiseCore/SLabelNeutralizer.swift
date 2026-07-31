@@ -45,17 +45,25 @@ public enum SLabelNeutralizer {
     /// selects Portuguese descriptors, anything else English (matching the
     /// renderer's dominant-language rule).
     public static func neutralize(
-        notes: NotesStructured, labelMap: [String: String], language: String = "en"
+        notes: NotesStructured, labelMap: [String: String], language: String = "en",
+        groundedMLabels: Set<String> = []
     ) -> (notes: NotesStructured, residuals: [Residual]) {
+        let groundedMLabels = Set(groundedMLabels.filter(DiarizationLabel.isMicCluster))
+        let effectiveLabelMap = labelMap.filter {
+            !DiarizationLabel.isMicCluster($0.key) || groundedMLabels.contains($0.key)
+        }
         // Layer 1: resolved label → name.
         let substituted = NameSubstitution.applyLabelSubstitution(
-            notes: notes, labelMap: labelMap)
+            notes: notes, labelMap: effectiveLabelMap,
+            groundedMLabels: groundedMLabels)
 
         // Layer 2: assign each DISTINCT residual label a stable descriptor by
         // label index (numeric order, then lexical), so two distinct unknown
         // speakers stay distinct in prose across every field.
         let descriptors = Descriptors.match(language)
-        let order = residualLabelOrder(in: substituted, labelMap: labelMap)
+        let order = residualLabelOrder(
+            in: substituted, labelMap: effectiveLabelMap,
+            groundedMLabels: groundedMLabels)
         var descriptorFor: [String: String] = [:]
         for (i, label) in order.enumerated() {
             descriptorFor[label] = descriptors.prose(index: i)
@@ -65,13 +73,19 @@ public enum SLabelNeutralizer {
         var residuals: [Residual] = []
 
         func neutralizeProse(_ value: String) -> String {
-            replaceResiduals(in: value, labelMap: labelMap) { label in
+            replaceResiduals(
+                in: value, labelMap: effectiveLabelMap,
+                groundedMLabels: groundedMLabels
+            ) { label in
                 descriptorFor[label] ?? descriptors.prose(index: 0)
             }
         }
         func neutralizeOwner(_ value: String, _ field: String) -> String {
             var sawResidual: String?
-            let cleaned = replaceResiduals(in: value, labelMap: labelMap) { label in
+            let cleaned = replaceResiduals(
+                in: value, labelMap: effectiveLabelMap,
+                groundedMLabels: groundedMLabels
+            ) { label in
                 sawResidual = label
                 return ""  // honest-empty: the item keeps its text, the owner clears
             }
@@ -116,9 +130,14 @@ public enum SLabelNeutralizer {
     /// `labelMap` resolves is substituted to its name; an unresolved label
     /// becomes a content-free neutral descriptor — never an invented identity.
     public static func neutralizeText(
-        _ text: String, labelMap: [String: String] = [:], language: String = "en"
+        _ text: String, labelMap: [String: String] = [:], language: String = "en",
+        groundedMLabels: Set<String> = []
     ) -> String {
-        let ranges = labelRanges(in: text)
+        let groundedMLabels = Set(groundedMLabels.filter(DiarizationLabel.isMicCluster))
+        let effectiveLabelMap = labelMap.filter {
+            !DiarizationLabel.isMicCluster($0.key) || groundedMLabels.contains($0.key)
+        }
+        let ranges = labelRanges(in: text, groundedMLabels: groundedMLabels)
         guard !ranges.isEmpty else { return text }
         let descriptors = Descriptors.match(language)
 
@@ -129,7 +148,7 @@ public enum SLabelNeutralizer {
         var nextIndex = 0
         for range in ranges {
             let label = String(text[range])
-            if labelMap[label] != nil { continue }  // resolved → name, no descriptor
+            if effectiveLabelMap[label] != nil { continue }  // resolved → name, no descriptor
             if descriptorFor[label] == nil {
                 descriptorFor[label] = descriptors.prose(index: nextIndex)
                 nextIndex += 1
@@ -140,7 +159,8 @@ public enum SLabelNeutralizer {
         // Replace right-to-left so earlier ranges stay valid.
         for range in ranges.reversed() {
             let label = String(text[range])
-            let replacement = labelMap[label] ?? descriptorFor[label] ?? descriptors.prose(index: 0)
+            let replacement =
+                effectiveLabelMap[label] ?? descriptorFor[label] ?? descriptors.prose(index: 0)
             result.replaceSubrange(range, with: replacement)
         }
         return result
@@ -154,8 +174,11 @@ public enum SLabelNeutralizer {
     /// emphasis runs (`_`, `*`, `` ` ``) are token boundaries, so `_S0_` (the
     /// renderer never emits it, but a model authoring underscore italics can)
     /// is detected exactly like `**S0**`.
-    static func residualRanges(in text: String, labelMap: [String: String]) -> [Range<String.Index>] {
-        labelRanges(in: text).filter { labelMap[String(text[$0])] == nil }
+    static func residualRanges(
+        in text: String, labelMap: [String: String], groundedMLabels: Set<String>
+    ) -> [Range<String.Index>] {
+        labelRanges(in: text, groundedMLabels: groundedMLabels)
+            .filter { labelMap[String(text[$0])] == nil }
     }
 
     /// The label grammar `(?<![A-Za-z0-9])S\d+(?![A-Za-z0-9])`: a capital `S`
@@ -170,11 +193,17 @@ public enum SLabelNeutralizer {
     /// lookahead in the pattern and the LEFT boundary is checked against the
     /// preceding character below. The match body is the whole `S\d+` token.
     static var labelRegex: Regex<Substring> { /S[0-9]+(?![A-Za-z0-9])/ }
+    static var micLabelRegex: Regex<Substring> { /M[0-9]+(?![A-Za-z0-9])/ }
 
     /// Every diarization-label occurrence in `text`, as source ranges, in
     /// reading order. Emphasis-aware, case-sensitive (see `labelRegex`).
-    static func labelRanges(in text: String) -> [Range<String.Index>] {
-        text.matches(of: labelRegex).compactMap { match in
+    static func labelRanges(
+        in text: String, groundedMLabels: Set<String> = []
+    ) -> [Range<String.Index>] {
+        func bounded(
+            _ matches: [Regex<Substring>.Match]
+        ) -> [Range<String.Index>] {
+            matches.compactMap { match in
             let range = match.range
             // Left boundary: the char before the `S` must not be alphanumeric.
             if range.lowerBound > text.startIndex {
@@ -182,13 +211,21 @@ public enum SLabelNeutralizer {
                 if isAlphanumericASCII(before) { return nil }
             }
             return range
+            }
         }
+        let system = bounded(text.matches(of: labelRegex))
+        let mic = bounded(text.matches(of: micLabelRegex)).filter {
+            groundedMLabels.contains(String(text[$0]))
+        }
+        return (system + mic).sorted { $0.lowerBound < $1.lowerBound }
     }
 
     /// True when `text` carries at least one diarization label (any field, the
     /// invariant predicate). Emphasis-aware, case-sensitive.
-    public static func containsLabel(_ text: String) -> Bool {
-        !labelRanges(in: text).isEmpty
+    public static func containsLabel(
+        _ text: String, groundedMLabels: Set<String> = []
+    ) -> Bool {
+        !labelRanges(in: text, groundedMLabels: groundedMLabels).isEmpty
     }
 
     private static func isAlphanumericASCII(_ c: Character) -> Bool {
@@ -199,9 +236,11 @@ public enum SLabelNeutralizer {
 
     /// Replaces every residual label range (right-to-left) using `replacement`.
     private static func replaceResiduals(
-        in value: String, labelMap: [String: String], replacement: (String) -> String
+        in value: String, labelMap: [String: String], groundedMLabels: Set<String>,
+        replacement: (String) -> String
     ) -> String {
-        let ranges = residualRanges(in: value, labelMap: labelMap)
+        let ranges = residualRanges(
+            in: value, labelMap: labelMap, groundedMLabels: groundedMLabels)
         guard !ranges.isEmpty else { return value }
         var result = value
         for range in ranges.reversed() {
@@ -216,12 +255,15 @@ public enum SLabelNeutralizer {
     /// across fields ("S0" is always "a participant", "S1" always "another
     /// participant").
     private static func residualLabelOrder(
-        in notes: NotesStructured, labelMap: [String: String]
+        in notes: NotesStructured, labelMap: [String: String],
+        groundedMLabels: Set<String>
     ) -> [String] {
         var seen = Set<String>()
         var labels: [String] = []
         func scan(_ value: String) {
-            for range in residualRanges(in: value, labelMap: labelMap) {
+            for range in residualRanges(
+                in: value, labelMap: labelMap, groundedMLabels: groundedMLabels
+            ) {
                 let label = String(value[range])
                 if seen.insert(label).inserted { labels.append(label) }
             }
@@ -248,7 +290,7 @@ public enum SLabelNeutralizer {
         let fallback: String
 
         func prose(index: Int) -> String {
-            index < participants.count ? participants[index] : fallback
+            index < participants.count ? participants[index] : "\(fallback) \(index + 1)"
         }
 
         static func match(_ language: String) -> Descriptors {
@@ -258,10 +300,10 @@ public enum SLabelNeutralizer {
 
         static let english = Descriptors(
             participants: ["a participant", "another participant", "a third participant"],
-            fallback: "another participant")
+            fallback: "participant")
 
         static let portuguese = Descriptors(
             participants: ["um participante", "outro participante", "um terceiro participante"],
-            fallback: "outro participante")
+            fallback: "participante")
     }
 }

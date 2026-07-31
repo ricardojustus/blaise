@@ -42,7 +42,8 @@ enum RegressionPin {
     /// The fabricated attendee list for the full-sample run (the ICSI
     /// Bmr001 excerpt is an English meeting): an English fictional cast.
     /// Sam Rivera is the user identity; the other participants exist so the
-    /// diarizer gets a sane speaker-count ceiling (attendeeCount + 1).
+    /// diarizer gets a sane speaker-count ceiling (file-first mixed track:
+    /// attendees + 1, C4 v5.5).
     static let fabricatedAttendees: [Attendee] = [
         Attendee(name: "Sam Rivera", email: "sam.rivera@vexatron.test", source: .manual),
         Attendee(name: "Marco Vidal", email: nil, source: .manual),
@@ -80,6 +81,24 @@ struct PinnedSegment: Codable, Equatable {
         self.speakerLabel = segment.speakerLabel
         self.speakerName = segment.speakerName
         self.text = segment.text
+    }
+}
+
+/// Pin-stable transcript shape: decoding the committed final export into it
+/// drops the storage artifacts (`id`, `meeting_id`) exactly as `PinnedSegment`
+/// does, so the pin and an in-process reproduction encode to the same
+/// canonical bytes. `pipeline_version` is deliberately absent — it is
+/// mint-time provenance, not deterministic-chain output, and an in-process run
+/// has no honest source for the value the mint recorded.
+struct PinnedTranscript: Codable {
+    let dominantLanguage: String
+    let asrProvenance: ASRProvenance
+    let segments: [PinnedSegment]
+
+    enum CodingKeys: String, CodingKey {
+        case segments
+        case dominantLanguage = "dominant_language"
+        case asrProvenance = "asr_provenance"
     }
 }
 

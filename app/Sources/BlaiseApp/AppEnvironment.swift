@@ -125,6 +125,11 @@ final class AppEnvironment {
     let settings: SettingsStore
     let secrets: KeychainSecretStore
     let ledger: CloudSpendLedger
+    /// The ONE voice-profile store of the app: the pipeline runs against it and
+    /// the Settings toggle acts on it. Its `enabled` flag and append-generation
+    /// token are in-memory actor state, so a second instance would not see a
+    /// toggle flip.
+    let voiceProfileStore: VoiceProfileStore
     let pipeline: ProcessingPipeline
     let worker: HandoffWorker
     let handoffStatus: HandoffStatusHolder
@@ -235,6 +240,8 @@ final class AppEnvironment {
         // G1 §4: provision the user glossary into the data root before the
         // first run can read it (idempotent; never overwrites an existing file).
         GlossaryProvisioning.ensure(dataRoot: dataRoot)
+        let voiceProfileStore = VoiceProfileStore(paths: database.paths)
+        self.voiceProfileStore = voiceProfileStore
         self.pipeline = ProcessingPipeline(
             database: database,
             registry: registry,
@@ -243,7 +250,8 @@ final class AppEnvironment {
             // UserLoad (diagnostics + timestamp) rides the activity observable (§5b).
             vocabularyProvider: { PipelineVocabulary.user(dataRoot: dataRoot) },
             handoffKicker: worker,
-            meetEventsSweeper: ingestor)
+            meetEventsSweeper: ingestor,
+            voiceProfileStore: voiceProfileStore)
         // F1 Inc2: the durable processing queue is the single admission path for
         // full-pipeline work. runJob = the unchanged executor; the job's origin
         // sets refuseCancelled (auto/recovery must not resurrect a user-cancelled
@@ -308,10 +316,7 @@ final class AppEnvironment {
             resumeWindowSeconds: { await AutomationSettings.resumeWindowSeconds(from: settings) },
             automationEnabled: { await AutomationSettings.enabled(from: settings) },
             suggestions: {
-                let identity =
-                    (try? await settings.get(UserIdentity.settingsKey, as: UserIdentity.self))
-                    ?? nil ?? .shippedDefault
-                await calendar.refresh(userEmail: identity.email)
+                await calendar.refresh()
                 return await MainActor.run { calendar.suggestions }
             },
             calendarHook: { code in
@@ -358,6 +363,11 @@ final class AppEnvironment {
     /// Launch sequence. The debug seed command (`--seed-demo`) populates the
     /// data root from the repo fixtures BEFORE anything observes it.
     func start() async {
+        // The profile store starts enabled in memory; a persisted OFF must
+        // reach it before any run can read a snapshot or take an append token.
+        try? await VoiceIdentificationSettings.apply(
+            enabled: await VoiceIdentificationSettings.isEnabled(in: settings),
+            to: voiceProfileStore)
         // Recording lifecycle → indicator state machine. Subscribed FIRST:
         // the start affordances (menu bar, ⌥⌘R) work as soon as the scene
         // renders, so a launch-instant recording must not lose its
@@ -806,8 +816,7 @@ final class AppEnvironment {
     }
 
     func refreshCalendarSurfaces(now: Date = Date()) async {
-        await calendarSuggestions.refresh(
-            userEmail: userEmail, recordedCodes: recordedMeetingCodes(), now: now)
+        await calendarSuggestions.refresh(recordedCodes: recordedMeetingCodes(), now: now)
     }
 
     /// A calendar source/visibility change (Apple or Google enable, or a
@@ -835,7 +844,9 @@ final class AppEnvironment {
 
     func startRecording(
         source: MeetingSource, title: String? = nil, meetingCode: String? = nil,
-        attendees: [Attendee] = [], anchor: CalendarAnchor? = nil
+        attendees: [Attendee] = [], anchor: CalendarAnchor? = nil,
+        sourceProvenance: CaptureFacts.SourceProvenance = .classified,
+        joinedLinkText: String? = nil
     ) async {
         // G11 §4 (v3.2): a quick-start carrying no suggestion anchor still binds
         // to a covering calendar event when one is in progress — the late-join /
@@ -853,7 +864,10 @@ final class AppEnvironment {
         do {
             let meeting = try await recordingController.start(
                 source: source, title: title, meetingCode: meetingCode, attendees: attendees,
-                anchor: resolvedAnchor)
+                anchor: resolvedAnchor,
+                captureFacts: CaptureFacts.derive(
+                    source: source, meetingCode: meetingCode,
+                    sourceProvenance: sourceProvenance, joinedLinkText: joinedLinkText))
             captureStatus.activeMeetingTitle = meeting.title
             captureStatus.lastActionError = nil
         } catch {
@@ -870,7 +884,8 @@ final class AppEnvironment {
     /// to nil-code sessions, by design).
     func startSlackRecording() async {
         let code = await slackHuddleTracker.currentMeetingCode()
-        await startRecording(source: .slack, meetingCode: code)
+        await startRecording(
+            source: .slack, meetingCode: code, sourceProvenance: .explicit)
     }
 
     func startRecording(suggestion: MeetingSuggestion) async {
@@ -878,14 +893,16 @@ final class AppEnvironment {
         await startRecording(
             source: suggestion.source, title: suggestion.title,
             meetingCode: suggestion.meetingCode, attendees: suggestion.attendees,
-            anchor: CalendarAnchor(suggestion: suggestion))
+            anchor: CalendarAnchor(suggestion: suggestion),
+            sourceProvenance: .classified, joinedLinkText: suggestion.joinedLinkText)
     }
 
     func startRecording(upcoming row: UpcomingMeetingRow) async {
         await startRecording(
             source: row.source, title: row.title,
             meetingCode: row.meetingCode, attendees: row.attendees,
-            anchor: row.anchor)
+            anchor: row.anchor, sourceProvenance: .classified,
+            joinedLinkText: row.joinedLinkText)
         await refreshCalendarSurfaces()
     }
 
