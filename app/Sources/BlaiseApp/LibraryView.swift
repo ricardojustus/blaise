@@ -60,12 +60,23 @@ struct LibraryView: View {
             // center footprint as a transparent exclusion zone: the divider
             // may pass through it, while every visible action stays to its
             // right in the original, preferred arrangement.
-            ToolbarItem(placement: .status) {
-                Color.clear
-                    .frame(width: 190, height: 1)
-                    .accessibilityHidden(true)
+            // sharedBackgroundVisibility is macOS 26 only (it hides the
+            // Liquid Glass item background); Sequoia draws no item
+            // background, so the bare item already reads as transparent.
+            if #available(macOS 26.0, *) {
+                ToolbarItem(placement: .status) {
+                    Color.clear
+                        .frame(width: 190, height: 1)
+                        .accessibilityHidden(true)
+                }
+                .sharedBackgroundVisibility(.hidden)
+            } else {
+                ToolbarItem(placement: .status) {
+                    Color.clear
+                        .frame(width: 190, height: 1)
+                        .accessibilityHidden(true)
+                }
             }
-            .sharedBackgroundVisibility(.hidden)
             // A GROUP, not a single ToolbarItem: macOS renders only the first
             // control in a ToolbarItem, which silently dropped the End & Process
             // button (leaving Pause as the only visible recording control).
@@ -311,7 +322,7 @@ struct LibraryView: View {
         .task {
             await appEnv.refreshCalendarSurfaces()
         }
-        .scrollEdgeEffectStyle(.soft, for: .top)
+        .softTopScrollEdge()
         .background(Design.listColumn.ignoresSafeArea())
         .navigationTitle(uiState.selectedGroup == .thisWeek ? "This Week" : "All Meetings")
         .overlay {
@@ -1266,18 +1277,46 @@ private struct HandoffWarningBanner: View {
 }
 
 /// Liquid Glass capsule that swaps to a solid fill under Reduce Transparency
-/// (accessibility floor).
+/// (accessibility floor). On macOS 15 (no Liquid Glass) the capsule falls
+/// back to ultra-thin material, tinted to match where the direction tints
+/// its glass.
 struct GlassCapsule: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    private var tinted: Bool {
+        // Estúdio (and Fluido) run their glass tinted — confident, not timid.
+        Design.direction == .estudio || Design.direction == .fluido
+    }
 
     func body(content: Content) -> some View {
         if reduceTransparency {
             content.background(Color(nsColor: .controlBackgroundColor), in: Capsule())
-        } else if Design.direction == .estudio || Design.direction == .fluido {
-            // Estúdio (and Fluido) run their glass tinted — confident, not timid.
-            content.glassEffect(.regular.tint(Design.accent.opacity(0.13)), in: Capsule())
+        } else if #available(macOS 26.0, *) {
+            if tinted {
+                content.glassEffect(.regular.tint(Design.accent.opacity(0.13)), in: Capsule())
+            } else {
+                content.glassEffect(.regular, in: Capsule())
+            }
+        } else if tinted {
+            content
+                .background(Design.accent.opacity(0.13), in: Capsule())
+                .background(.ultraThinMaterial, in: Capsule())
         } else {
-            content.glassEffect(.regular, in: Capsule())
+            content.background(.ultraThinMaterial, in: Capsule())
+        }
+    }
+}
+
+extension View {
+    /// `.scrollEdgeEffectStyle(.soft, for: .top)` where available; the
+    /// modifier (and the effect) does not exist before macOS 26, so
+    /// Sequoia renders a plain scroll edge.
+    @ViewBuilder
+    func softTopScrollEdge() -> some View {
+        if #available(macOS 26.0, *) {
+            scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            self
         }
     }
 }

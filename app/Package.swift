@@ -3,8 +3,10 @@ import PackageDescription
 
 let package = Package(
     name: "Blaise",
-    // String form required: .macOS(.v26) needs PackageDescription 6.2.
-    platforms: [.macOS("26.1")],
+    // Sequoia floor (15.6.1): everything below runs on macOS 15 — the only
+    // macOS-26 APIs in the app are cosmetic (Liquid Glass / scroll-edge
+    // effects), gated behind #available with material fallbacks.
+    platforms: [.macOS("15.6.1")],
     products: [
         .executable(name: "Blaise", targets: ["BlaiseApp"]),
         .library(name: "BlaiseCore", targets: ["BlaiseCore"]),

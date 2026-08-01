@@ -58,9 +58,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleVersion</key>
 	<string>__BLAISE_BUILD_NUMBER__</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.5.2</string>
+	<string>1.5.3</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>26.1</string>
+	<string>15.6.1</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>

@@ -1161,7 +1161,12 @@ public actor ProcessingPipeline {
     // MARK: - Run body
 
     /// Local per-run context (single actor method scope; never escapes).
-    private final class RunContext {
+    /// `@unchecked Sendable` because Swift 6.2.4's region analysis rejects
+    /// the stage-closure captures as sends. It is safe: a context belongs to
+    /// exactly one run, and every access — actor methods and the awaited
+    /// stage closures alike — is sequenced within that run's task chain, so
+    /// two accesses can never overlap.
+    private final class RunContext: @unchecked Sendable {
         var currentStage: PipelineStage
         var record: PipelineRunRecord
         /// G7 (M-1): an explicit cloud-spend purpose for this run's notes call.

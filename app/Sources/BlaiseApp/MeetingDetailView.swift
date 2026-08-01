@@ -359,7 +359,7 @@ private struct NotesPane: View {
             // Fluido: content slides under the toolbar with a soft scroll
             // edge; extra bottom room clears the floating recording pill.
             scrollCore
-                .scrollEdgeEffectStyle(.soft, for: .top)
+                .softTopScrollEdge()
         } else {
             scrollCore
         }

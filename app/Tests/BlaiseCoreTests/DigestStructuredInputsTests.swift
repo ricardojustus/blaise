@@ -261,13 +261,17 @@ private enum T31Fixtures {
         let notes = makeNotes(meetingID: meeting.id) // default: empty scoped set
         try await NotesRepository(database: database).upsert(notes)
 
+        // `Row` is not Sendable through the async `read` — copy the column
+        // value (Sendable) out inside the closure. A missing ROW stays nil,
+        // distinct from a present row carrying SQL NULL.
         let rawColumn = try await database.pool.read { db in
             try Row.fetchOne(
                 db, sql: "SELECT scoped_alias_bindings FROM meeting_notes WHERE meeting_id = ?",
-                arguments: [meeting.id])
+                arguments: [meeting.id]
+            ).map { $0["scoped_alias_bindings"] as DatabaseValue }
         }
         let value = try #require(rawColumn)
-        #expect(value["scoped_alias_bindings"] == DatabaseValue.null,
+        #expect(value == DatabaseValue.null,
             "an empty scoped set persists as SQL NULL")
         let reloaded = try #require(
             await NotesRepository(database: database).fetch(meetingID: meeting.id))
