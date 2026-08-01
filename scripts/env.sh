@@ -5,20 +5,22 @@
 # toolchain's swift directly with an explicit SDKROOT, which never trips the
 # license check.
 
-# Prefer the canonical /Applications/Xcode.app, but fall back to any
-# versioned install (Xcode_26.3.app, …) that ships a macOS 26 SDK.
+# Prefer the canonical /Applications/Xcode.app, then any versioned install
+# (Xcode_26.3.app, …) that ships a macOS 26 SDK. First match wins.
 XCODE_DEV=""
 for candidate in /Applications/Xcode.app /Applications/Xcode*.app; do
     dev="$candidate/Contents/Developer"
-    if compgen -G "$dev/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26*.sdk" > /dev/null 2>&1; then
-        XCODE_DEV="$dev"
-        break
-    fi
+    for sdk in "$dev"/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26*.sdk; do
+        if [ -e "$sdk" ]; then
+            XCODE_DEV="$dev"
+            break 2
+        fi
+    done
 done
 
-if [[ -z "$XCODE_DEV" ]]; then
+if [ -z "$XCODE_DEV" ]; then
     echo "error: no Xcode with a macOS 26 SDK found under /Applications (Xcode 26 required)" >&2
-    exit 1
+    return 1 2>/dev/null || exit 1
 fi
 
 PLAT="$XCODE_DEV/Platforms/MacOSX.platform/Developer"
