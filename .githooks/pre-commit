@@ -1,0 +1,4 @@
+#!/bin/sh
+# Leak-tripwire pre-commit hook (see CONTRIBUTING.md). Activated per clone with:
+#   git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/scripts/tripwire.sh" --staged
