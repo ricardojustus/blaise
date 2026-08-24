@@ -1,4 +1,5 @@
 import BlaiseCore
+import CryptoKit
 import Foundation
 
 // C7 crash-harness child process (scripts/c7_crash_harness.sh) + the C8
@@ -6,8 +7,13 @@ import Foundation
 //
 // Modes:
 //   import  <dataRoot> <wav>                      → prints the new meeting ULID
-//   process <dataRoot> <meetingID> [--real-asr --venv <p> --hf <p>]
-//                                                  → runs the pipeline (BLAISE_CRASH_AT honored)
+//   process <dataRoot> <meetingID> [--real-asr --venv <p> --hf <p>] [--park-notes]
+//                                                  → runs the pipeline (BLAISE_CRASH_AT honored);
+//                                                    --park-notes leaves it notes-pending (D17)
+//   rewrite <dataRoot> <meetingID>                 → adds an understanding correction and runs
+//                                                    the notes-only rewrite (BLAISE_CRASH_AT honored)
+//   resume  <dataRoot>                             → the launch self-heal for notes-pending
+//                                                    meetings (BLAISE_CRASH_AT honored)
 //   status  <dataRoot> <meetingID>                 → opens the DB (startup sweeps RUN) and
 //                                                    prints one JSON line of observable state
 //   handoff-seed  <dataRoot> <count> [--payload-kb N]
@@ -104,10 +110,16 @@ struct StubNotesEngine: SummarizationEngine {
     func availability() async -> EngineAvailability { .available }
 
     func generateNotes(_ request: NotesRequest, purpose: CloudSpendPurpose) async throws -> NotesResult {
-        NotesResult(
+        // Deterministic, and deterministically DIFFERENT once a correction is
+        // injected — a rewrite that changes no byte would prove nothing about
+        // the notes.md promote.
+        let corrected = !request.corrections.filter { $0.kind == .understanding }.isEmpty
+        return NotesResult(
             structured: NotesStructured(
                 title: "Reunião de teste",
-                summary: "Resumo determinístico para o harness de crash.",
+                summary: corrected
+                    ? "Resumo determinístico corrigido para o harness de crash."
+                    : "Resumo determinístico para o harness de crash.",
                 detailedNotes: "Notas detalhadas fixas.",
                 decisions: ["Decisão fixa"],
                 actionItems: [ActionItem(owner: "Demo User", text: "tarefa fixa")],
@@ -124,6 +136,30 @@ struct StubNotesEngine: SummarizationEngine {
             digest: "## HEADER\nmeeting: reunião de teste\nspeaker: (none resolved)\n",
             usage: nil,
             promptVersion: DigestPromptBuilder.shippedVersion.rawValue)
+    }
+}
+
+/// Parks the notes stage (D17): a fallback-trigger failure on an engine that
+/// suppresses auto-fallback leaves the meeting notes-pending with a persisted
+/// transcript, no notes row and no `notes.md` — the state the first-notes
+/// resume starts from.
+struct ParkingNotesEngine: SummarizationEngine {
+    let id = "stub-parking-notes"
+    let displayName = "Stub Parking Notes"
+    let kind: EngineKind = .local
+    let loadProfile: EngineLoadProfile = .lightweight
+    let costDescriptor: EngineCostDescriptor? = nil
+    let configDescriptors: [EngineConfigDescriptor] = []
+    var suppressesAutoFallback: Bool { true }
+
+    func availability() async -> EngineAvailability { .available }
+
+    func generateNotes(_ request: NotesRequest, purpose: CloudSpendPurpose) async throws -> NotesResult {
+        throw EngineError.configurationMissing(key: "stub.parked")
+    }
+
+    func generateDigest(_ request: DigestRequest, purpose: CloudSpendPurpose) async throws -> DigestResult {
+        throw EngineError.configurationMissing(key: "stub.parked")
     }
 }
 
@@ -173,7 +209,9 @@ func fail(_ message: String) -> Never {
     exit(2)
 }
 
-func makePipeline(dataRoot: URL, realASR: Bool, venv: String?, hfHome: String?) async throws
+func makePipeline(
+    dataRoot: URL, realASR: Bool, venv: String?, hfHome: String?, parkNotes: Bool = false
+) async throws
     -> (BlaiseDatabase, ProcessingPipeline)
 {
     let database = try BlaiseDatabase(rootURL: dataRoot)
@@ -202,7 +240,9 @@ func makePipeline(dataRoot: URL, realASR: Bool, venv: String?, hfHome: String?) 
     } else {
         asrEngine = StubASREngine()
     }
-    let registry = try EngineRegistry(asr: [asrEngine], summarization: [StubNotesEngine()])
+    let summarization: [any SummarizationEngine] =
+        parkNotes ? [ParkingNotesEngine()] : [StubNotesEngine()]
+    let registry = try EngineRegistry(asr: [asrEngine], summarization: summarization)
     let pipeline = ProcessingPipeline(
         database: database,
         registry: registry,
@@ -255,12 +295,14 @@ let task = Task.detached {
             guard args.count >= 4 else { fail("usage: CrashRunner process <dataRoot> <meetingID>") }
             let meetingID = args[3]
             var realASR = false
+            var parkNotes = false
             var venv: String?
             var hfHome: String?
             var index = 4
             while index < args.count {
                 switch args[index] {
                 case "--real-asr": realASR = true
+                case "--park-notes": parkNotes = true
                 case "--venv":
                     index += 1
                     venv = args[index]
@@ -272,9 +314,29 @@ let task = Task.detached {
                 index += 1
             }
             let (_, pipeline) = try await makePipeline(
-                dataRoot: dataRoot, realASR: realASR, venv: venv, hfHome: hfHome)
+                dataRoot: dataRoot, realASR: realASR, venv: venv, hfHome: hfHome,
+                parkNotes: parkNotes)
             let record = try await pipeline.process(meetingID: meetingID)
             print("processed \(meetingID): \(record.finalSegmentCount) segments, hash \(record.versionHash ?? "-")")
+
+        case "rewrite":
+            guard args.count >= 4 else { fail("usage: CrashRunner rewrite <dataRoot> <meetingID>") }
+            let meetingID = args[3]
+            let (_, pipeline) = try await makePipeline(
+                dataRoot: dataRoot, realASR: false, venv: nil, hfHome: nil)
+            try await pipeline.addCorrection(
+                meetingID: meetingID, kind: .understanding, section: .summary,
+                quotedText: "Resumo determinístico para o harness de crash.", occurrence: 0,
+                userText: "Somente uma avaliação foi acordada.")
+            let record = try await pipeline.rewriteNotes(meetingID: meetingID)
+            print("rewrote \(meetingID): hash \(record?.versionHash ?? "-")")
+
+        case "resume":
+            // The self-heal trigger the app fires at launch.
+            let (_, pipeline) = try await makePipeline(
+                dataRoot: dataRoot, realASR: false, venv: nil, hfHome: nil)
+            await pipeline.resumePendingNotes()
+            print("resumed")
 
         case "status":
             guard args.count >= 4 else { fail("usage: CrashRunner status <dataRoot> <meetingID>") }
@@ -304,8 +366,18 @@ let task = Task.detached {
             let payloadFiles =
                 (try? FileManager.default.contentsOfDirectory(atPath: payloadDir.path)
                     .filter { $0.hasSuffix(".json") }.sorted()) ?? []
+            // The human artifact vs the row it is promoted from: equal digests
+            // are the convergence oracle for the notes-only crash points.
+            let notesRow = try await NotesRepository(database: database).fetch(meetingID: meetingID)
+            let notesFileData = try? Data(contentsOf: database.paths.notesURL(meetingID))
+            func digest(_ data: Data?) -> Any {
+                guard let data else { return NSNull() }
+                return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            }
             let state: [String: Any] = [
                 "status": meeting.status.rawValue,
+                "notes_row_sha": digest(notesRow.map { Data($0.markdown.utf8) }),
+                "notes_file_sha": digest(notesFileData),
                 "last_error": meeting.lastProcessingError ?? NSNull(),
                 "processing_note": meeting.processingNote ?? NSNull(),
                 "segment_count": segments.count,
@@ -351,7 +423,10 @@ let task = Task.detached {
                 meeting.status = .ready
                 let payload = EvidencePayloadBuilder.build(
                     meeting: meeting, segments: stored, notes: notes,
-                    user: UserIdentity.shippedDefault)
+                    user: UserIdentity.shippedDefault,
+                    // Synthetic meetings: this harness writes no correction
+                    // rows, so the empty slice is the truth, not a stub.
+                    corrections: [])
                 let relativePath = database.paths.relativeHandoffPayloadPath(
                     meetingID: meetingID, versionHash: payload.versionHash)
                 try ImmutablePayloadWriter.write(

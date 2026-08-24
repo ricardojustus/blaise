@@ -23,6 +23,14 @@ private struct FakeAPI: Sendable {
     }
 }
 
+private struct FailingSecretStore: SecretStore {
+    struct ReadFailure: Error {}
+
+    func get(key: String) throws -> String? { throw ReadFailure() }
+    func set(key: String, value: String) throws {}
+    func delete(key: String) throws {}
+}
+
 private func successBody(
     stopReason: String = "end_turn", inputTokens: Int = 12_000, outputTokens: Int = 2_500
 ) -> String {
@@ -72,6 +80,375 @@ private func makeClaudeHarness(
     return ClaudeHarness(
         engine: engine, ledger: ledger, database: database, secrets: secrets,
         settings: settings, api: api)
+}
+
+private func editorAPIBody(
+    text: String,
+    stopReason: String = "end_turn",
+    inputTokens: Int = 1_200,
+    outputTokens: Int = 80
+) -> String {
+    let escaped = text
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\n", with: "\\n")
+    return """
+        {"id":"msg_editor","type":"message","role":"assistant",
+         "content":[{"type":"text","text":"\(escaped)"}],
+         "stop_reason":"\(stopReason)",
+         "usage":{"input_tokens":\(inputTokens),"output_tokens":\(outputTokens)}}
+        """
+}
+
+private struct ClaudeEditorPipelineHarness {
+    let engineHarness: ClaudeHarness
+    let pipeline: ProcessingPipeline
+    let meeting: Meeting
+    let correction: MeetingCorrection
+}
+
+private func makeClaudeEditorPipelineHarness(
+    responses: [(Int, String)]
+) async throws -> ClaudeEditorPipelineHarness {
+    let harness = try await makeClaudeHarness(responses: responses)
+    let registry = try EngineRegistry(asr: [], summarization: [harness.engine])
+    try await harness.settings.set(
+        EngineResolver.summarizationSettingsKey, to: harness.engine.id)
+    try await harness.settings.set(UserIdentity.settingsKey, to: UserIdentity.onboardedUser)
+    let pipeline = ProcessingPipeline(
+        database: harness.database, registry: registry,
+        diarizer: PipelineMockDiarizer(),
+        vocabulary: try VocabFixtures.pipelineVocabulary(),
+        notesEditorSleep: { _ in },
+        settleSleep: { _ in throw CancellationError() })
+    let meeting = makeMeeting(status: .ready)
+    try await MeetingRepository(database: harness.database).create(meeting)
+    try await NotesRepository(database: harness.database).upsert(makeNotes(meetingID: meeting.id))
+    let correction = MeetingCorrection(
+        meetingID: meeting.id, kind: .understanding, section: .summary,
+        quotedText: "Resumo", userText: "Use the corrected wording", createdAt: msDate())
+    try await harness.database.pool.write { db in
+        try MeetingCorrectionStore.insert(db, correction)
+    }
+    return ClaudeEditorPipelineHarness(
+        engineHarness: harness, pipeline: pipeline, meeting: meeting, correction: correction)
+}
+
+private func makeClaudeDigestPipelineHarness(
+    responses: [(Int, String)]
+) async throws -> ClaudeEditorPipelineHarness {
+    let harness = try await makeClaudeEditorPipelineHarness(responses: responses)
+    try await harness.engineHarness.database.pool.write { db in
+        try db.execute(
+            sql: """
+                UPDATE meeting_notes
+                SET memory_digest = ?, digest_edit_owed = 1
+                WHERE meeting_id = ?
+                """,
+            arguments: [
+                """
+                ## HEADER
+                meeting: Quoll Harbor sonar review
+
+                ## DECISIONS
+                Dana Marsh decided on 2026-03-14 to ship the sonar rig in May 2026.
+                """,
+                harness.meeting.id,
+            ])
+    }
+    return harness
+}
+
+@Suite struct ClaudeNotesEditorTests {
+    private let editorJSON = #"{"ops":[{"field":"summary","find":"before","replace":"after","instruction":1}]}"#
+
+    @Test func editorRequestCarriesExactSchemaPromptAndReturnsOperations() async throws {
+        let harness = try await makeClaudeHarness(responses: [
+            (200, editorAPIBody(text: editorJSON))
+        ])
+        let editorRequest = makeNotesEditorRequest()
+        let result = try await harness.engine.editNotes(editorRequest, purpose: .notesEditor)
+
+        #expect(result.operations == [
+            .replace(field: .summary, find: "before", replace: "after", instruction: 1)
+        ])
+        #expect(result.usage?.inputUnits == 1_200)
+        #expect(result.usage?.outputUnits == 80)
+        #expect(harness.api.requests.values.count == 1)
+
+        let request = try #require(harness.api.requests.values.first)
+        let bodyData = try #require(request.httpBody)
+        let bodyText = String(decoding: bodyData, as: UTF8.self)
+        #expect(bodyText.contains(NotesEditorWireContract.schemaJSON))
+        let body = try #require(
+            try JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
+        #expect(body["system"] as? String == NotesEditorWireContract.systemPrompt)
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        let expectedUser = try NotesEditorWireContract.userMessage(for: editorRequest)
+        #expect(messages.first?["content"] as? String == expectedUser)
+        let outputConfig = try #require(body["output_config"] as? [String: Any])
+        let format = try #require(outputConfig["format"] as? [String: Any])
+        #expect(format["type"] as? String == "json_schema")
+        let schema = try #require(format["schema"])
+        let normalizedWire = try JSONSerialization.data(
+            withJSONObject: schema, options: [.sortedKeys])
+        let normalizedOracle = try JSONSerialization.data(
+            withJSONObject: JSONSerialization.jsonObject(
+                with: Data(NotesEditorWireContract.schemaJSON.utf8)),
+            options: [.sortedKeys])
+        #expect(Array(normalizedWire) == Array(normalizedOracle))
+        let month = try await harness.ledger.monthReceipts()
+        #expect(month.receipts.count == 1)
+        #expect(month.receipts.first?.purpose == .notesEditor)
+    }
+
+    @Test func proseOnlyAndMalformed200BodiesArePermanent() async throws {
+        let proseHarness = try await makeClaudeHarness(responses: [
+            (200, editorAPIBody(text: "Here are the edited notes in prose."))
+        ])
+        let proseError = await engineError {
+            try await proseHarness.engine.editNotes(
+                makeNotesEditorRequest(), purpose: .notesEditor)
+        }
+        #expect({
+            if case .permanent = proseError { return true }
+            return false
+        }())
+        #expect(proseHarness.api.requests.values.count == 1)
+        #expect(try await proseHarness.ledger.monthReceipts().receipts.count == 1)
+        #expect(
+            try await proseHarness.ledger.monthReceipts().receipts.first?.purpose == .notesEditor)
+
+        // Usage is independently parseable, while the content shape is not.
+        // The body arrived and cannot be used, so this must not be transient.
+        let malformedHarness = try await makeClaudeHarness(responses: [
+            (200, #"{"content":"not-an-array","usage":{"input_tokens":12,"output_tokens":3}}"#)
+        ])
+        let malformedError = await engineError {
+            try await malformedHarness.engine.editNotes(
+                makeNotesEditorRequest(), purpose: .notesEditor)
+        }
+        #expect({
+            if case .permanent = malformedError { return true }
+            return false
+        }())
+        #expect(malformedHarness.api.requests.values.count == 1)
+        let billedMalformed = try await malformedHarness.ledger.monthReceipts()
+        #expect(billedMalformed.receipts.count == 1)
+        #expect(billedMalformed.receipts.first?.purpose == .notesEditor)
+    }
+
+    @Test func transportWithoutResponseBodyIsTransient() async throws {
+        let database = try makeDatabase()
+        let settings = SettingsStore(database: database)
+        let secrets = InMemorySecretStore()
+        try secrets.set(
+            key: "engine.\(ClaudeSummarizationEngine.engineID).\(ClaudeSummarizationEngine.apiKeyConfigKey)",
+            value: "sk-test-not-real")
+        let configuration = EngineConfiguration(
+            engineID: ClaudeSummarizationEngine.engineID,
+            descriptors: ClaudeSummarizationEngine.descriptors,
+            settings: settings,
+            secrets: secrets)
+        let calls = Recorder<Int>()
+        let engine = ClaudeSummarizationEngine(
+            configuration: configuration,
+            ledger: CloudSpendLedger(database: database),
+            transport: { _ in
+                calls.append(1)
+                throw URLError(.networkConnectionLost)
+            })
+        let error = await engineError {
+            try await engine.editNotes(makeNotesEditorRequest(), purpose: .notesEditor)
+        }
+        #expect({
+            if case .transient = error { return true }
+            return false
+        }())
+        #expect(calls.values.count == 1)
+        #expect(try await CloudSpendLedger(database: database).monthReceipts().receipts.isEmpty)
+    }
+
+    @Test func editorConfigurationReadFailureIsConfigurationMissingBeforeTransport() async throws {
+        let database = try makeDatabase()
+        let configuration = EngineConfiguration(
+            engineID: ClaudeSummarizationEngine.engineID,
+            descriptors: ClaudeSummarizationEngine.descriptors,
+            settings: SettingsStore(database: database),
+            secrets: FailingSecretStore())
+        let api = FakeAPI(responses: [(200, editorAPIBody(text: editorJSON))])
+        let engine = ClaudeSummarizationEngine(
+            configuration: configuration,
+            ledger: CloudSpendLedger(database: database),
+            transport: api.transport)
+
+        let error = await engineError {
+            try await engine.editNotes(makeNotesEditorRequest(), purpose: .notesEditor)
+        }
+
+        #expect(error == .configurationMissing(key: ClaudeSummarizationEngine.apiKeyConfigKey))
+        #expect(api.requests.values.isEmpty)
+    }
+
+    @Test("AC-15: a receipt-less 429 then decoded body writes one activation receipt")
+    func rateLimitThenSuccessWritesOneReceipt() async throws {
+        let rateLimit = #"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+        let harness = try await makeClaudeEditorPipelineHarness(responses: [
+            (429, rateLimit),
+            (200, editorAPIBody(text: #"{"ops":[]}"#)),
+        ])
+
+        try await harness.pipeline.sendPendingNotesToEditor(meetingID: harness.meeting.id)
+
+        #expect(harness.engineHarness.api.requests.values.count == 2)
+        let month = try await harness.engineHarness.ledger.monthReceipts()
+        #expect(month.receipts.count == 1)
+        #expect(month.receipts.first?.purpose == .notesEditor)
+    }
+
+    @Test("AC-15: a billed undecodable body records once and ends the activation")
+    func billedDecodeFailureEndsActivation() async throws {
+        let malformed = #"{"content":"not-an-array","usage":{"input_tokens":12,"output_tokens":3}}"#
+        let harness = try await makeClaudeEditorPipelineHarness(responses: [
+            (200, malformed),
+            (200, editorAPIBody(text: #"{"ops":[]}"#)),
+        ])
+
+        await #expect(throws: EngineError.self) {
+            try await harness.pipeline.sendPendingNotesToEditor(meetingID: harness.meeting.id)
+        }
+
+        #expect(harness.engineHarness.api.requests.values.count == 1)
+        let month = try await harness.engineHarness.ledger.monthReceipts()
+        #expect(month.receipts.count == 1)
+        #expect(month.receipts.first?.purpose == .notesEditor)
+        let rows = try await harness.engineHarness.database.pool.read { db in
+            try MeetingCorrectionStore.all(db, meetingID: harness.meeting.id)
+        }
+        #expect(rows == [harness.correction])
+    }
+}
+
+// MARK: - SC-6 / SC-17: the API adapter's digest-editor seam
+
+@Suite struct ClaudeDigestEditorTests {
+    private let digestOpsJSON =
+        #"{"ops":[{"find":"in May 2026","replace":"in June 2026","instruction":1}]}"#
+
+    @Test("SC-17: the API adapter sends the digest ops schema server-side, one attempt")
+    func digestRequestCarriesTheSchemaAndSpawnsOnce() async throws {
+        let harness = try await makeClaudeHarness(responses: [
+            (200, editorAPIBody(text: digestOpsJSON))
+        ])
+        let request = makeDigestEditorRequest()
+        let result = try await harness.engine.editDigest(request, purpose: .digestEditor)
+
+        #expect(result.operations == [
+            DigestEditOperation(find: "in May 2026", replace: "in June 2026", instruction: 1)
+        ])
+        #expect(harness.api.requests.values.count == 1, "zero internal transient retries")
+
+        let sent = try #require(harness.api.requests.values.first)
+        let bodyData = try #require(sent.httpBody)
+        let body = try #require(
+            try JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
+        #expect(body["system"] as? String == DigestEditorWireContract.systemPrompt)
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        #expect(
+            messages.first?["content"] as? String
+                == DigestEditorWireContract.userMessage(for: request))
+        let outputConfig = try #require(body["output_config"] as? [String: Any])
+        let format = try #require(outputConfig["format"] as? [String: Any])
+        #expect(format["type"] as? String == "json_schema")
+        let schema = try #require(format["schema"])
+        let normalizedWire = try JSONSerialization.data(
+            withJSONObject: schema, options: [.sortedKeys])
+        let normalizedOracle = try JSONSerialization.data(
+            withJSONObject: JSONSerialization.jsonObject(
+                with: Data(DigestEditorWireContract.schemaJSON.utf8)),
+            options: [.sortedKeys])
+        #expect(Array(normalizedWire) == Array(normalizedOracle), "the DIGEST ops schema")
+
+        // SC-6 receipt posture: a usable body with usage leaves exactly one row,
+        // under the digest-editor purpose.
+        let month = try await harness.ledger.monthReceipts()
+        #expect(month.receipts.count == 1)
+        #expect(month.receipts.first?.purpose == .digestEditor)
+    }
+
+    @Test("SC-6: a body-less transport failure leaves no receipt row")
+    func bodylessTransportFailureLeavesNoReceipt() async throws {
+        let database = try makeDatabase()
+        let settings = SettingsStore(database: database)
+        let secrets = InMemorySecretStore()
+        try secrets.set(
+            key: "engine.\(ClaudeSummarizationEngine.engineID).\(ClaudeSummarizationEngine.apiKeyConfigKey)",
+            value: "sk-test-not-real")
+        let configuration = EngineConfiguration(
+            engineID: ClaudeSummarizationEngine.engineID,
+            descriptors: ClaudeSummarizationEngine.descriptors,
+            settings: settings, secrets: secrets)
+        let calls = Recorder<Int>()
+        let engine = ClaudeSummarizationEngine(
+            configuration: configuration,
+            ledger: CloudSpendLedger(database: database),
+            transport: { _ in
+                calls.append(1)
+                throw URLError(.networkConnectionLost)
+            })
+
+        let error = await engineError {
+            try await engine.editDigest(makeDigestEditorRequest(), purpose: .digestEditor)
+        }
+        #expect({
+            if case .transient = error { return true }
+            return false
+        }())
+        #expect(calls.values.count == 1)
+        #expect(try await CloudSpendLedger(database: database).monthReceipts().receipts.isEmpty)
+    }
+
+    @Test("SC-6: a billed body that will not decode is permanent and receipts once")
+    func billedUndecodableBodyIsPermanentAndReceipted() async throws {
+        let harness = try await makeClaudeHarness(responses: [
+            (200, editorAPIBody(text: "prose, not an ops array"))
+        ])
+        let error = await engineError {
+            try await harness.engine.editDigest(makeDigestEditorRequest(), purpose: .digestEditor)
+        }
+        #expect({
+            if case .permanent = error { return true }
+            return false
+        }())
+        #expect(harness.api.requests.values.count == 1)
+        let month = try await harness.ledger.monthReceipts()
+        #expect(month.receipts.count == 1)
+        #expect(month.receipts.first?.purpose == .digestEditor)
+    }
+
+    /// The activation owns the retries: three attempts stay three transport
+    /// calls, and jobs are not attempts — a receipt-less 429 pair plus one
+    /// decoded body is ONE job with ONE receipt.
+    @Test("SC-6/SC-17: three activation attempts never multiply, and one job leaves one receipt")
+    func activationAttemptsNeverMultiply() async throws {
+        let rateLimit = #"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+        let harness = try await makeClaudeDigestPipelineHarness(responses: [
+            (429, rateLimit),
+            (429, rateLimit),
+            (200, editorAPIBody(text: digestOpsJSON)),
+        ])
+
+        let outcome = try await harness.pipeline.reconcileDigest(meetingID: harness.meeting.id)
+
+        #expect(outcome == .reconciled)
+        #expect(
+            harness.engineHarness.api.requests.values.count == 3,
+            "3 activation attempts, never 3 × the adapter's own retries")
+        let month = try await harness.engineHarness.ledger.monthReceipts()
+        #expect(month.receipts.count == 1, "attempts without bodies leave no rows")
+        #expect(month.receipts.first?.purpose == .digestEditor)
+        #expect(month.receipts.first?.meetingID == harness.meeting.id)
+    }
 }
 
 @Suite struct ClaudeRequestConstructionTests {

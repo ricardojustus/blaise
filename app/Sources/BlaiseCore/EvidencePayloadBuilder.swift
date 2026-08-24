@@ -32,21 +32,41 @@ public enum EvidencePayloadBuilder {
         }
     }
 
+    /// The `retractions` wire-encoding form. Forward mints always carry
+    /// `.current` — the key emitted, `[]` when the set is empty.
+    /// `.preN5Absent` omits the key entirely and exists ONLY so
+    /// re-materialization of a payload minted before the field existed can
+    /// reproduce its stored `version_hash` byte-for-byte — the same recovery
+    /// discipline as the legacy user-action-items key form.
+    public enum RetractionsKey {
+        case current
+        case preN5Absent
+    }
+
     /// Every field's persisted source (C8 §builder-inputs): `meeting` row,
-    /// `transcript_segment` rows, `meeting_notes` row, `UserIdentity` from
-    /// SettingsStore. Re-materialization at delivery time therefore works
-    /// from durable state alone.
+    /// `transcript_segment` rows, `meeting_notes` row, `meeting_correction`
+    /// rows, `UserIdentity` from SettingsStore. Re-materialization at delivery
+    /// time therefore works from durable state alone.
+    ///
+    /// `corrections` carries NO default: a defaulted empty slice would let a
+    /// new mint site silently ship no retractions, and every package must
+    /// carry the complete current set.
     public static func build(
         meeting: Meeting,
         segments: [TranscriptSegment],
         notes: MeetingNotes,
         user: UserIdentity,
+        corrections: [MeetingCorrection],
         userActionItemsKey: UserActionItemsKey = .current,
-        digestPromptVersion: DigestPromptVersion = DigestPromptBuilder.shippedVersion
+        digestPromptVersion: DigestPromptVersion? = nil,
+        includeMemoryDigest: Bool = true,
+        retractionsKey: RetractionsKey = .current
     ) -> Payload {
         let value = payloadValue(
             meeting: meeting, segments: segments, notes: notes, user: user,
-            userActionItemsKey: userActionItemsKey, digestPromptVersion: digestPromptVersion)
+            corrections: corrections,
+            userActionItemsKey: userActionItemsKey, digestPromptVersion: digestPromptVersion,
+            includeMemoryDigest: includeMemoryDigest, retractionsKey: retractionsKey)
         let bytes = CanonicalJSONWriter.write(value)
         return Payload(bytes: bytes, versionHash: sha256Hex(bytes))
     }
@@ -62,9 +82,29 @@ public enum EvidencePayloadBuilder {
         segments: [TranscriptSegment],
         notes: MeetingNotes,
         user: UserIdentity,
+        corrections: [MeetingCorrection],
         userActionItemsKey: UserActionItemsKey = .current,
-        digestPromptVersion: DigestPromptVersion = DigestPromptBuilder.shippedVersion
+        digestPromptVersion: DigestPromptVersion? = nil,
+        includeMemoryDigest: Bool = true,
+        retractionsKey: RetractionsKey = .current
     ) -> CanonicalJSONValue {
+        // The mint-time toggle gate, at the SHARED seam so every forward mint
+        // conforms: while the digest toggle is OFF a forward render emits
+        // NEITHER digest key — the top-level `memory_digest` nor
+        // `provenance.memory_digest` — even where a stored digest exists.
+        // Flipping the toggle affects forward renders only; the stored digest
+        // is never deleted.
+        let digest = includeMemoryDigest ? notes.memoryDigest : nil
+        // The stamp a payload minted from this row carries: an EXPLICIT argument
+        // always wins (that is `HandoffWorker.rematerialize`'s recovery axis,
+        // which varies the version across all cases to reproduce a queued
+        // payload's hash and must never be neutered by the row), then the row's
+        // own recorded stamp, then the shipped version for a row minted before
+        // the column existed.
+        let stampVersion =
+            digestPromptVersion
+            ?? notes.digestPromptVersion.flatMap(DigestPromptVersion.init(rawValue:))
+            ?? DigestPromptBuilder.shippedVersion
         let attendees: [CanonicalJSONValue] = meeting.attendees.map { attendee in
             var fields: [(String, CanonicalJSONValue)] = [("name", .string(attendee.name))]
             if let email = attendee.email {
@@ -155,7 +195,7 @@ public enum EvidencePayloadBuilder {
             ("notes", .object(notesProvenanceFields)),
             ("pipeline_version", .string(notes.provenance.pipelineVersion)),
         ]
-        if notes.memoryDigest != nil {
+        if digest != nil {
             // #102 (F9): `memory_digest.model` denotes the SYNTHESIS engine — the
             // model that PRODUCED the digest draft (always Sonnet = the engine the
             // user selected for notes), NOT the per-call combined-audit model. The
@@ -165,7 +205,7 @@ public enum EvidencePayloadBuilder {
             provenanceFields.append((
                 "memory_digest",
                 .object([
-                    ("prompt_version", .string(digestPromptVersion.rawValue)),
+                    ("prompt_version", .string(stampVersion.rawValue)),
                     ("engine", .string(notes.provenance.engine)),
                     ("model", .string(notes.provenance.model)),
                 ])))
@@ -199,8 +239,34 @@ public enum EvidencePayloadBuilder {
         // (amendment §10). A toggle-off / legacy / digest-failed meeting omits
         // it, byte-identical to today's payload. `CanonicalJSONWriter` byte-sorts
         // it into canonical position automatically.
-        if let digest = notes.memoryDigest {
+        if let digest {
             topLevel.append(("memory_digest", .string(digest)))
+        }
+        // The retraction set: one record per understanding row whose quoted
+        // claim is currently ABSENT from the notes this payload carries, by the
+        // shipped withdrawn-claim predicate. Derived fresh at every mint, so a
+        // claim whose words returned (or whose row the user deleted) simply is
+        // not in the next set. Unlike the additive fields above this one is
+        // ALWAYS emitted under `.current`, `[]` included: the consumer replaces
+        // its whole set from the winning payload, and an omitted key would read
+        // as "leave unchanged" exactly where the last record must retire.
+        // `.preN5Absent` is recovery-only. Records sort by id so the bytes never
+        // depend on the caller's row order.
+        if case .current = retractionsKey {
+            let haystack = CorrectionAnchoring.foldedHaystack(
+                of: structured, meetingTitle: meeting.title)
+            let records = CorrectionAnchoring.withdrawnRows(
+                corrections: corrections, currentHaystack: haystack)
+                .sorted { $0.id < $1.id }
+                .map { row -> CanonicalJSONValue in
+                    .object([
+                        ("id", .string(row.id)),
+                        ("kind", .string("removal")),
+                        ("claim_text", .string(row.quotedText)),
+                        ("retracted_at_ms", .integer(milliseconds(date: row.createdAt))),
+                    ])
+                }
+            topLevel.append(("retractions", .array(records)))
         }
         return .object(topLevel)
     }

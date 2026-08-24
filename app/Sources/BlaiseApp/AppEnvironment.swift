@@ -50,6 +50,36 @@ final class AppUIState {
     /// set on failure, cleared on the next success, shown as a dismissible
     /// banner over the split view.
     var lastActionError: String?
+    /// Published by the notes pane so the menu-bar editing commands can be
+    /// enabled honestly instead of guessing at the surface's state.
+    var notesEditingContext = NotesEditingContext()
+    /// Set by "Correct Selection…" / "Add Note…"; the notes pane consumes it
+    /// against whatever the user has selected, or the block they last aimed at.
+    var notesEditingRequest: NotesEditingRequest?
+
+    /// What the open notes surface can currently accept.
+    struct NotesEditingContext: Equatable {
+        var meetingID: MeetingID?
+        /// Final notes are on screen and their blocks accept instructions.
+        var surfaceReady = false
+        /// The command has something to aim at: a live selection, or the block
+        /// the pointer last entered. The selection host exists only on macOS 26
+        /// and only over prose, so the block is what carries these commands on
+        /// the best-effort tier and on list items, headers and table cells.
+        var hasTarget = false
+        /// The correction-path run gate as the pane currently evaluates it.
+        var correctionEnabled = false
+        /// Whether the selected summarization engine can edit notes. False
+        /// closes the correction command: nothing could serve it.
+        var engineCanEditNotes = false
+    }
+
+    struct NotesEditingRequest: Equatable {
+        var meetingID: MeetingID
+        var kind: EditingTarget.Kind
+        /// Monotonic, so invoking the same command twice re-fires it.
+        var token: Int
+    }
 
     struct DetailRequest: Equatable {
         enum Target: Equatable {
@@ -109,6 +139,33 @@ final class ListenerStatusHolder {
     }
 }
 
+/// The notes editing surface's presentation state, held live so a Settings
+/// change re-renders the open notes instead of waiting for a relaunch. The
+/// durable values are the `notes.*` KV keys; this mirrors them.
+@MainActor @Observable
+final class NotesPresentationHolder {
+    var marginNotesPlacement = NotesEditingSettings.defaultPlacement
+    var editingCalloutSeen = false
+
+    func load(from store: SettingsStore) async {
+        marginNotesPlacement = await NotesEditingSettings.marginNotesPlacement(from: store)
+        editingCalloutSeen = await NotesEditingSettings.editingCalloutSeen(from: store)
+    }
+
+    func setPlacement(_ value: MarginNotesPlacement, in store: SettingsStore) async {
+        marginNotesPlacement = value
+        try? await NotesEditingSettings.setMarginNotesPlacement(value, in: store)
+    }
+
+    /// The teaching callout is retired by any editing action, forever: the
+    /// `notes.editingCalloutSeen` key carries it across launches.
+    func retireEditingCallout(in store: SettingsStore) {
+        guard !editingCalloutSeen else { return }
+        editingCalloutSeen = true
+        Task { try? await NotesEditingSettings.markEditingCalloutSeen(in: store) }
+    }
+}
+
 @MainActor @Observable
 final class AppEnvironment {
     let database: BlaiseDatabase
@@ -146,6 +203,7 @@ final class AppEnvironment {
     let library: LibraryModel
     let activity: PipelineActivityHolder
     let engineSettings: EngineSettingsModel
+    let notesPresentation = NotesPresentationHolder()
     let uiState = AppUIState()
     // C11: live capture.
     let recordingController: RecordingController
@@ -597,6 +655,7 @@ final class AppEnvironment {
             let health = await notificationAdapter.notificationHealth()
             await MainActor.run { captureStatus.notificationHealth = health }
         }
+        await notesPresentation.load(from: settings)
         await googleCalendar.load()
         await calendarSuggestions.load()
         // Handoff persistent-failure warning → Notification Center: the
@@ -731,6 +790,7 @@ final class AppEnvironment {
                 guard path.status == .satisfied, wasUnsatisfied else { return }
                 Task { await pipeline.resumePendingNotes() }
                 Task { await pipeline.resumePendingDigests() }
+                Task { await pipeline.resumeOwedSettles() }
             }
             monitor.start(queue: DispatchQueue(label: BlaiseBundle.subsystem("notes.path")))
             notesPathMonitor = monitor
@@ -766,6 +826,15 @@ final class AppEnvironment {
                     break
                 }
             }
+        }
+        // N2 durable editor recovery starts only after the activity consumer is
+        // subscribed, so every timer-fired pass has a real run-event surface.
+        Task { [pipeline] in
+            try? await pipeline.rearmPendingNotesEditorActivations()
+            // N4: the owed sweep runs AFTER the N2 re-arm, so a meeting whose
+            // batch that re-arm just claimed is skipped as a candidate and
+            // drains on its own window instead.
+            await pipeline.resumeOwedSettles()
         }
 
         // Pending-batch purge: startup + a daily timer (contract).

@@ -404,8 +404,15 @@ func makePipelineHarness(
     vocabularyProvider: (@Sendable () -> PipelineVocabulary.UserLoad)? = nil,
     handoffKicker: (any HandoffKicking)? = nil,
     now: @escaping @Sendable () -> Date = { msDate() },
+    notesEditorSleep: @escaping @Sendable (Duration) async throws -> Void = { _ in
+        throw CancellationError()
+    },
+    afterNotesEditorSchedulerDatabaseOperation:
+        (@Sendable (MeetingID) async -> Void)? = nil,
     duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
-    duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil
+    duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil,
+    duringResurrectionGate:
+        (@Sendable (MeetingID, ProcessingPipeline.ResurrectionGatePhase) async -> Void)? = nil
 ) async throws -> PipelineHarness {
     let dataRoot = try makeTempRoot()
     let tempDir = dataRoot.appendingPathComponent("pipeline-tmp", isDirectory: true)
@@ -442,8 +449,12 @@ func makePipelineHarness(
             voiceProfileStore: voiceProfileStore,
             tempDirectory: tempDir,
             now: now,
+            notesEditorSleep: notesEditorSleep,
+            afterNotesEditorSchedulerDatabaseOperation:
+                afterNotesEditorSchedulerDatabaseOperation,
             duringParticipantParkCommit: duringParticipantParkCommit,
-            duringRunEntryAsk: duringRunEntryAsk)
+            duringRunEntryAsk: duringRunEntryAsk,
+            duringResurrectionGate: duringResurrectionGate)
     } else {
         pipeline = ProcessingPipeline(
             database: database,
@@ -454,8 +465,12 @@ func makePipelineHarness(
             voiceProfileStore: voiceProfileStore,
             tempDirectory: tempDir,
             now: now,
+            notesEditorSleep: notesEditorSleep,
+            afterNotesEditorSchedulerDatabaseOperation:
+                afterNotesEditorSchedulerDatabaseOperation,
             duringParticipantParkCommit: duringParticipantParkCommit,
-            duringRunEntryAsk: duringRunEntryAsk)
+            duringRunEntryAsk: duringRunEntryAsk,
+            duringResurrectionGate: duringResurrectionGate)
     }
     return PipelineHarness(
         dataRoot: dataRoot, tempDir: tempDir, database: database, pipeline: pipeline,

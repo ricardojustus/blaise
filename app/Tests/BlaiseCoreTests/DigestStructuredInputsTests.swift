@@ -499,7 +499,7 @@ private enum T31Fixtures {
     private func payload(_ meeting: Meeting, scoped: [AliasPair] = []) -> EvidencePayloadBuilder.Payload {
         EvidencePayloadBuilder.build(
             meeting: meeting, segments: [], notes: notes(meeting.id, scoped: scoped),
-            user: .shippedDefault)
+            user: .shippedDefault, corrections: [])
     }
 
     /// Varying `scopedAliasBindings` / `hostBinding` on a DigestRequest does NOT

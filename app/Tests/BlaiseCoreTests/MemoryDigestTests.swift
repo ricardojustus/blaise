@@ -360,16 +360,18 @@ private enum DigestFixtures {
         #expect(!p.contains("Sam"))
         #expect(!lower.contains("vexatron"))
         #expect(!lower.contains("árvore"))
-        // md-v4 is the shipped SYNTHESIS prompt; md-v5 and md-v6 (the shipped
-        // contract) reuse it verbatim — md-v5 added the notes-reconciler pass,
-        // md-v6 folds verify+reconcile into one combined audit pass. The md-v4
-        // synthesis hash pin is untouched by either pipeline bump.
+        // md-v4 is the shipped SYNTHESIS prompt; md-v5, md-v6 and md-v7 (the
+        // shipped contract) reuse it verbatim — md-v5 added the notes-reconciler
+        // pass, md-v6 folds verify+reconcile into one combined audit pass, md-v7
+        // adds presence-gated user-message correction blocks. The md-v4 synthesis
+        // hash pin is untouched by any of those pipeline bumps.
         #expect(DigestPromptBuilder.systemPrompt(for: .mdV4) == p)
         #expect(DigestPromptBuilder.systemPrompt(for: .mdV5) == p)
         #expect(DigestPromptBuilder.systemPrompt(for: .mdV6) == p)
+        #expect(DigestPromptBuilder.systemPrompt(for: .mdV7) == p)
         #expect(DigestPromptBuilder.systemPrompt == p)
-        #expect(DigestPromptBuilder.shippedVersion == .mdV6)
-        #expect(DigestPromptBuilder.promptVersion == "md-v6")
+        #expect(DigestPromptBuilder.shippedVersion == .mdV7)
+        #expect(DigestPromptBuilder.promptVersion == "md-v7")
     }
 
     /// `md-v5` is now the ROLLBACK pipeline branch (its separate notes-reconciler
@@ -399,17 +401,18 @@ private enum DigestFixtures {
         #expect(!lower.contains("árvore"))
     }
 
-    /// `md-v6` (the SHIPPED contract) is a PIPELINE bump that FOLDS the md-v5
-    /// transcript-only verify AND the notes reconcile into ONE combined audit
-    /// pass. The SYNTHESIS prompt stays md-v4 verbatim (hash pin untouched). The
-    /// combined-audit prompt sequences the verify fix-categories (STEP 1) BEFORE
-    /// the additive notes-reconcile procedure (STEP 2), and emits one final
-    /// digest from `## HEADER` (the `stripPreamble` contract). This is the exact
-    /// string validated on the 6-meeting gauntlet. No real identity.
+    /// The combined-audit pass — introduced by md-v6 and carried by the shipped
+    /// md-v7 — FOLDS the md-v5 transcript-only verify AND the notes reconcile
+    /// into ONE call. The SYNTHESIS prompt stays md-v4 verbatim (hash pin
+    /// untouched). The combined-audit prompt sequences the verify fix-categories
+    /// (STEP 1) BEFORE the additive notes-reconcile procedure (STEP 2), and emits
+    /// one final digest from `## HEADER` (the `stripPreamble` contract). This is
+    /// the exact string validated on the 6-meeting gauntlet. No real identity.
     @Test func mdV6CombinedAuditPassContract() {
         // Shipped contract + synthesis reuse (md-v4 verbatim).
-        #expect(DigestPromptBuilder.shippedVersion == .mdV6)
-        #expect(DigestPromptBuilder.promptVersion == "md-v6")
+        #expect(DigestPromptBuilder.shippedVersion == .mdV7)
+        #expect(DigestPromptBuilder.promptVersion == "md-v7")
+        #expect(DigestPromptBuilder.shippedVersion.usesCombinedAudit)
         #expect(DigestPromptBuilder.systemPrompt(for: .mdV6)
             == DigestPromptBuilder.systemDigestPromptV4)
         let c = DigestPromptBuilder.systemDigestCombinedAuditPrompt
@@ -656,7 +659,7 @@ private func inlineFlagBullets(_ prompt: String) -> [String] {
         let meeting = makeMeeting(status: .ready)
         let withNil = EvidencePayloadBuilder.build(
             meeting: meeting, segments: [], notes: notes(meetingID: meeting.id, digest: nil),
-            user: .shippedDefault)
+            user: .shippedDefault, corrections: [])
         let text = String(decoding: withNil.bytes, as: UTF8.self)
         #expect(!text.contains("memory_digest"))
     }
@@ -667,14 +670,14 @@ private func inlineFlagBullets(_ prompt: String) -> [String] {
         let meeting = makeMeeting(status: .ready)
         let withNil = EvidencePayloadBuilder.build(
             meeting: meeting, segments: [], notes: notes(meetingID: meeting.id, digest: nil),
-            user: .shippedDefault)
+            user: .shippedDefault, corrections: [])
         let withDigest = EvidencePayloadBuilder.build(
             meeting: meeting, segments: [],
             notes: notes(meetingID: meeting.id, digest: DigestFixtures.degenerateDigest),
-            user: .shippedDefault)
+            user: .shippedDefault, corrections: [])
         let text = String(decoding: withDigest.bytes, as: UTF8.self)
         #expect(text.contains("\"memory_digest\""))
-        #expect(text.contains("\"prompt_version\":\"md-v6\""))
+        #expect(text.contains("\"prompt_version\":\"md-v7\""))
         #expect(withDigest.versionHash != withNil.versionHash)
     }
 
@@ -686,10 +689,10 @@ private func inlineFlagBullets(_ prompt: String) -> [String] {
         let meeting = makeMeeting()
         let n = notes(meetingID: meeting.id, digest: DigestFixtures.degenerateDigest)
         let v1 = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: [], notes: n, user: .shippedDefault,
+            meeting: meeting, segments: [], notes: n, user: .shippedDefault, corrections: [],
             digestPromptVersion: .mdV1)
         let v2 = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: [], notes: n, user: .shippedDefault,
+            meeting: meeting, segments: [], notes: n, user: .shippedDefault, corrections: [],
             digestPromptVersion: .mdV2)
         #expect(v1.versionHash != v2.versionHash)
         #expect(String(decoding: v1.bytes, as: UTF8.self).contains("\"prompt_version\":\"md-v1\""))
@@ -701,8 +704,10 @@ private func inlineFlagBullets(_ prompt: String) -> [String] {
     @Test func rematerializationOfStoredDigestIsByteIdentical() throws {
         let meeting = makeMeeting(status: .ready)
         let n = notes(meetingID: meeting.id, digest: DigestFixtures.enDigest)
-        let first = EvidencePayloadBuilder.build(meeting: meeting, segments: [], notes: n, user: .shippedDefault)
-        let second = EvidencePayloadBuilder.build(meeting: meeting, segments: [], notes: n, user: .shippedDefault)
+        let first = EvidencePayloadBuilder.build(
+            meeting: meeting, segments: [], notes: n, user: .shippedDefault, corrections: [])
+        let second = EvidencePayloadBuilder.build(
+            meeting: meeting, segments: [], notes: n, user: .shippedDefault, corrections: [])
         #expect(first.versionHash == second.versionHash)
         #expect(first.bytes == second.bytes)
     }

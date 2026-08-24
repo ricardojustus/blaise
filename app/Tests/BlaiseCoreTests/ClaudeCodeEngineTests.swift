@@ -17,6 +17,7 @@ private struct CPInvocation: Sendable {
     let args: [String]
     let env: [String: String]
     let stdin: Data?
+    let systemPrompt: String?
 }
 
 private typealias CPResponse = ClaudeCodeSummarizationEngine.SubprocessOutcomeLike
@@ -153,7 +154,15 @@ private func makeCPHarness(
     let invocations = Recorder<CPInvocation>()
     let counter = Recorder<Int>()
     let runner: ClaudeCodeSummarizationEngine.CommandRunner = { executable, args, env, stdin in
-        invocations.append(CPInvocation(executable: executable, args: args, env: env, stdin: stdin))
+        let systemPrompt: String? = {
+            guard let flag = args.firstIndex(of: "--system-prompt-file"),
+                args.indices.contains(args.index(after: flag))
+            else { return nil }
+            return try? String(contentsOfFile: args[args.index(after: flag)], encoding: .utf8)
+        }()
+        invocations.append(CPInvocation(
+            executable: executable, args: args, env: env, stdin: stdin,
+            systemPrompt: systemPrompt))
         counter.append(1)
         let index = min(counter.values.count - 1, responses.count - 1)
         return responses[index]
@@ -168,6 +177,208 @@ private func makeCPHarness(
         runner: runner)
     return CPHarness(
         engine: engine, database: database, invocations: invocations, binaryURL: binaryURL)
+}
+
+@Suite struct ClaudeCodeNotesEditorTests {
+    private let editorJSON = #"{"ops":[{"field":"summary","find":"before","replace":"after","instruction":1}]}"#
+
+    @Test func editorUsesExactSchemaPromptAndStructuredOutput() async throws {
+        let harness = try await makeCPHarness(responses: [
+            cpStructuredSuccess(
+                structuredOutputJSON: editorJSON,
+                result: "prose that must never be parsed"),
+        ])
+        let request = makeNotesEditorRequest()
+        let result = try await harness.engine.editNotes(request, purpose: .notesEditor)
+
+        #expect(result.operations == [
+            .replace(field: .summary, find: "before", replace: "after", instruction: 1)
+        ])
+        #expect(result.usage?.estimatedCostUSD == 0.0)
+        #expect(harness.invocations.values.count == 1)
+
+        let invocation = try #require(harness.invocations.values.first)
+        let schemaIndex = try #require(invocation.args.firstIndex(of: "--json-schema"))
+        #expect(
+            invocation.args[invocation.args.index(after: schemaIndex)]
+                == NotesEditorWireContract.schemaJSON)
+        let turnsIndex = try #require(invocation.args.firstIndex(of: "--max-turns"))
+        #expect(invocation.args[invocation.args.index(after: turnsIndex)] == "3")
+        #expect(
+            Array(try #require(invocation.systemPrompt).utf8)
+                == Array(NotesEditorWireContract.systemPrompt.utf8))
+        #expect(
+            Array(try #require(invocation.stdin))
+                == Array(try NotesEditorWireContract.userMessage(for: request).utf8))
+        let receipts = try await harness.database.pool.read { db in
+            try CloudSpendReceipt.fetchAll(db)
+        }
+        #expect(receipts.count == 1)
+        #expect(receipts.first?.purpose == .notesEditor)
+    }
+
+    @Test func transientEditorFailureSpawnsExactlyOnce() async throws {
+        let harness = try await makeCPHarness(responses: [
+            cpOverloaded(),
+            cpStructuredSuccess(structuredOutputJSON: editorJSON),
+        ])
+        let error = await engineError {
+            try await harness.engine.editNotes(makeNotesEditorRequest(), purpose: .notesEditor)
+        }
+        #expect({
+            if case .transient = error { return true }
+            return false
+        }())
+        #expect(
+            harness.invocations.values.count == 1,
+            "the account adapter must not inherit invoke()'s five-retry loop")
+        #expect(try await harness.database.pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cloud_spend_receipt") ?? -1
+        } == 0)
+    }
+
+    @Test func unusableStructuredBodyIsPermanentUnlessTransportWasInterrupted() async throws {
+        let proseHarness = try await makeCPHarness(responses: [cpSuccess(result: editorJSON)])
+        let proseError = await engineError {
+            try await proseHarness.engine.editNotes(
+                makeNotesEditorRequest(), purpose: .generation)
+        }
+        #expect({
+            if case .permanent = proseError { return true }
+            return false
+        }())
+        #expect(proseHarness.invocations.values.count == 1)
+
+        let envelopeHarness = try await makeCPHarness(responses: [
+            CPResponse(stdout: Data("not a CLI envelope".utf8), exitStatus: 0)
+        ])
+        let envelopeError = await engineError {
+            try await envelopeHarness.engine.editNotes(
+                makeNotesEditorRequest(), purpose: .generation)
+        }
+        #expect({
+            if case .permanent = envelopeError { return true }
+            return false
+        }())
+        #expect(envelopeHarness.invocations.values.count == 1)
+
+        let timedOutBodyHarness = try await makeCPHarness(responses: [
+            CPResponse(
+                stdout: Data("partial response body".utf8), exitStatus: nil, timedOut: true)
+        ])
+        let timedOutBodyError = await engineError {
+            try await timedOutBodyHarness.engine.editNotes(
+                makeNotesEditorRequest(), purpose: .generation)
+        }
+        #expect({
+            if case .transient = timedOutBodyError { return true }
+            return false
+        }())
+        #expect(timedOutBodyHarness.invocations.values.count == 1)
+
+        let malformedHarness = try await makeCPHarness(responses: [
+            cpStructuredSuccess(structuredOutputJSON: #"{"ops":[{"field":"summary","find":"before","replace":"after"}]}"#)
+        ])
+        let malformedError = await engineError {
+            try await malformedHarness.engine.editNotes(
+                makeNotesEditorRequest(), purpose: .notesEditor)
+        }
+        #expect({
+            if case .permanent = malformedError { return true }
+            return false
+        }())
+        #expect(malformedHarness.invocations.values.count == 1)
+        let malformedReceipts = try await malformedHarness.database.pool.read { db in
+            try CloudSpendReceipt.fetchAll(db)
+        }
+        #expect(malformedReceipts.count == 1)
+        #expect(malformedReceipts.first?.purpose == .notesEditor)
+    }
+}
+
+// MARK: - SC-6 / SC-17: the account adapter's digest-editor seam
+
+@Suite struct ClaudeCodeDigestEditorTests {
+    private let digestOpsJSON =
+        #"{"ops":[{"find":"in May 2026","replace":"in June 2026","instruction":1}]}"#
+
+    @Test("SC-17: the account adapter sends the digest ops schema server-side, one spawn")
+    func digestInvocationCarriesTheSchemaAndSpawnsOnce() async throws {
+        let harness = try await makeCPHarness(responses: [
+            cpStructuredSuccess(
+                structuredOutputJSON: digestOpsJSON,
+                result: "prose that must never be parsed")
+        ])
+        let request = makeDigestEditorRequest()
+        let result = try await harness.engine.editDigest(request, purpose: .digestEditor)
+
+        #expect(result.operations == [
+            DigestEditOperation(find: "in May 2026", replace: "in June 2026", instruction: 1)
+        ])
+        #expect(harness.invocations.values.count == 1)
+
+        let invocation = try #require(harness.invocations.values.first)
+        let schemaIndex = try #require(invocation.args.firstIndex(of: "--json-schema"))
+        #expect(
+            invocation.args[invocation.args.index(after: schemaIndex)]
+                == DigestEditorWireContract.schemaJSON)
+        #expect(
+            Array(try #require(invocation.systemPrompt).utf8)
+                == Array(DigestEditorWireContract.systemPrompt.utf8))
+        #expect(
+            Array(try #require(invocation.stdin))
+                == Array(DigestEditorWireContract.userMessage(for: request).utf8))
+
+        // SC-6: the adapter records usage on a usable response, under the
+        // digest-editor purpose.
+        let receipts = try await harness.database.pool.read { db in
+            try CloudSpendReceipt.fetchAll(db)
+        }
+        #expect(receipts.count == 1)
+        #expect(receipts.first?.purpose == .digestEditor)
+    }
+
+    @Test("SC-17: a transient digest failure spawns exactly once and leaves no receipt")
+    func transientDigestFailureSpawnsExactlyOnce() async throws {
+        let harness = try await makeCPHarness(responses: [
+            cpOverloaded(),
+            cpStructuredSuccess(structuredOutputJSON: digestOpsJSON),
+        ])
+        let error = await engineError {
+            try await harness.engine.editDigest(makeDigestEditorRequest(), purpose: .digestEditor)
+        }
+        #expect({
+            if case .transient = error { return true }
+            return false
+        }())
+        #expect(
+            harness.invocations.values.count == 1,
+            "the digest adapter must not inherit invoke()'s five-retry loop")
+        #expect(try await harness.database.pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cloud_spend_receipt") ?? -1
+        } == 0, "a body-less failure leaves no receipt row")
+    }
+
+    @Test("SC-6: a usable digest body that will not decode is permanent and still receipts")
+    func undecodableDigestBodyIsPermanent() async throws {
+        let harness = try await makeCPHarness(responses: [
+            cpStructuredSuccess(
+                structuredOutputJSON: #"{"ops":[{"find":"a","replace":"b"}]}"#)
+        ])
+        let error = await engineError {
+            try await harness.engine.editDigest(makeDigestEditorRequest(), purpose: .digestEditor)
+        }
+        #expect({
+            if case .permanent = error { return true }
+            return false
+        }())
+        #expect(harness.invocations.values.count == 1)
+        let receipts = try await harness.database.pool.read { db in
+            try CloudSpendReceipt.fetchAll(db)
+        }
+        #expect(receipts.count == 1)
+        #expect(receipts.first?.purpose == .digestEditor)
+    }
 }
 
 // MARK: - Tests
@@ -329,7 +540,7 @@ private func makeCPHarness(
     }
 
     /// Notes JSON wrapped in a ```json fence + prose is still parsed (the `-p`
-    /// path has no server-side schema enforcement, so we extract the object).
+    /// fallback path carries no schema, so we extract the object).
     @Test func notesFenceWrappedJSONIsParsed() async throws {
         let wrapped = "Here are the notes:\n```json\n" + cpNotesJSON + "\n```\nDone."
         let harness = try await makeCPHarness(responses: [cpSuccess(result: wrapped)])

@@ -188,12 +188,11 @@ let sampleEngineResponseJSON = """
     }
 
     @Test func unknownMeetingTypeDecodesToGeneralNotThrow() throws {
-        // Leniency (account-engine hardening, commit 0d89f42): the `claude -p`
-        // notes path has no server-side enum enforcement, so an out-of-taxonomy
-        // meeting_type must decode to `.general` rather than failing the ENTIRE
-        // notes. No-op for the schema-enforced API/MLX engines. The dedicated
-        // contract lives in NotesMeetingTypeLeniencyTests; this pins the engine
-        // decode path too.
+        // Leniency: the `claude -p` notes path has a fallback that carries no schema,
+        // so an out-of-taxonomy meeting_type must decode to `.general` rather than
+        // failing the ENTIRE notes. No-op on every schema-enforced path. The dedicated
+        // contract lives in NotesMeetingTypeLeniencyTests; this pins the engine decode
+        // path too.
         let json = sampleEngineResponseJSON.replacingOccurrences(
             of: "\"project_review\"", with: "\"standup\"")
         let (structured, _) = try NotesEngineResponse.decode(from: Data(json.utf8)).toNotes()

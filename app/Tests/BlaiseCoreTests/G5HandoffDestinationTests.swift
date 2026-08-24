@@ -537,7 +537,8 @@ private func selectLocalFolder(_ database: BlaiseDatabase, _ folder: URL, sideca
         else { throw TestFailure() }
         let segments = try await TranscriptRepository(database: database).segments(meetingID: item.meetingID)
         let built = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: segments, notes: notes, user: .shippedDefault)
+            meeting: meeting, segments: segments, notes: notes, user: .shippedDefault,
+            corrections: [])
 
         #expect(localJSON == built.bytes)
         #expect(EvidencePayloadBuilder.sha256Hex(localJSON) == built.versionHash)

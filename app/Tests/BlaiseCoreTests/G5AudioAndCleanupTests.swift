@@ -50,7 +50,7 @@ private func enqueueSecondVersion(_ database: BlaiseDatabase, _ meetingID: Meeti
     notes.markdown += "\n<!-- v2 correction -->"
     let segments = try await TranscriptRepository(database: database).segments(meetingID: meetingID)
     let payload = EvidencePayloadBuilder.build(
-        meeting: meeting, segments: segments, notes: notes, user: .shippedDefault)
+        meeting: meeting, segments: segments, notes: notes, user: .shippedDefault, corrections: [])
     let relative = database.paths.relativeHandoffPayloadPath(
         meetingID: meetingID, versionHash: payload.versionHash)
     try ImmutablePayloadWriter.write(

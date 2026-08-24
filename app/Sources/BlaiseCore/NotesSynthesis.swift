@@ -278,12 +278,58 @@ public enum NotesPromptBuilder {
         metadata.append("The user is: \(request.user.name)\(aliases)")
         sections.append("MEETING:\n" + metadata.joined(separator: "\n"))
 
+        // Presence-gated USER CORRECTIONS block, after the meeting metadata
+        // and before the transcript (instructions precede the material). HARD
+        // presence guard like the vocabulary/hints blocks: no corrections →
+        // byte-identical user message.
+        if let correctionsBlock = Self.correctionsBlock(request.corrections) {
+            sections.append(correctionsBlock)
+        }
+
         let transcript = request.transcript.map { segment in
             "[\(segment.speakerName ?? segment.speakerLabel)] \(segment.text)"
         }.joined(separator: "\n")
         sections.append("TRANSCRIPT:\n" + transcript)
 
         return sections.joined(separator: "\n\n")
+    }
+
+    /// The corrections block. Corrections are AUTHORITATIVE (the user reviewed
+    /// an earlier draft; their statement of fact outranks transcript
+    /// inference). nil when the meeting has no understanding rows (presence
+    /// gate). Margin notes never appear here — they are the user's own text
+    /// and are excluded from the request upstream.
+    ///
+    /// Every user-authored string goes through `promptField`: folded to ONE
+    /// line, with every `"` scalar mapped off the delimiter used below. A
+    /// newline forges an additional numbered entry and a quote character ends
+    /// its own data position mid-line; either way the forgery lands inside a
+    /// block the prompt itself labels authoritative — the highest-trust
+    /// position in the whole message. This is the only interpolation where a
+    /// quote delimits anything, so it is the only one that maps them.
+    static func correctionsBlock(_ corrections: [NotesCorrection]) -> String? {
+        let understanding = corrections.filter { $0.kind == .understanding }
+        guard !understanding.isEmpty else { return nil }
+        var lines: [String] = []
+        lines.append(
+            "USER CORRECTIONS (authoritative — the user reviewed an earlier draft of these notes; these corrections override anything the transcript seems to imply):")
+        lines.append(
+            "Where a correction conflicts with the transcript, the correction wins: treat the transcript passage as misheard or misunderstood.")
+        for (index, correction) in understanding.enumerated() {
+            lines.append(
+                "\(index + 1). In the \(sectionLabel(correction.section)), an earlier draft said: \"\(CorrectionSanitize.promptField(correction.quotedText))\". The user corrects: \(CorrectionSanitize.promptField(correction.userText))")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func sectionLabel(_ section: MeetingCorrection.Section) -> String {
+        switch section {
+        case .summary: return "summary"
+        case .detailedNotes: return "detailed notes"
+        case .decision: return "decisions"
+        case .actionItem: return "action items"
+        case .userActionItem: return "your action items"
+        }
     }
 
     /// DD/MM/YYYY in `timeZone` (default: the system time zone).
@@ -341,11 +387,12 @@ struct NotesEngineResponse: Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.title = try container.decodeIfPresent(String.self, forKey: .title)
         self.summary = try container.decode(String.self, forKey: .summary)
-        // Lenient: the API/MLX engines get a schema-enforced enum, but the
-        // `claude -p` (Account) engine has NO server-side json_schema enforcement and
-        // can emit a free-text phrase here — an UNRECOGNIZED (or absent) value maps to
-        // `.general` rather than throwing and failing the ENTIRE notes. `decodeIfPresent`
-        // only nils on an ABSENT key, so we decode the raw String and validate it.
+        // Lenient: every engine's notes call enforces this enum server-side, but the
+        // `claude -p` (Account) engine also has a fallback path carrying no schema,
+        // where the model can emit a free-text phrase here — an UNRECOGNIZED (or absent)
+        // value maps to `.general` rather than throwing and failing the ENTIRE notes.
+        // `decodeIfPresent` only nils on an ABSENT key, so we decode the raw String and
+        // validate it.
         self.meetingType =
             (try container.decodeIfPresent(String.self, forKey: .meetingType))
             .flatMap(MeetingType.init(rawValue:)) ?? .general

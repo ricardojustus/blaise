@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import os
 
 // MARK: - Pipeline version
@@ -22,6 +23,9 @@ enum PipelineCrashPoint: String {
     case persistTranscript = "persist-transcript"
     /// Between the immutable payload write and `finalizeMeetingProcessing`.
     case preFinalize = "pre-finalize"
+    /// Between the committed finalize transaction and the `notes.md` promote
+    /// the notes-only paths defer until after it.
+    case notesPromote = "notes-promote"
 }
 
 enum PipelineCrashHooks {
@@ -143,6 +147,8 @@ public struct AppliedCorrection: Codable, Sendable, Equatable {
 
 public struct NotesFallbackRecord: Codable, Sendable, Equatable {
     public let primaryEngineID: String
+    /// Its one consumer is the meeting's processing note, which a person
+    /// reads — so it holds the human rendering, never the diagnostic one.
     public let reason: String
     public let fallbackEngineID: String
 }
@@ -254,6 +260,24 @@ public actor ProcessingPipeline {
     private let meetEventsSweeper: any MeetEventsSweeping
     private let tempDirectory: URL
     private let now: @Sendable () -> Date
+    /// One injected sleep seam owns both the 5-minute activation timers and
+    /// the short within-activation transport backoff. Production uses the
+    /// continuous clock; tests advance a manual clock with no wall waits.
+    private let notesEditorSleep: @Sendable (Duration) async throws -> Void
+    /// The settle scheduler's own injected sleep seam (the 10-minute idle
+    /// window and the 5-minute digest-failure re-arm). Production uses the
+    /// continuous clock; tests advance a manual clock with no wall waits.
+    private let settleSleep: @Sendable (Duration) async throws -> Void
+    /// Test-only suspension seam for the actor-reentrancy window after an
+    /// editor scheduler database decision has committed or returned. nil in
+    /// production; scheduler correctness continues to come from slot UUIDs.
+    private let afterNotesEditorSchedulerDatabaseOperation:
+        (@Sendable (MeetingID) async -> Void)?
+    /// Test-only suspension seam in the window between the settle terminal
+    /// step's last predicate sample and the executor leaving the in-flight set
+    /// — the window a latch-setting signal can land in. nil in production; a
+    /// test uses it to commit at exactly that moment instead of racing it.
+    private let afterSettleTerminalStep: (@Sendable (MeetingID) async -> Void)?
     /// G15 R2-H1 pin: a suspension point in the window between the gate's
     /// pending decision and the participant marker's commit — the window a
     /// Confirm or Skip can land in. nil in production (one nil check on the
@@ -265,7 +289,26 @@ public actor ProcessingPipeline {
     /// return. nil in production (one nil check per run entry); a test uses it
     /// to click Cancel at exactly that moment instead of racing it.
     private let duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)?
+    /// The cancellation windows of the absence check: `.beforeStoredRead` sits
+    /// ahead of the gate's first (cancellation-aware) database await,
+    /// `.duringCandidateDerivation` inside the re-derivation of the candidate
+    /// as stage 12 would persist it, ahead of its reads, `.afterVerdict`
+    /// between a hit and its bookkeeping.
+    public enum ResurrectionGatePhase: Sendable {
+        case beforeStoredRead
+        case duringCandidateDerivation
+        case afterVerdict
+    }
+    /// N3 cancellation pins: a suspension point at each of those windows. nil
+    /// in production: one nil check per gate call, a second only when the
+    /// withdrawn set is non-empty, a third only on a hit. A test cancels at
+    /// exactly that moment instead of racing it.
+    private let duringResurrectionGate:
+        (@Sendable (MeetingID, ResurrectionGatePhase) async -> Void)?
     private let chain = EngineTaskChain()
+    /// Set synchronously by quit, read by the detach handler. `nonisolated`
+    /// because `applicationShouldTerminate` cannot await the actor.
+    private nonisolated let terminating = Mutex(false)
     private let logger = Logger(subsystem: BlaiseBundle.identifier, category: "pipeline")
     private var eventContinuations: [UUID: AsyncStream<PipelineEvent>.Continuation] = [:]
 
@@ -276,6 +319,15 @@ public actor ProcessingPipeline {
     /// IS the idleness key the §1 no-op rule needs: a meeting with no run in
     /// flight has no token, so its cancel is a no-op.
     private var cancelTokens: [MeetingID: RunCancelHandle] = [:]
+
+    /// Scheduling state only. Durable truth remains the pending correction
+    /// rows. A slot is removed by its UUID before its task enters the editor,
+    /// so a live mutation can never cancel an already-running editor call.
+    private struct SleepingNotesEditorActivation {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+    private var sleepingNotesEditorActivations: [MeetingID: SleepingNotesEditorActivation] = [:]
 
     /// G15 §2 ask bookkeeping, all consumed by the notes-stage gate.
     /// `participantStopAsks`: the confirmation was already raised for this
@@ -329,8 +381,19 @@ public actor ProcessingPipeline {
         voiceProfileStore: VoiceProfileStore? = nil,
         tempDirectory: URL = FileManager.default.temporaryDirectory,
         now: @escaping @Sendable () -> Date = { Date() },
+        notesEditorSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        },
+        settleSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        },
+        afterNotesEditorSchedulerDatabaseOperation:
+            (@Sendable (MeetingID) async -> Void)? = nil,
+        afterSettleTerminalStep: (@Sendable (MeetingID) async -> Void)? = nil,
         duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
-        duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil
+        duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil,
+        duringResurrectionGate:
+            (@Sendable (MeetingID, ResurrectionGatePhase) async -> Void)? = nil
     ) {
         self.database = database
         self.registry = registry
@@ -343,8 +406,14 @@ public actor ProcessingPipeline {
         self.meetEventsSweeper = meetEventsSweeper
         self.tempDirectory = tempDirectory
         self.now = now
+        self.notesEditorSleep = notesEditorSleep
+        self.settleSleep = settleSleep
+        self.afterNotesEditorSchedulerDatabaseOperation =
+            afterNotesEditorSchedulerDatabaseOperation
+        self.afterSettleTerminalStep = afterSettleTerminalStep
         self.duringParticipantParkCommit = duringParticipantParkCommit
         self.duringRunEntryAsk = duringRunEntryAsk
+        self.duringResurrectionGate = duringResurrectionGate
     }
 
     /// Convenience overload for a CONSTANT vocabulary stack (tests, regression
@@ -359,8 +428,19 @@ public actor ProcessingPipeline {
         voiceProfileStore: VoiceProfileStore? = nil,
         tempDirectory: URL = FileManager.default.temporaryDirectory,
         now: @escaping @Sendable () -> Date = { Date() },
+        notesEditorSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        },
+        settleSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        },
+        afterNotesEditorSchedulerDatabaseOperation:
+            (@Sendable (MeetingID) async -> Void)? = nil,
+        afterSettleTerminalStep: (@Sendable (MeetingID) async -> Void)? = nil,
         duringParticipantParkCommit: (@Sendable (MeetingID) async -> Void)? = nil,
-        duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil
+        duringRunEntryAsk: (@Sendable (MeetingID) async -> Void)? = nil,
+        duringResurrectionGate:
+            (@Sendable (MeetingID, ResurrectionGatePhase) async -> Void)? = nil
     ) {
         self.init(
             database: database, registry: registry, diarizer: diarizer,
@@ -370,9 +450,14 @@ public actor ProcessingPipeline {
             },
             handoffKicker: handoffKicker,
             meetEventsSweeper: meetEventsSweeper, voiceProfileStore: voiceProfileStore,
-            tempDirectory: tempDirectory, now: now,
+            tempDirectory: tempDirectory, now: now, notesEditorSleep: notesEditorSleep,
+            settleSleep: settleSleep,
+            afterNotesEditorSchedulerDatabaseOperation:
+                afterNotesEditorSchedulerDatabaseOperation,
+            afterSettleTerminalStep: afterSettleTerminalStep,
             duringParticipantParkCommit: duringParticipantParkCommit,
-            duringRunEntryAsk: duringRunEntryAsk)
+            duringRunEntryAsk: duringRunEntryAsk,
+            duringResurrectionGate: duringResurrectionGate)
     }
 
     // MARK: - Progress
@@ -784,21 +869,33 @@ public actor ProcessingPipeline {
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: notes.structured, labelMap: labelMap, language: notes.language,
                 groundedMLabels: Self.groundedMicLabels(in: segments)).notes
+            // Every re-mint re-weaves the current margin notes: an unrelated
+            // rename must not drop them from the delivered notes.
+            let correctionRows = try await self.correctionRows(meetingID: meetingID)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: title,
-                userName: user.name)
+                userName: user.name, annotations: correctionRows)
             try Data(notes.markdown.utf8).write(
                 to: self.database.paths.notesURL(meetingID), options: .atomic)
             let payload = EvidencePayloadBuilder.build(
                 meeting: meeting, segments: segments, notes: notes,
-                user: user)
+                user: user, corrections: correctionRows,
+                includeMemoryDigest: await MemoryDigestSettings.isEnabled(in: self.settings))
             let relativePath = self.database.paths.relativeHandoffPayloadPath(
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
+            // The re-mint re-WEAVES annotations, so the live rows are also
+            // re-ANCHORED here: a shifted or dropped anchor would otherwise
+            // leave a wrong status/occurrence behind until the next synthesis,
+            // and the management list would disagree with notes.md. Computed
+            // OUTSIDE the write closure (`notes` is a captured var).
+            let reanchorUpdates = CorrectionAnchoring.reanchor(
+                annotations: correctionRows, against: notes.structured)
             let rootURL = self.database.rootURL
             try await self.database.pool.write { [notes] db in
                 try notes.upsert(db)
+                try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
                 _ = try HandoffRepository.enqueue(
                     db, rootURL: rootURL, meetingID: meetingID,
                     versionHash: payload.versionHash, payloadPath: relativePath)
@@ -920,21 +1017,32 @@ public actor ProcessingPipeline {
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: notes.structured, labelMap: labelMap, language: notes.language,
                 groundedMLabels: Self.groundedMicLabels(in: finalSegments)).notes
+            // Re-weave the current margin notes with the re-rendered markdown.
+            let correctionRows = try await self.correctionRows(meetingID: meetingID)
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: finalMeeting.title,
-                userName: user.name)
+                userName: user.name, annotations: correctionRows)
             try Data(notes.markdown.utf8).write(
                 to: self.database.paths.notesURL(meetingID), options: .atomic)
             let payload = EvidencePayloadBuilder.build(
                 meeting: finalMeeting, segments: finalSegments, notes: notes,
-                user: user)
+                user: user, corrections: correctionRows,
+                includeMemoryDigest: await MemoryDigestSettings.isEnabled(in: self.settings))
             let relativePath = self.database.paths.relativeHandoffPayloadPath(
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
+            // A speaker rename rewrites notes.structured (layer-1 substitution
+            // + S-label neutralization), so an anchor quoting the old surface
+            // may move or vanish — re-anchor the live rows in the same
+            // transaction as the re-woven mint. Computed outside the write
+            // closure (`notes` is a captured var).
+            let reanchorUpdates = CorrectionAnchoring.reanchor(
+                annotations: correctionRows, against: notes.structured)
             let rootURL = self.database.rootURL
             try await self.database.pool.write { [notes] db in
                 try notes.upsert(db)
+                try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
                 _ = try HandoffRepository.enqueue(
                     db, rootURL: rootURL, meetingID: meetingID,
                     versionHash: payload.versionHash, payloadPath: relativePath)
@@ -1116,9 +1224,31 @@ public actor ProcessingPipeline {
             notes.structured = SLabelNeutralizer.neutralize(
                 notes: edited, labelMap: labelMap, language: notes.language,
                 groundedMLabels: Self.groundedMicLabels(in: segments)).notes
+            // The name correction applies to the ANCHORS too. A note hung on
+            // "Kobi closed the contract" is about that sentence, not about the
+            // spelling of the name in it — leaving the quote behind orphans
+            // the note into "Your notes" over a fix the user made one click
+            // earlier. Every fold-equal mention in the quote is rewritten (the
+            // `memoryDigest` precedent above); a quote that then no longer
+            // matches the prose — the position-scoped case, where only one of
+            // several mentions moved — is caught honestly by the re-anchor
+            // pass below.
+            var correctionRows: [MeetingCorrection] = []
+            var quoteRewrites: [String: String] = [:]
+            for var row in try await self.correctionRows(meetingID: meetingID) {
+                if row.kind == .annotation {
+                    let rewritten = NameSubstitution.applyTextCorrection(
+                        text: row.quotedText, original: original, replacement: clean).text
+                    if rewritten != row.quotedText {
+                        row.quotedText = rewritten
+                        quoteRewrites[row.id] = rewritten
+                    }
+                }
+                correctionRows.append(row)
+            }
             notes.markdown = try NotesRenderer.render(
                 notes.structured, language: notes.language, meetingTitle: meeting.title,
-                userName: user.name)
+                userName: user.name, annotations: correctionRows)
             try Data(notes.markdown.utf8).write(
                 to: self.database.paths.notesURL(meetingID), options: .atomic)
 
@@ -1133,20 +1263,1453 @@ public actor ProcessingPipeline {
             }
             let payload = EvidencePayloadBuilder.build(
                 meeting: finalMeeting, segments: segments, notes: notes,
-                user: user)
+                user: user, corrections: correctionRows,
+                includeMemoryDigest: await MemoryDigestSettings.isEnabled(in: self.settings))
             let relativePath = self.database.paths.relativeHandoffPayloadPath(
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
                 payload.bytes, to: self.database.rootURL.appendingPathComponent(relativePath))
+            // The name replacement edits the very prose the anchors quote, so
+            // an anchor carrying the old surface stops matching — re-anchor
+            // the live rows here rather than leaving them wrong until the next
+            // synthesis. Computed outside the write closure (`notes` is a
+            // captured var).
+            let reanchorUpdates = CorrectionAnchoring.reanchor(
+                annotations: correctionRows, against: notes.structured)
             let rootURL = self.database.rootURL
-            try await self.database.pool.write { [notes] db in
+            try await self.database.pool.write { [notes, quoteRewrites] db in
                 try notes.upsert(db)
+                // Quote rewrites before the re-anchor: the rewritten quotes are
+                // what the re-anchor result was computed against, so both land
+                // in one transaction with the mint they describe.
+                try MeetingCorrectionStore.applyQuoteRewrites(db, rewrites: quoteRewrites)
+                try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
                 _ = try HandoffRepository.enqueue(
                     db, rootURL: rootURL, meetingID: meetingID,
                     versionHash: payload.versionHash, payloadPath: relativePath)
             }
             await self.handoffKicker.kick()
             return count
+        }
+    }
+
+    // MARK: - Span-anchored corrections and margin notes
+
+
+    /// The meeting's durable correction rows (display order). FAIL-CLOSED: a
+    /// read error throws rather than reporting "no rows". Treating an I/O
+    /// failure as an empty set would let a synthesis run regenerate the notes
+    /// with ZERO pinned corrections and silently erase user truth the run was
+    /// supposed to honor; the throw lands on the caller's existing failure
+    /// surface, which retries with the rows intact.
+    func correctionRows(meetingID: MeetingID) async throws -> [MeetingCorrection] {
+        try await database.pool.read { db in
+            try MeetingCorrectionStore.all(db, meetingID: meetingID)
+        }
+    }
+
+    /// Records a correction/note row. The row is durable before follow-up work:
+    /// an understanding add arms a fresh notes-editor quiet window, while an
+    /// annotation add re-mints immediately. Returns the inserted row plus whether
+    /// that annotation re-mint refused.
+    @discardableResult
+    public func addCorrection(
+        meetingID: MeetingID, kind: MeetingCorrection.Kind,
+        section: MeetingCorrection.Section, quotedText: String, occurrence: Int,
+        userText: String
+    ) async throws -> CorrectionWriteResult {
+        let clock = now
+        let row = try await database.pool.write { db -> MeetingCorrection in
+            let proposedCreatedAt = clock()
+            let createdAt = kind == .understanding
+                ? try MeetingCorrectionStore.strictlyLatestCreatedAt(
+                    db, meetingID: meetingID, now: proposedCreatedAt)
+                : proposedCreatedAt
+            let row = MeetingCorrection(
+                meetingID: meetingID, kind: kind, section: section,
+                quotedText: quotedText.trimmingCharacters(in: .whitespacesAndNewlines),
+                occurrence: occurrence,
+                userText: userText.trimmingCharacters(in: .whitespacesAndNewlines),
+                createdAt: createdAt)
+            try MeetingCorrectionStore.insert(db, row)
+            if kind == .annotation {
+                try MeetingCorrectionStore.recordAnnotationMutation(
+                    db, meetingID: meetingID, proposedTimestamp: proposedCreatedAt)
+            }
+            return row
+        }
+        let remintRefused = try await remintIfAnnotation(row, meetingID: meetingID)
+        if kind == .understanding {
+            armNotesEditorActivation(meetingID: meetingID)
+        }
+        await armSettleAfterMutation(meetingID: meetingID)
+        return CorrectionWriteResult(row: row, remintRefused: remintRefused)
+    }
+
+    /// Edit of an existing row. An annotation edit re-mints (its rendered
+    /// aside must move now); an understanding edit returns the row to `pending`
+    /// and arms a fresh notes-editor quiet window. Returns the re-mint refusal
+    /// flag.
+    @discardableResult
+    public func updateCorrection(
+        meetingID: MeetingID, id: String, quotedText: String, occurrence: Int,
+        userText: String
+    ) async throws -> Bool {
+        let clock = now
+        let updated = try await database.pool.write { db -> MeetingCorrection? in
+            guard let row = try MeetingCorrection.fetchOne(db, key: id),
+                row.meetingID == meetingID
+            else { return nil }
+            let restamp = row.kind == .understanding
+                ? try MeetingCorrectionStore.strictlyLatestCreatedAt(
+                    db, meetingID: meetingID, now: clock())
+                : nil
+            try MeetingCorrectionStore.update(
+                db, id: id, quotedText: quotedText, occurrence: occurrence,
+                userText: userText,
+                status: row.kind == .understanding ? .pending : row.status,
+                createdAt: restamp)
+            if row.kind == .annotation {
+                try MeetingCorrectionStore.recordAnnotationMutation(
+                    db, meetingID: meetingID, proposedTimestamp: clock())
+            }
+            return try MeetingCorrection.fetchOne(db, key: id)
+        }
+        guard let updated else { return false }
+        let remintRefused = try await remintIfAnnotation(updated, meetingID: meetingID)
+        if updated.kind == .understanding {
+            armNotesEditorActivation(meetingID: meetingID)
+        }
+        await armSettleAfterMutation(meetingID: meetingID)
+        return remintRefused
+    }
+
+    /// Deletion IS the undo. An annotation delete re-mints so its aside leaves
+    /// notes.md and the payload immediately. An understanding delete is row-only:
+    /// it never reverts notes bytes and cancels the sleeping editor activation
+    /// only when no pending understanding remains. Returns the re-mint refusal.
+    @discardableResult
+    public func deleteCorrection(meetingID: MeetingID, id: String) async throws -> Bool {
+        let observedActivationID = sleepingNotesEditorActivations[meetingID]?.id
+        let clock = now
+        let result = try await database.pool.write {
+            db -> (row: MeetingCorrection, hasPendingUnderstanding: Bool)? in
+            guard let row = try MeetingCorrection.fetchOne(db, key: id),
+                row.meetingID == meetingID
+            else { return nil }
+            try MeetingCorrectionStore.delete(db, id: id)
+            if row.kind == .annotation {
+                try MeetingCorrectionStore.recordAnnotationMutation(
+                    db, meetingID: meetingID, proposedTimestamp: clock())
+            }
+            return (
+                row,
+                try MeetingCorrectionStore.hasPendingUnderstanding(db, meetingID: meetingID))
+        }
+        guard let result else { return false }
+        if result.row.kind == .understanding, !result.hasPendingUnderstanding,
+            sleepingNotesEditorActivations[meetingID]?.id == observedActivationID
+        {
+            cancelSleepingNotesEditorActivation(meetingID: meetingID)
+        }
+        let remintRefused = try await remintIfAnnotation(result.row, meetingID: meetingID)
+        await armSettleAfterMutation(meetingID: meetingID)
+        return remintRefused
+    }
+
+    /// Resolve / Reopen lives beside every other correction mutation so the
+    /// lifecycle write and the editor scheduler cannot diverge. The fetched
+    /// kind derives the legal stored status: an understanding can only resolve
+    /// or return to pending, while an annotation reopens through anchoring.
+    /// Reopening an understanding restamps its chronological precedence in the
+    /// same GRDB transaction as the status change.
+    public func setCorrectionResolved(
+        meetingID: MeetingID, id: String, resolved: Bool,
+        structuredNotes: NotesStructured?
+    ) async throws {
+        let observedActivationID = sleepingNotesEditorActivations[meetingID]?.id
+        let clock = now
+        let result = try await database.pool.write {
+            db -> (row: MeetingCorrection, hasPendingUnderstanding: Bool)? in
+            guard let row = try MeetingCorrection.fetchOne(db, key: id),
+                row.meetingID == meetingID
+            else { return nil }
+            let status: MeetingCorrection.Status
+            if resolved {
+                status = .resolved
+            } else if row.kind == .understanding {
+                status = .pending
+            } else if let structuredNotes {
+                let blocks = CorrectionAnchoring.blocks(
+                    of: structuredNotes, section: row.section)
+                status = CorrectionAnchoring.resolve(
+                    quote: row.quotedText, occurrence: row.occurrence, in: blocks) == nil
+                    ? .stale : .applied
+            } else {
+                status = .pending
+            }
+            let isUnderstandingReopen = row.kind == .understanding
+                && row.status == .resolved && status == .pending
+            let restamp = isUnderstandingReopen
+                ? try MeetingCorrectionStore.strictlyLatestCreatedAt(
+                    db, meetingID: meetingID, now: clock())
+                : nil
+            try MeetingCorrectionStore.setStatus(
+                db, id: id, status: status, createdAt: restamp)
+            let stored = try MeetingCorrection.fetchOne(db, key: id) ?? row
+            return (
+                stored,
+                try MeetingCorrectionStore.hasPendingUnderstanding(db, meetingID: meetingID))
+        }
+        guard let result else { return }
+        if result.row.kind == .understanding, result.row.status == .pending {
+            armNotesEditorActivation(meetingID: meetingID)
+        } else if result.row.kind == .understanding, !result.hasPendingUnderstanding,
+            sleepingNotesEditorActivations[meetingID]?.id == observedActivationID
+        {
+            cancelSleepingNotesEditorActivation(meetingID: meetingID)
+        }
+        await armSettleAfterMutation(meetingID: meetingID)
+    }
+
+    // MARK: - Pooled notes editor
+
+    private struct NotesEditorCompletionSnapshot: Sendable {
+        let id: String
+        let quotedText: String
+        let userText: String
+        let createdAt: Date
+    }
+
+    private enum NotesEditorActivationOutcome: Sendable {
+        case completed
+        case transportExhausted(String)
+    }
+
+    private struct NotesEditorTransportExhaustion: Error, Sendable {
+        let reason: String
+    }
+
+    /// The thirteenth app-wide pipeline chain entry. It never calls another
+    /// public ProcessingPipeline entry while holding its link; persistence is
+    /// performed by the unchained helper below.
+    public func editPendingNotes(meetingID: MeetingID) async throws {
+        try await editPendingNotesActivation(
+            meetingID: meetingID, drivenBySettleExecutor: false)
+    }
+
+    /// `drivenBySettleExecutor` suppresses the post-editor hook: the executor's
+    /// own drain is step 1 of an activation that continues in-line, so firing
+    /// the hook there would latch a redundant second activation against itself.
+    private func editPendingNotesActivation(
+        meetingID: MeetingID, drivenBySettleExecutor: Bool
+    ) async throws {
+        let outcome = try await chain.run { () -> NotesEditorActivationOutcome in
+            let outcome = try await self.editPendingNotesBody(meetingID: meetingID)
+            // A decoded terminal outcome is a fresh external trigger, and it
+            // invalidates the digest-call generation INSIDE this link — before
+            // the chain releases the successor. A delivery queued behind this
+            // link would otherwise enter with the old activation's failure
+            // bypass still armed by stale quiescence and ship these newer notes
+            // over the unreconciled digest. Transport exhaustion is not a
+            // decoded outcome: N2's freshly armed retry slot owns it.
+            if case .transportExhausted = outcome { return outcome }
+            await self.clearQuiescentDigestDebt(meetingID: meetingID)
+            return outcome
+        }
+        if case .transportExhausted(let reason) = outcome {
+            // The re-arm is unconditional: arming replaces the single slot, so
+            // it can never produce two future activations. At worst it replaces
+            // a newer sleeping timer and delays that correction by one window.
+            let retryActivationID = armNotesEditorActivation(meetingID: meetingID)
+            do {
+                let stillPending = try await database.pool.read { db in
+                    try MeetingCorrectionStore.hasPendingUnderstanding(
+                        db, meetingID: meetingID)
+                }
+                if let afterNotesEditorSchedulerDatabaseOperation {
+                    await afterNotesEditorSchedulerDatabaseOperation(meetingID)
+                }
+                if !stillPending,
+                    sleepingNotesEditorActivations[meetingID]?.id == retryActivationID
+                {
+                    cancelSleepingNotesEditorActivation(meetingID: meetingID)
+                }
+            } catch {
+                if sleepingNotesEditorActivations[meetingID]?.id == retryActivationID {
+                    cancelSleepingNotesEditorActivation(meetingID: meetingID)
+                }
+                throw error
+            }
+            throw EngineError.transient(reason)
+        }
+        if !drivenBySettleExecutor {
+            await settlePostEditorHook(meetingID: meetingID)
+        }
+    }
+
+    /// Optional accelerator used by the Changes panel in stage 3. Cancelling
+    /// the sleeping slot cannot touch an in-flight editor because a fired task
+    /// removes its slot before entering `editPendingNotes`.
+    public func sendPendingNotesToEditor(meetingID: MeetingID) async throws {
+        cancelSleepingNotesEditorActivation(meetingID: meetingID)
+        try await editPendingNotes(meetingID: meetingID)
+    }
+
+    /// Launch recovery: pending understanding rows are the durable journal.
+    /// Every meeting receives a fresh quiet window; elapsed wall time while the
+    /// process was absent is deliberately not reconstructed.
+    public func rearmPendingNotesEditorActivations() async throws {
+        let observedActivationIDs = sleepingNotesEditorActivations.mapValues(\.id)
+        let meetingIDs = try await database.pool.read { db in
+            try MeetingCorrectionStore.meetingIDsWithPendingUnderstanding(db)
+        }
+        for meetingID in meetingIDs {
+            if sleepingNotesEditorActivations[meetingID]?.id
+                == observedActivationIDs[meetingID]
+            {
+                armNotesEditorActivation(meetingID: meetingID)
+            }
+        }
+    }
+
+    /// The summarization selection changed. A meeting whose pending correction
+    /// lost its window under an engine that cannot edit has no sleeping
+    /// activation left — the pass returned without scheduling — so selecting an
+    /// engine that CAN edit is what makes those rows live again; nothing else
+    /// would wake them before a relaunch. A selection that still cannot edit
+    /// arms nothing.
+    public func rearmPendingNotesEditorActivationsIfEngineCanEdit() async {
+        guard let resolved = try? await resolver.resolveSummarization(),
+            resolved.engine is any NotesEditingEngine
+        else { return }
+        try? await rearmPendingNotesEditorActivations()
+    }
+
+    @discardableResult
+    private func armNotesEditorActivation(meetingID: MeetingID) -> UUID {
+        cancelSleepingNotesEditorActivation(meetingID: meetingID)
+        let id = UUID()
+        let sleep = notesEditorSleep
+        let task = Task { [weak self] in
+            do {
+                try await sleep(.seconds(300))
+                try Task.checkCancellation()
+                await self?.notesEditorActivationTimerFired(meetingID: meetingID, id: id)
+            } catch {
+                // Cancellation means a live mutation or immediate send replaced
+                // this slot. The replacement is already the sole future call.
+            }
+        }
+        sleepingNotesEditorActivations[meetingID] = SleepingNotesEditorActivation(
+            id: id, task: task)
+        return id
+    }
+
+    private func cancelSleepingNotesEditorActivation(meetingID: MeetingID) {
+        let activation = sleepingNotesEditorActivations.removeValue(forKey: meetingID)
+        activation?.task.cancel()
+    }
+
+    private func notesEditorActivationTimerFired(meetingID: MeetingID, id: UUID) async {
+        guard sleepingNotesEditorActivations[meetingID]?.id == id else { return }
+        // Identity-clear BEFORE the pass. A correction saved during the await
+        // below sees an empty slot and arms the next activation without
+        // cancelling this call.
+        sleepingNotesEditorActivations[meetingID] = nil
+        try? await editPendingNotes(meetingID: meetingID)
+    }
+
+    private func editPendingNotesBody(
+        meetingID: MeetingID
+    ) async throws -> NotesEditorActivationOutcome {
+        // §2's availability boundary is intentionally silent. In particular,
+        // do not write `lastProcessingError`: it also carries digest-pending
+        // recovery markers.
+        guard let meeting = try await MeetingRepository(database: database).fetch(meetingID),
+            meeting.status == .ready,
+            !NotesPendingClass.isPending(meeting.lastProcessingError),
+            let storedNotes = try await NotesRepository(database: database).fetch(
+                meetingID: meetingID)
+        else { return .completed }
+
+        let resolved = try await resolver.resolveSummarization()
+        let primary = resolved.engine
+        guard let primaryEditor = primary as? any NotesEditingEngine else {
+            return .completed
+        }
+
+        let rows = try await correctionRows(meetingID: meetingID)
+        let understandingRows = rows.filter { $0.kind == .understanding }
+        guard let oldestPendingIndex = understandingRows.firstIndex(where: {
+            $0.status == .pending
+        }) else { return .completed }
+        let slice = Array(understandingRows[oldestPendingIndex...])
+        let request = NotesEditorRequest(
+            meetingID: meetingID,
+            currentNotes: storedNotes.structured,
+            instructions: slice.map {
+                NotesEditorInstruction(
+                    rowID: $0.id, section: $0.section, quotedText: $0.quotedText,
+                    userText: $0.userText)
+            })
+        let completionSnapshots = Dictionary(uniqueKeysWithValues: slice.enumerated().compactMap {
+            offset, row -> (Int, NotesEditorCompletionSnapshot)? in
+            guard row.status == .pending else { return nil }
+            return (
+                offset + 1,
+                NotesEditorCompletionSnapshot(
+                    id: row.id, quotedText: row.quotedText, userText: row.userText,
+                    createdAt: row.createdAt))
+        })
+
+        let cancelToken = installCancelToken(meetingID: meetingID, statusSilent: true)
+        defer { removeCancelToken(meetingID: meetingID, token: cancelToken) }
+        emit(.runStarted(meetingID, regeneration: true))
+        emit(.stageBegan(meetingID, .notes))
+
+        do {
+            let result = try await CancellationToken.$current.withValue(cancelToken) {
+                try await self.performNotesEditorAttempts(
+                    request: request, primary: primary, primaryEditor: primaryEditor,
+                    cancelToken: cancelToken)
+            }
+            if cancelToken.isCancelled { throw EngineError.cancelled }
+
+            let applied = NotesEditApplier.apply(
+                result.operations, to: storedNotes.structured)
+            var citedCompletionPositions = Set<Int>()
+            var effectiveTitleOperation = false
+            for (operation, effective) in zip(result.operations, applied.effectiveOperations)
+            where effective {
+                let instruction = Self.notesEditorInstructionNumber(operation)
+                if completionSnapshots[instruction] != nil {
+                    citedCompletionPositions.insert(instruction)
+                }
+                if case .replace(let field, _, _, _) = operation, field == .title {
+                    effectiveTitleOperation = true
+                }
+            }
+
+            if applied.effectiveOperations.contains(true) {
+                try await persistNotesEditorResult(
+                    meeting: meeting, storedNotes: storedNotes,
+                    editedStructured: applied.notes,
+                    effectiveTitleOperation: effectiveTitleOperation,
+                    completionSnapshots: completionSnapshots,
+                    citedCompletionPositions: citedCompletionPositions)
+            }
+            emit(.stageFinished(meetingID, .notes))
+            emit(.runCompleted(meetingID))
+            return .completed
+        } catch let exhaustion as NotesEditorTransportExhaustion {
+            emit(.runFailed(meetingID, stage: .notes, message: exhaustion.reason))
+            return .transportExhausted(exhaustion.reason)
+        } catch {
+            emit(.runFailed(meetingID, stage: .notes, message: Self.describe(error)))
+            throw error
+        }
+    }
+
+    private func performNotesEditorAttempts(
+        request: NotesEditorRequest,
+        primary: any SummarizationEngine,
+        primaryEditor: any NotesEditingEngine,
+        cancelToken: CancellationToken
+    ) async throws -> NotesEditorResult {
+        var engine = primary
+        var editor = primaryEditor
+        var usedFallback = false
+        var attempts = 0
+        var transportFailures = 0
+
+        do {
+            try await engine.prepare()
+        } catch let error as EngineError {
+            guard let fallback = try await preparedNotesEditorFallback(
+                after: engine, error: error, usedFallback: usedFallback,
+                cancelToken: cancelToken)
+            else { throw error }
+            engine = fallback.engine
+            editor = fallback.editor
+            usedFallback = true
+        }
+        while attempts < 3 {
+            if cancelToken.isCancelled { throw EngineError.cancelled }
+            attempts += 1
+            do {
+                return try await editor.editNotes(request, purpose: .notesEditor)
+            } catch let error as EngineError {
+                if cancelToken.isCancelled { throw EngineError.cancelled }
+                if case .transient(let reason) = error {
+                    transportFailures += 1
+                    if attempts == 3 {
+                        if transportFailures == 3 {
+                            throw NotesEditorTransportExhaustion(reason: reason)
+                        }
+                        throw error
+                    }
+                    let backoff: Duration = attempts == 1 ? .seconds(1) : .seconds(2)
+                    try await notesEditorSleep(backoff)
+                    continue
+                }
+
+                guard let fallback = try await preparedNotesEditorFallback(
+                    after: engine, error: error, usedFallback: usedFallback,
+                    cancelToken: cancelToken)
+                else { throw error }
+                engine = fallback.engine
+                editor = fallback.editor
+                usedFallback = true
+            }
+        }
+        throw EngineError.permanent("notes editor attempt bound reached")
+    }
+
+    private func preparedNotesEditorFallback(
+        after engine: any SummarizationEngine,
+        error: EngineError,
+        usedFallback: Bool,
+        cancelToken: CancellationToken
+    ) async throws -> (engine: any SummarizationEngine, editor: any NotesEditingEngine)? {
+        guard !usedFallback, EngineFallbackReason.isFallbackTrigger(error),
+            !engine.suppressesAutoFallback,
+            let fallback = registry.summarizationEngines.first(where: { candidate in
+                candidate.id != engine.id
+                    && candidate.loadProfile == .lightweight
+                    && candidate is any NotesEditingEngine
+            }),
+            let fallbackEditor = fallback as? any NotesEditingEngine
+        else { return nil }
+
+        if cancelToken.isCancelled { throw EngineError.cancelled }
+        try await fallback.prepare()
+        if cancelToken.isCancelled { throw EngineError.cancelled }
+        return (fallback, fallbackEditor)
+    }
+
+    private static func notesEditorInstructionNumber(_ operation: NotesEditOperation) -> Int {
+        switch operation {
+        case .replace(_, _, _, let instruction),
+            .set(_, _, _, let instruction),
+            .remove(_, _, let instruction),
+            .insert(_, _, _, let instruction):
+            return instruction
+        }
+    }
+
+    /// Unchained persistence body. The file and meeting-row writes precede
+    /// the final atomic notes/re-anchor/completion transaction exactly as §8
+    /// specifies; failures are intentionally not compensated here.
+    ///
+    /// Nothing is delivered here: an applied edit records the two owed bits in
+    /// the same transaction that installs the edited notes, and the settle
+    /// chain ships one pooled package for the whole session.
+    private func persistNotesEditorResult(
+        meeting: Meeting,
+        storedNotes: MeetingNotes,
+        editedStructured: NotesStructured,
+        effectiveTitleOperation: Bool,
+        completionSnapshots: [Int: NotesEditorCompletionSnapshot],
+        citedCompletionPositions: Set<Int>
+    ) async throws {
+        let meetingID = meeting.id
+        let segments = try await TranscriptRepository(database: database)
+            .segments(meetingID: meetingID)
+        let labelMap = await slabelMap(meetingID: meetingID, segments: segments)
+
+        var notes = storedNotes
+        notes.structured = SLabelNeutralizer.neutralize(
+            notes: editedStructured, labelMap: labelMap, language: storedNotes.language,
+            groundedMLabels: Self.groundedMicLabels(in: segments)).notes
+
+        let mayPromoteTitle = effectiveTitleOperation
+            && (meeting.titleSource == .default || meeting.titleSource == .llm)
+        let promotedTitle = mayPromoteTitle
+            ? Self.promotedLLMTitle(from: notes.structured.title)
+            : nil
+        var renderStructured = notes.structured
+        if let promotedTitle { renderStructured.title = promotedTitle }
+
+        let allCorrectionRows = try await correctionRows(meetingID: meetingID)
+        let user = await userIdentity()
+        notes.markdown = try NotesRenderer.render(
+            renderStructured, language: notes.language,
+            meetingTitle: promotedTitle ?? meeting.title,
+            userName: user.name, annotations: allCorrectionRows)
+
+        try Data(notes.markdown.utf8).write(
+            to: database.paths.notesURL(meetingID), options: .atomic)
+
+        let proposedTimestamp = now()
+        let finalMeeting = try await database.pool.write { db -> Meeting in
+            guard let liveMeeting = try Meeting.fetchOne(db, key: meetingID) else {
+                throw BlaiseDatabaseError.meetingNotFound(meetingID)
+            }
+            let timestamp = max(
+                proposedTimestamp, liveMeeting.updatedAt.addingTimeInterval(0.001))
+            if let promotedTitle,
+                liveMeeting.titleSource == .default || liveMeeting.titleSource == .llm
+            {
+                try db.execute(
+                    sql: "UPDATE meeting SET title = ?, title_source = ?, updated_at = ? WHERE id = ?",
+                    arguments: [
+                        promotedTitle, TitleSource.llm.rawValue, timestamp, meetingID,
+                    ])
+            } else {
+                try db.execute(
+                    sql: "UPDATE meeting SET updated_at = ? WHERE id = ?",
+                    arguments: [timestamp, meetingID])
+            }
+            guard let updated = try Meeting.fetchOne(db, key: meetingID) else {
+                throw BlaiseDatabaseError.meetingNotFound(meetingID)
+            }
+            return updated
+        }
+        let timestamp = finalMeeting.updatedAt
+
+        // The settle chain's durable intent, recorded with the edit itself: the
+        // corrected notes are undelivered, and — because effective operations
+        // changed the notes semantically — the stored digest no longer reflects
+        // the instruction set. The digest bit is set ONLY beside a non-nil
+        // digest: a digest-less meeting has nothing to reconcile, and its
+        // eventual first synthesis is instruction-aware.
+        notes.deliveryOwed = true
+        if notes.memoryDigest != nil { notes.digestEditOwed = true }
+
+        let reanchorUpdates = CorrectionAnchoring.reanchor(
+            annotations: allCorrectionRows, against: notes.structured)
+        let observedActivationID = sleepingNotesEditorActivations[meetingID]?.id
+        let hasPendingUnderstanding = try await database.pool.write { [notes] db -> Bool in
+            try notes.upsert(db)
+            try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
+            for position in citedCompletionPositions.sorted() {
+                guard let snapshot = completionSnapshots[position] else { continue }
+                try db.execute(
+                    sql: """
+                        UPDATE meeting_correction
+                        SET status = 'applied', applied_at = ?
+                        WHERE id = ? AND meeting_id = ? AND status = 'pending'
+                          AND quoted_text = ? AND user_text = ? AND created_at = ?
+                        """,
+                    arguments: [
+                        timestamp, snapshot.id, meetingID, snapshot.quotedText,
+                        snapshot.userText, snapshot.createdAt,
+                    ])
+            }
+            return try MeetingCorrectionStore.hasPendingUnderstanding(
+                db, meetingID: meetingID)
+        }
+        if let afterNotesEditorSchedulerDatabaseOperation {
+            await afterNotesEditorSchedulerDatabaseOperation(meetingID)
+        }
+        if !hasPendingUnderstanding,
+            sleepingNotesEditorActivations[meetingID]?.id == observedActivationID
+        {
+            cancelSleepingNotesEditorActivation(meetingID: meetingID)
+        }
+    }
+
+    /// The shared annotation re-mint step. Returns TRUE when the re-mint was
+    /// REFUSED — the meeting is not ready, or carries the notes-pending marker
+    /// — so the caller can say so instead of implying the delivered notes
+    /// already carry the change. An understanding row never re-mints; its
+    /// follow-up belongs to the notes-editor scheduler, so it never refuses.
+    private func remintIfAnnotation(
+        _ row: MeetingCorrection, meetingID: MeetingID
+    ) async throws -> Bool {
+        guard row.kind == .annotation else { return false }
+        return try await !remintNotesArtifacts(meetingID: meetingID)
+    }
+
+    /// User-origin notes-only re-run for a READY meeting — the "Re-write the
+    /// notes" action. Reuses the persisted transcript (the D17 resume
+    /// machinery) with the meeting's correction rows injected at request
+    /// build. Returns nil (refusal, not an error) when the meeting is not
+    /// `ready` — a live run or a pending meeting already produces notes and
+    /// consumes the rows itself.
+    ///
+    /// Failure is no-regress: the meeting stays `ready` with its previous
+    /// notes; `notesOnlyStages`' catch writes the notes-pending marker
+    /// (regeneration-class → status untouched), so the existing self-heal
+    /// triggers (launch / key save / network restore) retry the rewrite with
+    /// the corrections still included.
+    @discardableResult
+    public func rewriteNotes(meetingID: MeetingID) async throws -> PipelineRunRecord? {
+        try await chain.run { try await self.rewriteNotesBody(meetingID: meetingID) }
+    }
+
+    private func rewriteNotesBody(meetingID: MeetingID) async throws -> PipelineRunRecord? {
+        guard let meeting = try await MeetingRepository(database: database).fetch(meetingID),
+            meeting.status == .ready,
+            let dominantLanguage = meeting.dominantLanguage,
+            let asrProvenance = meeting.asrProvenance
+        else { return nil }
+        let segments = try await TranscriptRepository(database: database)
+            .segments(meetingID: meetingID)
+        guard !segments.isEmpty else {
+            throw PipelineError(
+                stage: .notes, message: "ready meeting has no persisted transcript to re-write from")
+        }
+        emit(.runStarted(meetingID, regeneration: true))
+        let context = RunContext(meetingID: meetingID, regeneration: true)
+        // Status-silent cancel: a cancelled rewrite keeps `ready` + the
+        // previous notes (the G10 §1 notes-resume precedent).
+        let cancelToken = installCancelToken(meetingID: meetingID, statusSilent: true)
+        defer { removeCancelToken(meetingID: meetingID, token: cancelToken) }
+        context.cancelToken = cancelToken
+        context.notesPurpose = .regeneration
+        context.currentStage = .notes
+        let userLoad = vocabularyProvider()
+        reportGlossaryLoad(userLoad, meetingID: meetingID)
+        return try await notesOnlyStages(
+            meeting: meeting, segments: segments, dominantLanguage: dominantLanguage,
+            asrProvenance: asrProvenance, context: context, vocabulary: userLoad.vocabulary,
+            hadNotesBefore: true, applyNameProposals: false)
+    }
+
+    /// The deterministic notes re-mint (render with current annotations →
+    /// upsert) — the `correctNameInNotes` shape, shared by the annotation add /
+    /// edit / delete paths. No engine call, and no delivery: the local artifacts
+    /// stay current (Copy Notes reads them) while the settle chain ships one
+    /// pooled package.
+    ///
+    /// It RE-ASSERTS `delivery_owed`: the annotation mutation transactions are
+    /// not chain-serialized, so a `deliverSettled` slot they interleave can
+    /// blind-clear the freshly set bit. This re-mint cannot interleave a
+    /// delivery, so it repairs any such clobber.
+    ///
+    /// Returns false (refusal) for a non-ready or notes-pending meeting: the row
+    /// is durable, nothing is owed here, and the heal-owned finalize that owns
+    /// those states delivers everything and clears the bits.
+    @discardableResult
+    public func remintNotesArtifacts(meetingID: MeetingID) async throws -> Bool {
+        let reminted = try await remintNotesArtifactsBody(meetingID: meetingID)
+        // The re-asserted bit must never be left trigger-less: a detach fire
+        // consumed mid-race would otherwise leave nothing to deliver it.
+        if reminted { await settleSchedulingHandoff(meetingID: meetingID) }
+        return reminted
+    }
+
+    private func remintNotesArtifactsBody(meetingID: MeetingID) async throws -> Bool {
+        try await chain.run {
+            guard let meeting = try await MeetingRepository(database: self.database)
+                .fetch(meetingID), meeting.status == .ready,
+                !NotesPendingClass.isPending(meeting.lastProcessingError),
+                var notes = try await NotesRepository(database: self.database)
+                    .fetch(meetingID: meetingID)
+            else { return false }
+
+            let user = await self.userIdentity()
+            let segments = try await TranscriptRepository(database: self.database)
+                .segments(meetingID: meetingID)
+            let correctionRows = try await self.correctionRows(meetingID: meetingID)
+            // G13: neutralize S-labels as the LAST write to notes.structured
+            // before the render (unchanged content otherwise).
+            let labelMap = await self.slabelMap(meetingID: meetingID, segments: segments)
+            notes.structured = SLabelNeutralizer.neutralize(
+                notes: notes.structured, labelMap: labelMap, language: notes.language,
+                groundedMLabels: Self.groundedMicLabels(in: segments)).notes
+            notes.markdown = try NotesRenderer.render(
+                notes.structured, language: notes.language, meetingTitle: meeting.title,
+                userName: user.name, annotations: correctionRows)
+            try Data(notes.markdown.utf8).write(
+                to: self.database.paths.notesURL(meetingID), options: .atomic)
+
+            // Re-anchor annotations against the (unchanged) structured notes
+            // so a freshly added/edited note records its resolved state.
+            // Computed OUTSIDE the write closure (`notes` is a captured var).
+            let proposedTimestamp = self.now()
+            let reanchorUpdates = CorrectionAnchoring.reanchor(
+                annotations: correctionRows, against: notes.structured)
+            try await self.database.pool.write { db in
+                guard var m = try Meeting.fetchOne(db, key: meetingID) else {
+                    throw BlaiseDatabaseError.meetingNotFound(meetingID)
+                }
+                // Monotonic, the editor path's discipline: the mutation
+                // transaction has already moved the timestamp forward, and a
+                // raw clock write would undo that bump — leaving the settled
+                // payload's `updated_at_ms` equal to, or behind, one already
+                // delivered.
+                m.updatedAt = max(
+                    proposedTimestamp, m.updatedAt.addingTimeInterval(0.001))
+                try m.update(db)
+                try MeetingCorrectionStore.applyReanchor(db, updates: reanchorUpdates)
+            }
+            notes.deliveryOwed = true
+            try await self.database.pool.write { [notes] db in
+                try notes.upsert(db)
+            }
+            return true
+        }
+    }
+
+    // MARK: - The settle scheduler, executor and pooled delivery
+
+    /// Scheduling state only. Durable truth is the two owed bits on the notes
+    /// row. A slot is removed by its UUID before its task runs the executor, so
+    /// a live mutation can never cancel an already-running executor.
+    private struct SleepingSettleActivation {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+    private var sleepingSettleActivations: [MeetingID: SleepingSettleActivation] = [:]
+    /// In-memory truth about the CURRENT session — which meetings have a detail
+    /// view on screen. Never persisted: a meeting whose view is open waits out
+    /// the idle window, while one with no session settles immediately.
+    private var attachedSettleViews: Set<MeetingID> = []
+    /// One executor per meeting, never two concurrently.
+    private var runningSettleExecutors: Set<MeetingID> = []
+    /// A fire or invocation that arrived while an executor was running. The
+    /// terminal step consumes it against a FRESH sample, so a signal is never
+    /// swallowed and never consumed against stale state.
+    private var settleRerunLatch: Set<MeetingID> = []
+    /// Meetings whose digest debt hit a permanent-class failure this session.
+    /// Quiescent debt is excluded from ACTIONABLE-OWED itself, so no evaluator
+    /// re-runs the failed call on its own; any fresh external trigger clears it,
+    /// giving exactly one resample per trigger.
+    private var quiescentDigestDebt: Set<MeetingID> = []
+    /// Meetings whose in-flight digest call has seen no fresh trigger since it
+    /// began. Actor isolation is reentrant, so a call's own continuation can
+    /// resume AFTER a trigger has already cleared quiescence; a result that
+    /// predates the trigger must not silence the debt the trigger owns. The
+    /// call marks itself here before suspending, every trigger unmarks it, and
+    /// only a still-marked call may quiesce.
+    private var uninterruptedDigestCalls: Set<MeetingID> = []
+
+    /// The operator-pinned session-settle window.
+    static let settleIdleWindow: Duration = .seconds(600)
+
+    /// Quit sets this synchronously as its first act, so a detach racing the
+    /// set is the only exposure — one abandoned call at worst, never a lost bit.
+    public nonisolated func markTerminating() {
+        terminating.withLock { $0 = true }
+    }
+
+    /// ACTIONABLE-OWED — the ONE predicate every evaluator uses. A meeting has
+    /// settle work iff its delivery is owed, OR N2 holds a sleeping editor
+    /// activation for it (an undrained recent batch), OR its digest debt is
+    /// both RUNNABLE now and not quiescent. Non-runnable digest-only debt is
+    /// real but not actionable: it arms nothing and fires nothing until its own
+    /// blocking condition transitions.
+    ///
+    /// A pending understanding row with NO sleeping slot is deliberately not
+    /// settle work — that is N2's normal permanently-pending state, and treating
+    /// it as owed would re-fire a model call at every settle forever.
+    private func settleWorkIsActionable(_ meetingID: MeetingID) async -> Bool {
+        guard
+            let notes = try? await NotesRepository(database: database)
+                .fetch(meetingID: meetingID)
+        else { return false }
+        if notes.deliveryOwed { return true }
+        if sleepingNotesEditorActivations[meetingID] != nil { return true }
+        guard notes.digestEditOwed, !quiescentDigestDebt.contains(meetingID) else { return false }
+        guard let meeting = try? await MeetingRepository(database: database).fetch(meetingID)
+        else { return false }
+        return await digestStepIsRunnable(meeting: meeting, notes: notes)
+    }
+
+    /// Can the digest step run right now: toggle ON, a stored digest to edit, a
+    /// conforming engine, and no digest-pending marker. A caller that must not
+    /// read the toggle twice passes the snapshot it already took.
+    private func digestStepIsRunnable(
+        meeting: Meeting, notes: MeetingNotes, digestEnabled: Bool? = nil
+    ) async -> Bool {
+        let enabled: Bool
+        if let digestEnabled {
+            enabled = digestEnabled
+        } else {
+            enabled = await MemoryDigestSettings.isEnabled(in: settings)
+        }
+        guard notes.memoryDigest != nil,
+            !DigestPendingClass.isPending(meeting.lastProcessingError),
+            enabled,
+            let resolved = try? await resolver.resolveSummarization(),
+            resolved.engine is any DigestEditingEngine
+        else { return false }
+        return true
+    }
+
+    @discardableResult
+    private func armSettleActivation(
+        meetingID: MeetingID, after window: Duration = ProcessingPipeline.settleIdleWindow
+    ) -> UUID {
+        cancelSleepingSettleActivation(meetingID: meetingID)
+        let id = UUID()
+        let sleep = settleSleep
+        let task = Task { [weak self] in
+            do {
+                try await sleep(window)
+                try Task.checkCancellation()
+                await self?.settleActivationTimerFired(meetingID: meetingID, id: id)
+            } catch {
+                // Cancellation means a signal replaced this slot; the
+                // replacement is already the sole future activation.
+            }
+        }
+        sleepingSettleActivations[meetingID] = SleepingSettleActivation(id: id, task: task)
+        return id
+    }
+
+    private func cancelSleepingSettleActivation(meetingID: MeetingID) {
+        let activation = sleepingSettleActivations.removeValue(forKey: meetingID)
+        activation?.task.cancel()
+    }
+
+    private func settleActivationTimerFired(meetingID: MeetingID, id: UUID) async {
+        guard sleepingSettleActivations[meetingID]?.id == id else { return }
+        // Identity-clear BEFORE executing: a mutation landing during the
+        // executor sees an empty slot and arms the next one without cancelling
+        // this run.
+        sleepingSettleActivations[meetingID] = nil
+        guard await settleWorkIsActionable(meetingID) else { return }
+        await runSettleExecutor(meetingID: meetingID)
+    }
+
+    // MARK: Signals
+
+    /// The meeting's detail view came on screen. Attaching arms the slot when
+    /// there is actionable debt and nothing is already counting — no executor
+    /// and no sleeping slot; symmetric with the sweep, so an actionable-owed
+    /// meeting whose view is open always has a running slot, debt inherited
+    /// from a previous process included, and an already-counting window is
+    /// never restarted behind the user's back.
+    public func settleViewAttached(_ meetingID: MeetingID) async {
+        attachedSettleViews.insert(meetingID)
+        guard await settleWorkIsActionable(meetingID),
+            !runningSettleExecutors.contains(meetingID),
+            sleepingSettleActivations[meetingID] == nil
+        else { return }
+        armSettleActivation(meetingID: meetingID)
+    }
+
+    /// The view went away: the session is over. The sleeping slot dies with it
+    /// and the executor runs now — unless the app is terminating, in which case
+    /// the durable bits carry the work to the next launch.
+    public func settleViewDetached(_ meetingID: MeetingID) async {
+        attachedSettleViews.remove(meetingID)
+        cancelSleepingSettleActivation(meetingID: meetingID)
+        guard await settleWorkIsActionable(meetingID), !terminating.withLock({ $0 })
+        else { return }
+        await runSettleExecutor(meetingID: meetingID)
+    }
+
+    /// The user is still working in this meeting (scroll, selection change,
+    /// composer typing — debounced to at most one call a second by the view).
+    /// It RESETS a running slot and never arms one: activity without a running
+    /// slot is not a session that owes anything.
+    public func noteMeetingActivity(_ meetingID: MeetingID) {
+        guard sleepingSettleActivations[meetingID] != nil else { return }
+        armSettleActivation(meetingID: meetingID)
+    }
+
+    /// A fresh external trigger: quiescent debt becomes actionable again, and a
+    /// digest call already in flight loses its claim on quiescence — its result
+    /// predates this trigger and may not silence what the trigger released.
+    private func clearQuiescentDigestDebt(meetingID: MeetingID) {
+        quiescentDigestDebt.remove(meetingID)
+        uninterruptedDigestCalls.remove(meetingID)
+    }
+
+    /// The digest call is about to suspend: mark it as having seen no trigger
+    /// yet. Every clear between here and the result unmarks it.
+    private func markDigestCallInFlight(meetingID: MeetingID) {
+        uninterruptedDigestCalls.insert(meetingID)
+    }
+
+    /// Installs quiescence for a permanent-class failure, and reports whether it
+    /// took. It does not when a fresh trigger committed while the call was in
+    /// flight: the debt stays actionable and this activation carries no failure
+    /// bypass into the delivery guard, so the refusal-and-retry path runs
+    /// instead of shipping newer notes over an older failure.
+    private func quiesceDigestDebt(meetingID: MeetingID) -> Bool {
+        guard uninterruptedDigestCalls.remove(meetingID) != nil else { return false }
+        quiescentDigestDebt.insert(meetingID)
+        return true
+    }
+
+    /// An instruction mutation just committed. A mutation is a fresh external
+    /// trigger, so it clears quiescence first, then arms-or-resets the slot when
+    /// what it committed leaves actionable debt.
+    private func armSettleAfterMutation(meetingID: MeetingID) async {
+        clearQuiescentDigestDebt(meetingID: meetingID)
+        guard await settleWorkIsActionable(meetingID) else { return }
+        armSettleActivation(meetingID: meetingID)
+    }
+
+    /// The scheduling handoff the executor's terminal step performs, reused by
+    /// the annotation re-mint so its re-asserted bit is never left trigger-less.
+    ///
+    /// "None running" means no executor AND no slot already counting: the
+    /// ten-minute constant measures USER quiet, so an invisible completion —
+    /// an editor pass, a re-mint — must never restart a window the user's own
+    /// activity is what resets.
+    private func settleSchedulingHandoff(meetingID: MeetingID) async {
+        guard await settleWorkIsActionable(meetingID) else { return }
+        if attachedSettleViews.contains(meetingID) {
+            guard !runningSettleExecutors.contains(meetingID),
+                sleepingSettleActivations[meetingID] == nil
+            else { return }
+            armSettleActivation(meetingID: meetingID)
+        } else if !terminating.withLock({ $0 }) {
+            await runSettleExecutor(meetingID: meetingID)
+        }
+    }
+
+    /// SCHEDULING only, after an editor activation's terminal outcome — the
+    /// terminal's quiescence clear belongs to the editor's own chain link,
+    /// which runs it before releasing the successor; repeating it here would
+    /// invalidate the generation of a digest call that started in between. A
+    /// transport-exhaustion terminal never reaches here: its freshly armed N2
+    /// retry slot exclusively owns the next activation, and collapsing that
+    /// backoff into an immediate re-drain is exactly what this hook must not do.
+    private func settlePostEditorHook(meetingID: MeetingID) async {
+        await settleSchedulingHandoff(meetingID: meetingID)
+    }
+
+    /// The owed sweep: launch, network restore, key save, the digest toggle
+    /// going ON, an engine-selection change. Each invocation is a fresh external
+    /// trigger, so it clears quiescence before evaluating.
+    ///
+    /// A meeting holding a sleeping N2 editor slot is deliberately NOT a
+    /// candidate: its batch drains on that slot's own expiry (N2's locked
+    /// fresh-window rule — the launch re-arm has just armed one for every
+    /// pending-row meeting), and the post-editor hook continues the chain.
+    public func resumeOwedSettles() async {
+        let candidates: [MeetingID] =
+            (try? await database.pool.read { db in
+                try MeetingID.fetchAll(
+                    db,
+                    sql: """
+                        SELECT meeting_id FROM meeting_notes
+                        WHERE digest_edit_owed = 1 OR delivery_owed = 1
+                        ORDER BY meeting_id
+                        """)
+            }) ?? []
+        for meetingID in candidates {
+            guard sleepingNotesEditorActivations[meetingID] == nil else { continue }
+            clearQuiescentDigestDebt(meetingID: meetingID)
+            guard await settleWorkIsActionable(meetingID) else { continue }
+            if attachedSettleViews.contains(meetingID) {
+                // A slot already counting is left alone: the ten-minute constant
+                // measures USER quiet, and an invisible sweep must never restart
+                // a window the user's own activity is what resets.
+                guard !runningSettleExecutors.contains(meetingID),
+                    sleepingSettleActivations[meetingID] == nil
+                else { continue }
+                armSettleActivation(meetingID: meetingID)
+            } else {
+                await runSettleExecutor(meetingID: meetingID)
+            }
+        }
+    }
+
+    // MARK: The executor
+
+    /// One executor per meeting. An invocation arriving while one runs is a
+    /// no-op against the in-flight set AND sets the rerun latch, which the
+    /// terminal step consumes against a fresh sample.
+    ///
+    /// The executor is NOT a chain entry: it is an orchestrator that awaits the
+    /// public chained entries in order, so the no-chain-entry-calls-another rule
+    /// is never violated — it holds no chain link.
+    private func runSettleExecutor(meetingID: MeetingID) async {
+        guard !runningSettleExecutors.contains(meetingID) else {
+            settleRerunLatch.insert(meetingID)
+            return
+        }
+        runningSettleExecutors.insert(meetingID)
+        await settleActivation(meetingID: meetingID)
+        // Removal is a stable loop, not a single trailing check: the drain ends
+        // with an awaited sample of its own, and a signal landing in THAT window
+        // would otherwise be latched against an executor that is about to
+        // disappear. The loop re-enters while a latch stands, and the removal
+        // itself follows the last check with no suspension in between, so a
+        // signal arriving after it starts a fresh executor directly.
+        repeat {
+            await drainSettleRerunLatch(meetingID: meetingID)
+            if let afterSettleTerminalStep {
+                await afterSettleTerminalStep(meetingID)
+            }
+        } while settleRerunLatch.contains(meetingID)
+        runningSettleExecutors.remove(meetingID)
+    }
+
+    /// The terminal step: consume the latch FIRST, then take a FRESH sample —
+    /// a database read serialized after the latch-setter's committed
+    /// transaction, never one captured earlier — and run one activation when it
+    /// holds. When the loop drains, surviving debt hands scheduling back: armed
+    /// where the view is attached, otherwise ended for the next external
+    /// trigger to own (an immediate re-run would be a tight churn loop).
+    private func drainSettleRerunLatch(meetingID: MeetingID) async {
+        while settleRerunLatch.remove(meetingID) != nil {
+            guard await settleWorkIsActionable(meetingID) else { break }
+            await settleActivation(meetingID: meetingID)
+        }
+        guard await settleWorkIsActionable(meetingID),
+            attachedSettleViews.contains(meetingID),
+            sleepingSettleActivations[meetingID] == nil
+        else { return }
+        armSettleActivation(meetingID: meetingID)
+    }
+
+    /// One walk of the three steps. Reached equally on a throw from any step —
+    /// every exit routes back through the terminal evaluation above.
+    private func settleActivation(meetingID: MeetingID) async {
+        // Executor entry condition, evaluated ALWAYS and whatever the sleeping
+        // slot state: the owning run or heal of a not-ready / notes-pending
+        // meeting will finalize and DELIVER everything itself, so any settle
+        // work here would race it. This is where the heal-owned fork lives —
+        // not inside step 1, whose sleeping-slot gate would skip it for the
+        // commonest annotation-only settle.
+        guard let meeting = try? await MeetingRepository(database: database).fetch(meetingID),
+            meeting.status == .ready,
+            !NotesPendingClass.isPending(meeting.lastProcessingError),
+            ((try? await NotesRepository(database: database).fetch(meetingID: meetingID)) ?? nil)
+                != nil
+        else { return }
+
+        // 1. Drain the editor batch — only a SLEEPING batch. A permanently
+        //    pending meeting has no sleeping slot and this step is skipped.
+        var engineCannotEdit = false
+        if sleepingNotesEditorActivations[meetingID] != nil {
+            let resolved = try? await resolver.resolveSummarization()
+            if resolved?.engine is any NotesEditingEngine {
+                cancelSleepingNotesEditorActivation(meetingID: meetingID)
+                do {
+                    try await editPendingNotesActivation(
+                        meetingID: meetingID, drivenBySettleExecutor: true)
+                } catch {
+                    // Transport exhaustion: N2's own re-arm owns the retry, and
+                    // the hook after THAT activation continues the chain.
+                    logger.notice(
+                        "settle drain for \(meetingID, privacy: .public) ended on an editor failure")
+                    return
+                }
+            } else {
+                // The one refusal cause left here is capability: the truthful
+                // current state ships, corrections stay pending, and nothing
+                // else would deliver them.
+                engineCannotEdit = true
+            }
+        }
+
+        // 2. Reconcile the digest.
+        var digestFailedThisActivation = false
+        if !engineCannotEdit {
+            let notes = try? await NotesRepository(database: database).fetch(meetingID: meetingID)
+            if notes?.digestEditOwed == true, !quiescentDigestDebt.contains(meetingID) {
+                markDigestCallInFlight(meetingID: meetingID)
+                let outcome =
+                    (try? await reconcileDigest(meetingID: meetingID)) ?? .permanentFailure
+                switch outcome {
+                case .transportExhausted:
+                    uninterruptedDigestCalls.remove(meetingID)
+                    armSettleActivation(meetingID: meetingID, after: .seconds(300))
+                    return
+                case .permanentFailure:
+                    // The corrected notes still ship truthfully; the digest debt
+                    // survives and goes quiescent until a fresh external trigger
+                    // — but only when this call's own generation still stands. A
+                    // trigger that committed while the call was in flight owns
+                    // the debt now, and its resample must not be silenced by a
+                    // result that predates it.
+                    digestFailedThisActivation = quiesceDigestDebt(meetingID: meetingID)
+                case .reconciled, .skipped:
+                    uninterruptedDigestCalls.remove(meetingID)
+                }
+            }
+        }
+
+        // 3. Deliver once. A DIGEST-caused refusal gets one reconcile-and-retry
+        //    in this activation; a second refusal ends it (the bits are durable
+        //    and the editor outcome's own arm converges). A READINESS-caused
+        //    refusal just ends — the owning run's finalize delivers.
+        let outcome = try? await deliverSettled(
+            meetingID: meetingID, digestFailedThisActivation: digestFailedThisActivation)
+        guard outcome == .refusedDigestOwed else { return }
+        if !quiescentDigestDebt.contains(meetingID) {
+            markDigestCallInFlight(meetingID: meetingID)
+            let retry = (try? await reconcileDigest(meetingID: meetingID)) ?? .permanentFailure
+            if retry == .permanentFailure {
+                digestFailedThisActivation = quiesceDigestDebt(meetingID: meetingID)
+            } else {
+                uninterruptedDigestCalls.remove(meetingID)
+                if retry == .transportExhausted {
+                    armSettleActivation(meetingID: meetingID, after: .seconds(300))
+                    return
+                }
+            }
+        }
+        _ = try? await deliverSettled(
+            meetingID: meetingID, digestFailedThisActivation: digestFailedThisActivation)
+    }
+
+    // MARK: The pooled delivery
+
+    public enum SettleDeliveryOutcome: Sendable, Equatable {
+        case delivered
+        /// The digest step is owed and runnable: shipping notes ahead of their
+        /// digest is the incoherent pair the design forbids.
+        case refusedDigestOwed
+        /// Not ready, no notes, or mid-replacement. Nothing to retry.
+        case refusedNotReady
+    }
+
+    /// The fifteenth app-wide pipeline chain entry: read fresh, re-render with
+    /// annotations, mint, write, and upsert-plus-enqueue in ONE transaction, all
+    /// inside its own chain slot so the read-mint-transact is atomic against
+    /// every other chain-serialized mutation.
+    ///
+    /// What the slot guarantees, stated honestly: every CHAINED writer is
+    /// serialized against this entry, but the annotation mutation transactions
+    /// are not chained, so one can land between this entry's read and its
+    /// transaction and be clobbered by the blind row upsert. That clobber is
+    /// REPAIRED, not prevented — the chained re-mint that always follows an
+    /// annotation mutation re-asserts the bit, and the mutation's own settle arm
+    /// then delivers it, one settle cycle later.
+    @discardableResult
+    public func deliverSettled(
+        meetingID: MeetingID, digestFailedThisActivation: Bool = false
+    ) async throws -> SettleDeliveryOutcome {
+        try await chain.run {
+            try await self.deliverSettledBody(
+                meetingID: meetingID, digestFailedThisActivation: digestFailedThisActivation)
+        }
+    }
+
+    private func deliverSettledBody(
+        meetingID: MeetingID, digestFailedThisActivation: Bool
+    ) async throws -> SettleDeliveryOutcome {
+        // The same readiness condition as the executor entry — it refuses
+        // exactly where the shipped re-mint refuses, so a settle can never ship
+        // notes a regeneration is mid-replacing.
+        guard let meeting = try await MeetingRepository(database: database).fetch(meetingID),
+            meeting.status == .ready,
+            !NotesPendingClass.isPending(meeting.lastProcessingError),
+            var notes = try await NotesRepository(database: database).fetch(meetingID: meetingID)
+        else { return .refusedNotReady }
+
+        // ONE toggle snapshot for this mint, taken before the guard and threaded
+        // into the payload: two reads let a flip land between them, so a mint
+        // whose guard saw the digest step un-runnable could still emit an
+        // unreconciled digest — the exact pair the guard exists to prevent.
+        let digestEnabled = await MemoryDigestSettings.isEnabled(in: settings)
+
+        // The owed bits are re-read inside this chain slot: a chained editor
+        // pass slotted between the executor's digest step and this entry
+        // re-establishes the digest debt, and shipping over it would deliver
+        // notes ahead of their digest. A permanent-failure outcome with
+        // quiescence intact DELIVERS through this guard — holding the notes
+        // hostage to a failing digest is the wedge — while a late editor or
+        // mutation that CLEARED quiescence forces the refusal-and-retry path.
+        if notes.digestEditOwed,
+            await digestStepIsRunnable(
+                meeting: meeting, notes: notes, digestEnabled: digestEnabled),
+            !(digestFailedThisActivation && quiescentDigestDebt.contains(meetingID))
+        {
+            return .refusedDigestOwed
+        }
+
+        let user = await userIdentity()
+        let segments = try await TranscriptRepository(database: database)
+            .segments(meetingID: meetingID)
+        let correctionRows = try await correctionRows(meetingID: meetingID)
+        let labelMap = await slabelMap(meetingID: meetingID, segments: segments)
+        notes.structured = SLabelNeutralizer.neutralize(
+            notes: notes.structured, labelMap: labelMap, language: notes.language,
+            groundedMLabels: Self.groundedMicLabels(in: segments)).notes
+        // Re-rendered here, not trusted from the row: an annotation whose
+        // follow-on re-mint was lost to a crash still delivers fresh. The
+        // renderer derives the H1 from the structured title, so a meeting whose
+        // title an LLM promotion owns renders against the COMMITTED (trimmed,
+        // truncated) value — otherwise a settle would re-inflate an H1 the
+        // promotion had shortened, and the human surface and the payload would
+        // disagree on one title.
+        var renderStructured = notes.structured
+        if meeting.titleSource == .llm { renderStructured.title = meeting.title }
+        notes.markdown = try NotesRenderer.render(
+            renderStructured, language: notes.language, meetingTitle: meeting.title,
+            userName: user.name, annotations: correctionRows)
+        try Data(notes.markdown.utf8).write(
+            to: database.paths.notesURL(meetingID), options: .atomic)
+
+        let payload = EvidencePayloadBuilder.build(
+            meeting: meeting, segments: segments, notes: notes, user: user,
+            corrections: correctionRows,
+            includeMemoryDigest: digestEnabled)
+        let relativePath = database.paths.relativeHandoffPayloadPath(
+            meetingID: meetingID, versionHash: payload.versionHash)
+        try ImmutablePayloadWriter.write(
+            payload.bytes, to: database.rootURL.appendingPathComponent(relativePath))
+
+        notes.deliveryOwed = false
+        let rootURL = database.rootURL
+        try await database.pool.write { [notes] db in
+            try notes.upsert(db)
+            _ = try HandoffRepository.enqueue(
+                db, rootURL: rootURL, meetingID: meetingID,
+                versionHash: payload.versionHash, payloadPath: relativePath)
+        }
+        await handoffKicker.kick()
+        logger.notice("settle delivery enqueued for \(meetingID, privacy: .public)")
+        return .delivered
+    }
+
+    // MARK: - Digest reconcile (the digest-editor pass)
+
+    /// What a digest-reconcile activation left behind. The settle executor
+    /// threads this into the delivery entry, whose guard is outcome-aware.
+    public enum DigestReconcileOutcome: Sendable, Equatable {
+        /// The digest agrees with the instruction set — because the editor made
+        /// it agree, because it already agreed (an empty ops array), or because
+        /// there is nothing to reconcile against. The debt is cleared.
+        case reconciled
+        /// A guard refused before any model call, or a cancel landed. The debt
+        /// survives; the blocking condition's own transition re-activates it.
+        case skipped
+        /// A decoded response that could not be honored: a permanent engine
+        /// error, a body that would not decode, or a structural-assertion
+        /// discard. The debt survives and goes quiescent for this session.
+        case permanentFailure
+        /// Every attempt failed without a usable body.
+        case transportExhausted
+    }
+
+    /// The fourteenth app-wide pipeline chain entry. Event-silent (the closest
+    /// shipped sibling, the digest heal, emits none either) and it installs the
+    /// status-silent cancel token. Correction entry stays ENABLED throughout:
+    /// this pass writes only `memory_digest`, which no UI surface edits, so the
+    /// in-flight editor lock would block the user for nothing.
+    public func reconcileDigest(meetingID: MeetingID) async throws -> DigestReconcileOutcome {
+        try await chain.run { await self.reconcileDigestBody(meetingID: meetingID) }
+    }
+
+    private func reconcileDigestBody(meetingID: MeetingID) async -> DigestReconcileOutcome {
+        guard
+            let meeting = try? await MeetingRepository(database: database).fetch(meetingID),
+            meeting.status == .ready,
+            !DigestPendingClass.isPending(meeting.lastProcessingError),
+            let notes = try? await NotesRepository(database: database).fetch(meetingID: meetingID),
+            notes.digestEditOwed,
+            let storedDigest = notes.memoryDigest,
+            await MemoryDigestSettings.isEnabled(in: settings),
+            let resolved = try? await resolver.resolveSummarization(),
+            let editor = resolved.engine as? any DigestEditingEngine
+        else { return .skipped }
+
+        // The SYNTHESIS seams' slice — kind-filtered only, every status, in
+        // chronological order. Deliberately NOT the editor's precedence-closed
+        // slice: the digest may still assert a claim corrected long before the
+        // oldest pending row. Annotations never enter.
+        guard let rows = try? await correctionRows(meetingID: meetingID) else { return .skipped }
+        let instructions = rows.filter { $0.kind == .understanding }.map {
+            NotesEditorInstruction(
+                rowID: $0.id, section: $0.section, quotedText: $0.quotedText,
+                userText: $0.userText)
+        }
+        guard !instructions.isEmpty else {
+            // Every instruction was deleted: there is nothing left to reconcile
+            // against, so the debt is real no longer. No model call.
+            await clearDigestEditOwed(meetingID: meetingID)
+            return .reconciled
+        }
+
+        let request = DigestEditorRequest(
+            meetingID: meetingID, currentDigest: storedDigest, instructions: instructions)
+        let cancelToken = installCancelToken(meetingID: meetingID, statusSilent: true)
+        defer { removeCancelToken(meetingID: meetingID, token: cancelToken) }
+
+        do {
+            try await resolved.engine.prepare()
+        } catch let error as EngineError {
+            logger.notice(
+                "digest reconcile for \(meetingID, privacy: .public) could not prepare its engine: \(Self.describe(error), privacy: .public)")
+            if case .transient = error { return .transportExhausted }
+            return .permanentFailure
+        } catch {
+            return .permanentFailure
+        }
+
+        var attempts = 0
+        var result: DigestEditorResult?
+        while attempts < 3, result == nil {
+            if cancelToken.isCancelled { return .skipped }
+            attempts += 1
+            do {
+                result = try await CancellationToken.$current.withValue(cancelToken) {
+                    try await editor.editDigest(request, purpose: .digestEditor)
+                }
+            } catch let error as EngineError {
+                if cancelToken.isCancelled { return .skipped }
+                guard case .transient(let reason) = error else {
+                    logger.notice(
+                        "digest reconcile for \(meetingID, privacy: .public) failed permanently: \(Self.describe(error), privacy: .public)")
+                    return .permanentFailure
+                }
+                guard attempts < 3 else {
+                    logger.notice(
+                        "digest reconcile for \(meetingID, privacy: .public) exhausted its transport attempts: \(reason, privacy: .public)")
+                    return .transportExhausted
+                }
+                let backoff: Duration = attempts == 1 ? .seconds(1) : .seconds(2)
+                try? await notesEditorSleep(backoff)
+            } catch {
+                return .permanentFailure
+            }
+        }
+        guard let result else { return .transportExhausted }
+        if cancelToken.isCancelled { return .skipped }
+
+        guard let edited = DigestEditApplier.apply(result.operations, to: storedDigest) else {
+            logger.notice(
+                "digest reconcile for \(meetingID, privacy: .public) discarded its operations: the applied result violates the md-v1 section structure")
+            return .permanentFailure
+        }
+
+        // G13: neutralize as the LAST write before persist.
+        let segments = (try? await TranscriptRepository(database: database)
+            .segments(meetingID: meetingID)) ?? []
+        let labelMap = await slabelMap(meetingID: meetingID, segments: segments)
+        let clean = SLabelNeutralizer.neutralizeText(
+            edited, labelMap: labelMap, language: notes.language,
+            groundedMLabels: Self.groundedMicLabels(in: segments))
+
+        // An unchanged string means the model confirmed the digest already
+        // agrees: clear the debt and write nothing else. `delivery_owed` is set
+        // only where the bytes moved — whatever made the reconcile owed set it
+        // already, so nothing is lost. The stamp column is untouched: an edit
+        // does not re-author the digest.
+        let changed = Array(clean.utf8) != Array(storedDigest.utf8)
+        do {
+            try await database.pool.write { db in
+                if changed {
+                    try db.execute(
+                        sql: """
+                            UPDATE meeting_notes
+                            SET memory_digest = ?, digest_edit_owed = 0, delivery_owed = 1
+                            WHERE meeting_id = ?
+                            """,
+                        arguments: [clean, meetingID])
+                } else {
+                    try db.execute(
+                        sql: "UPDATE meeting_notes SET digest_edit_owed = 0 WHERE meeting_id = ?",
+                        arguments: [meetingID])
+                }
+            }
+        } catch {
+            return .permanentFailure
+        }
+        logger.notice(
+            "digest reconcile for \(meetingID, privacy: .public) applied \(result.operations.count) operations (changed: \(changed))")
+        return .reconciled
+    }
+
+    private func clearDigestEditOwed(meetingID: MeetingID) async {
+        try? await database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE meeting_notes SET digest_edit_owed = 0 WHERE meeting_id = ?",
+                arguments: [meetingID])
         }
     }
 
@@ -1176,6 +2739,12 @@ public actor ProcessingPipeline {
         /// had persisted notes before this run, `.generation` for a meeting's
         /// first-ever notes produced via the pending path.
         var notesPurpose: CloudSpendPurpose?
+        /// The understanding rows the request ACTUALLY carried — id + content,
+        /// captured at request build. Post-finalize bookkeeping flips a row to
+        /// `applied` only when its CURRENT content still equals the captured
+        /// content: a row inserted OR edited while the model ran stays
+        /// `pending` for the next run.
+        var consumedCorrections: [(id: String, quoted: String, text: String)] = []
         /// G14: an explicit cloud-spend purpose for this run's digest call.
         /// nil = `.digest` (the default for a first-time generation). The
         /// digest-only resume / regeneration sets `.regeneration`.
@@ -1442,6 +3011,14 @@ public actor ProcessingPipeline {
         // ceiling/budget/config conditions arrive as THROWN triggers so the
         // one-hop fallback can fire (lightweight engines only — D17; a
         // heavyweight-only fallback resolves to notes-pending instead).
+        // The correction load sits before the first `stage(...)` of this slot,
+        // so tag the stage first — otherwise a store fault here is reported
+        // under whichever stage ran last (the notes-only seams do the same).
+        context.currentStage = .notes
+        let correctionRowsForRequest = try await correctionRows(meetingID: meetingID)
+        context.consumedCorrections = correctionRowsForRequest
+            .filter { $0.kind == .understanding && $0.status == .pending }
+            .map { ($0.id, $0.quotedText, $0.userText) }
         let notesRequest = NotesRequest(
             meeting: meeting,
             transcript: segments,
@@ -1452,7 +3029,13 @@ public actor ProcessingPipeline {
             // on the notes-only resume (same vocabulary, attendees, segments), so
             // the resume request stays byte-equal to this stage-9 request.
             groundedPersonHints: GroundedPersonHints.groundedPersonHints(
-                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments))
+                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments),
+            // EVERY synthesis path injects the meeting's durable corrections —
+            // a full Regenerate can never erase user truth. Margin notes are
+            // excluded: they render deterministically and never enter a prompt.
+            corrections: correctionRowsForRequest
+                .filter { $0.kind == .understanding }
+                .map(NotesCorrection.init(row:)))
         // G15: the participant-confirmation gate is evaluated ONCE here, at
         // notes-stage entry (transcript + diarization already produced and about
         // to persist). When it fires, the run resolves to notes-pending with the
@@ -1571,6 +3154,19 @@ public actor ProcessingPipeline {
         let substituted = await applyNameSubstitution(
             to: notesResult, meeting: meeting, segments: segments, vocabulary: vocabulary)
 
+        // N3: screen the candidate before anything downstream can install it —
+        // no digest, no payload, no handoff. The transcript stage 11 persisted
+        // above stands (the same partial state a late-stage regeneration
+        // failure already produces). The single `.runCompleted` for this path
+        // belongs to the outer wrapper, which runs after this return.
+        if try await withholdsResurrectedClaim(
+            meetingID: meetingID, meeting: meeting, corrections: correctionRowsForRequest,
+            candidate: substituted.structured, dominantLanguage: dominantLanguage,
+            context: context)
+        {
+            return context.record
+        }
+
         // G14: the SECOND synthesis call — fired AFTER name-substitution, with
         // the name-substituted notes as the salience guide (toggle-gated;
         // non-fatal; bounded retry inside generateDigest). Its produced digest
@@ -1583,16 +3179,16 @@ public actor ProcessingPipeline {
         let digest = Self.digestStringOrNil(digestOutcome)
 
         // 12+13. persistNotes + finalize (shared with the notes-only resume).
+        // H1: a digest call that failed past its bounded retry leaves a
+        // distinguishable `digest-pending:` marker (the run is still ready;
+        // the payload omits `memory_digest` until a self-heal re-fire lands) —
+        // committed by the finalize transaction itself, so no crash window can
+        // swallow the debt.
         try await persistNotesAndFinalize(
             meetingID: meetingID, notesResult: substituted,
             dominantLanguage: dominantLanguage, meetingTitle: meeting.title,
-            user: user, context: context, memoryDigest: digest)
-        // H1: a digest call that failed past its bounded retry leaves a
-        // distinguishable `digest-pending:` marker (the run is still ready;
-        // the payload omits `memory_digest` until a self-heal re-fire lands).
-        if case .failed(let reason) = digestOutcome {
-            await writeDigestPending(meetingID: meetingID, reason: reason)
-        }
+            user: user, context: context, memoryDigest: digest,
+            digestPendingReason: Self.digestFailureReason(digestOutcome))
         await handoffKicker.kick()
 
         // Terminal event (single writer): a successful run with a fallback
@@ -2603,21 +4199,28 @@ public actor ProcessingPipeline {
                 logger.warning(
                     "notes pending: selected engine \(primary.id) failed (\(primaryReason)); not auto-falling back — user-selected subscription engine stays free, retry on the same engine"
                 )
-                return .pending(reason: "\(primary.id) failed: \(primaryReason)")
+                return .pending(
+                    reason: "\(primary.displayName): \(Self.humanReason(primaryError))")
             }
             guard
                 let fallback = registry.summarizationEngines.first(where: { $0.id != primary.id })
             else {
+                // A stage failure's message is what the meeting's error banner
+                // shows a person, so it names engines the way they are named on
+                // screen; the ids and the configuration key stay in the log.
+                logger.warning(
+                    "notes failed (\(primary.id): \(primaryReason)) and no fallback engine is registered"
+                )
                 throw PipelineError(
                     stage: .notes,
                     message:
-                        "notes failed (\(primary.id): \(primaryReason)) and no fallback engine is registered")
+                        "\(primary.displayName): \(Self.humanReason(primaryError)); no other notes engine is set up")
             }
             if case .heavyweight = fallback.loadProfile {
                 logger.warning(
                     "notes pending: \(primary.id) failed (\(primaryReason)); fallback \(fallback.id) is heavyweight and is never auto-loaded (D17)"
                 )
-                return .pending(reason: primaryReason)
+                return .pending(reason: Self.humanReason(primaryError))
             }
             logger.warning(
                 "notes fallback: \(primary.id) → \(fallback.id) (\(primaryReason))")
@@ -2631,15 +4234,20 @@ public actor ProcessingPipeline {
                 try await fallback.prepare()
                 let result = try await fallback.generateNotes(request, purpose: purpose)
                 context.record.fallback = NotesFallbackRecord(
-                    primaryEngineID: primary.id, reason: primaryReason,
+                    primaryEngineID: primary.id, reason: Self.humanReason(primaryError),
                     fallbackEngineID: fallback.id)
                 return .produced(result)
             } catch {
-                // Both-fail → stage failure, BOTH reasons recorded.
+                // Both-fail → stage failure. BOTH reasons are recorded, in the
+                // log, with the ids; the thrown message is the one the banner
+                // shows and carries neither an id nor the diagnostic rendering.
+                logger.warning(
+                    "notes failed on both engines — \(primary.id): \(primaryReason); \(fallback.id): \(Self.describe(error))"
+                )
                 throw PipelineError(
                     stage: .notes,
                     message:
-                        "notes failed on both engines — \(primary.id): \(primaryReason); \(fallback.id): \(Self.describe(error))"
+                        "\(primary.displayName): \(Self.humanReason(primaryError)); \(fallback.displayName) could not write the notes either"
                 )
             }
         }
@@ -2839,6 +4447,13 @@ public actor ProcessingPipeline {
         return nil
     }
 
+    /// The `digest-pending:` reason a finalize must carry, or nil where the
+    /// digest landed or was never wanted.
+    private static func digestFailureReason(_ outcome: DigestOutcome) -> String? {
+        if case .failed(let reason) = outcome { return reason }
+        return nil
+    }
+
     /// Fires the SECOND synthesis call (`generateDigest`) after the notes when
     /// the Settings → Handoff toggle is ON, neutralizes residual S-labels in the
     /// produced digest string (the same emphasis-aware G13 detector, via the
@@ -2910,6 +4525,33 @@ public actor ProcessingPipeline {
             }
         }
 
+        // md-v7: the complete active correction set rides EVERY digest-producing
+        // call — the full run, the notes-only resume and the digest heal all
+        // reach the engine through here, so deriving the slice at this one seam
+        // is what makes the three identical by construction. Kind-filtered
+        // only: every status, chronological, annotations excluded (they render
+        // deterministically and never enter a prompt).
+        // FAIL-CLOSED, like every other reader of this slice: a read fault must
+        // never be reported as "no corrections". Synthesizing from an empty set
+        // would resurrect a withdrawn claim from the transcript and record the
+        // result as instruction-aware; the failure takes the digest-pending
+        // marker instead, and the heal retries with the rows intact.
+        let instructions: [NotesEditorInstruction]
+        do {
+            instructions = try await correctionRows(meetingID: meetingID)
+                .filter { $0.kind == .understanding }
+                .map {
+                    NotesEditorInstruction(
+                        rowID: $0.id, section: $0.section, quotedText: $0.quotedText,
+                        userText: $0.userText)
+                }
+        } catch {
+            let reason = Self.describe(error)
+            logger.warning(
+                "memory digest for \(meetingID, privacy: .public) could not read its correction set: \(reason, privacy: .public) — digest-pending, no correction-blind call")
+            return .failed(reason: reason)
+        }
+
         let request = DigestRequest(
             meeting: meeting,
             transcript: segments,
@@ -2920,7 +4562,8 @@ public actor ProcessingPipeline {
             scopedAliasBindings: scopedAliasBindings,
             hostBinding: hostBinding,
             groundedPersonHints: groundedPersonHints,
-            knowledgeGlossary: knowledgeGlossary)
+            knowledgeGlossary: knowledgeGlossary,
+            instructions: instructions)
 
         // DEV-ONLY recall-gate capture (env-gated; OFF by default; NEVER alters
         // the digest, the payload, or any persisted state). When
@@ -2998,7 +4641,7 @@ public actor ProcessingPipeline {
             // no audit call and ships `clean`). ROBUSTNESS: any throw (incl. cancel)
             // falls back to the synthesis draft `clean` — the digest is NEVER lost
             // because the audit failed.
-            if DigestPromptBuilder.shippedVersion == .mdV6 {
+            if DigestPromptBuilder.shippedVersion.usesCombinedAudit {
                 // Hoist both async toggle reads out of the `||` chain: the `||`
                 // right-operand is an autoclosure that cannot `await`.
                 let verifyOn = await MemoryDigestSettings.isVerifyEnabled(in: settings)
@@ -3141,16 +4784,172 @@ public actor ProcessingPipeline {
         }
     }
 
+    // MARK: - The absence check (shared by the full run and the notes-only paths)
+
+    /// The one notice the withheld path writes, on both sites.
+    static let resurrectedClaimNote =
+        "notes kept: a regeneration tried to restore a claim your corrections removed — review the correction or rewrite again"
+
+    /// Screens a regeneration result before it can replace existing notes: a
+    /// claim the user's corrections removed from the notes must not come back.
+    /// The withdrawn set is derived at check time from THIS run's correction
+    /// rows against the stored notes (the request's snapshot — a row added or
+    /// edited during the model await shapes the NEXT run, not this verdict),
+    /// and each withdrawn claim is searched once over the candidate as stage
+    /// 12 would persist it (G13-neutralized).
+    ///
+    /// Returns true when the run must keep the previous notes, having already
+    /// performed the withheld bookkeeping; the caller then returns per its
+    /// site's terminal-event rule and installs nothing.
+    ///
+    /// Regeneration-class only: a process-class run's entry sets `.processing`
+    /// and only its own finalize restores a terminal status, so an early
+    /// return there would strand the meeting. No reachable case is lost —
+    /// corrections require a meeting that has been `ready`, and `ready`
+    /// dispatches as regeneration. A cancel at or before the verdict skips the
+    /// bookkeeping and the run dies at the next existing cancellation
+    /// checkpoint, installing nothing; a cancel after the verdict finds the
+    /// bookkeeping running shielded to completion.
+    private func withholdsResurrectedClaim(
+        meetingID: MeetingID, meeting: Meeting, corrections: [MeetingCorrection],
+        candidate: NotesStructured, dominantLanguage: String, context: RunContext
+    ) async throws -> Bool {
+        if let duringResurrectionGate {
+            await duringResurrectionGate(meetingID, .beforeStoredRead)
+        }
+        let keptMarkdown: String
+        do {
+            // No stored row → nothing to keep; a first mint cannot resurrect.
+            guard let stored = try await NotesRepository(database: database).fetch(
+                meetingID: meetingID)
+            else { return false }
+            let withdrawn = CorrectionAnchoring.withdrawnClaims(
+                corrections: corrections,
+                currentHaystack: CorrectionAnchoring.foldedHaystack(
+                    of: stored.structured, meetingTitle: meeting.title))
+            guard !withdrawn.isEmpty else { return false }
+            // The screened value is the one stage 12 PERSISTS: G13
+            // neutralization is the last write to `structured` before the
+            // render, so screening the pre-neutralization value would let a raw
+            // diarization label mask the withdrawn bytes it resolves into.
+            // Computed here and nowhere earlier — the common path (nothing
+            // withdrawn) never pays for it — and BEFORE the guard, so no await
+            // sits after the token check: a cancel landing on the derivation's
+            // reads is absorbed as pre-verdict instead of passing a stale
+            // "not cancelled" reading into the verdict.
+            let candidateHaystack = CorrectionAnchoring.foldedHaystack(
+                of: try await neutralizedForInstall(
+                    meetingID: meetingID, candidate: candidate,
+                    dominantLanguage: dominantLanguage),
+                meetingTitle: meeting.title)
+            guard context.record.regeneration,
+                context.cancelToken?.isCancelled != true,
+                CorrectionAnchoring.resurrectedClaim(
+                    withdrawn: withdrawn, candidateHaystack: candidateHaystack) != nil
+            else { return false }
+            keptMarkdown = stored.markdown
+        } catch is CancellationError {
+            // A cancel landing on one of the pre-verdict database awaits (both
+            // are cancellation-aware) is absorbed: no withheld bookkeeping runs
+            // and the run dies at the next existing checkpoint, installing
+            // nothing — the same outcome as the token conjunct above.
+            return false
+        }
+
+        logger.notice(
+            "regeneration withheld for \(meetingID, privacy: .public): a withdrawn claim reappeared — previous notes kept"
+        )
+        if let duringResurrectionGate {
+            await duringResurrectionGate(meetingID, .afterVerdict)
+        }
+        let database = self.database
+        let notesURL = database.paths.notesURL(meetingID)
+        // Detached: GRDB's async writes are cancellation-aware, and a cancel
+        // arriving after the verdict must not leave the withheld bookkeeping
+        // half-done. Errors still propagate to the run's failure path.
+        try await Task.detached {
+            // The kept ROW is the source of truth and more than one shipped
+            // path can leave the derived file behind it; the re-assert is
+            // idempotent (byte-identical in the common case) and restores
+            // row/file equality whichever window this meeting was left in.
+            try Data(keptMarkdown.utf8).write(to: notesURL, options: .atomic)
+            // ONE transaction, so no crash window can separate the clear from
+            // the notice. Clearing the parked marker is what stops the
+            // self-heal from re-firing this doomed synthesis on every
+            // launch/key-save/network trigger; the LIKE condition leaves a
+            // digest-pending marker standing. No updatedAt bump: the
+            // bookkeeping changes no content.
+            try await database.pool.write { db in
+                try db.execute(
+                    sql: """
+                        UPDATE meeting SET last_processing_error = NULL
+                        WHERE id = ? AND last_processing_error LIKE ?
+                        """,
+                    arguments: [meetingID, NotesPendingClass.prefix + "%"])
+                let current = try String.fetchOne(
+                    db, sql: "SELECT processing_note FROM meeting WHERE id = ?",
+                    arguments: [meetingID])
+                // A capture-recovery note outranks every other notice class.
+                guard current?.hasPrefix(CaptureRecovery.notePrefix) != true else { return }
+                try db.execute(
+                    sql: "UPDATE meeting SET processing_note = ? WHERE id = ?",
+                    arguments: [Self.resurrectedClaimNote, meetingID])
+            }
+        }.value
+        return true
+    }
+
+    /// The candidate as stage 12 would persist it: the same G13 pass over the
+    /// same inputs (the label map and grounded mic labels derived from the
+    /// persisted segments, the run's dominant language). The two maps are
+    /// computed independently, so a swallowed rename-read fault can diverge
+    /// them.
+    private func neutralizedForInstall(
+        meetingID: MeetingID, candidate: NotesStructured, dominantLanguage: String
+    ) async throws -> NotesStructured {
+        if let duringResurrectionGate {
+            await duringResurrectionGate(meetingID, .duringCandidateDerivation)
+        }
+        let segments = try await TranscriptRepository(database: database)
+            .segments(meetingID: meetingID)
+        return SLabelNeutralizer.neutralize(
+            notes: candidate,
+            labelMap: await slabelMap(meetingID: meetingID, segments: segments),
+            language: dominantLanguage,
+            groundedMLabels: Self.groundedMicLabels(in: segments)).notes
+    }
+
     // MARK: - Stages 12+13 (shared by the full run and the notes-only resume)
 
     /// persistNotes (render in the persisted dominant language) + finalize
     /// (builder reads the now-final DB state → immutable payload write →
     /// `finalizeMeetingProcessing`: status=ready + notes upsert + enqueue in
     /// ONE transaction). The caller kicks the handoff worker.
+    ///
+    /// `deferNotesInstall` (the notes-only paths — resume and user rewrite):
+    /// stage 12 renders the new notes but installs NOTHING; the value is carried
+    /// to stage 13, which builds the payload from it and lets the finalize
+    /// transaction install the row, and `notes.md` is written only after that
+    /// transaction commits. A meeting that already HAS notes must keep them
+    /// byte-intact when a regeneration fails anywhere before finalize; installing
+    /// at stage 12 would break that on a payload-write or finalize failure. The
+    /// commit-to-promote gap is covered by the
+    /// `notesFilePromoteIncomplete` marker.
+    ///
+    /// `digestPendingReason` (N4): the digest call failed, so this finalize owes
+    /// a `digest-pending:` marker. It cannot simply be written afterwards — a
+    /// crash in between would leave a meeting whose digest debt no trigger can
+    /// see. One `last_processing_error` string cannot carry two prefixes, so the
+    /// fold splits by install mode: a non-deferred install commits the marker
+    /// INSIDE the finalize transaction, while a deferred install keeps the
+    /// notes-promote marker first (its row/file repair is the more urgent one)
+    /// and the promote-retirement transaction below then REPLACES that exact
+    /// marker with the digest marker instead of clearing it.
     private func persistNotesAndFinalize(
         meetingID: MeetingID, notesResult: NotesResult, dominantLanguage: String,
         meetingTitle: String, user: UserIdentity, context: RunContext,
-        memoryDigest: String?
+        memoryDigest: String?, deferNotesInstall: Bool = false,
+        digestPendingReason: String? = nil
     ) async throws {
         let paths = database.paths
 
@@ -3192,15 +4991,23 @@ public actor ProcessingPipeline {
             }
         }
 
+        // The run's correction slice, read ONCE here — after every model await,
+        // in reach of BOTH the stage-12 render and the stage-13 mint. Never the
+        // caller's run-entry request slice: understanding-row deletion is not
+        // run-gated, so a slice taken before the synthesis await could mint a
+        // record for a row that no longer exists. Nothing between this read and
+        // the mint awaits a model, so the two stages see one consistent set.
+        let correctionRows = try await self.correctionRows(meetingID: meetingID)
+
         // 12. persistNotes — render in the persisted dominant language.
-        try await stage(.persistNotes, context, meetingID) {
+        let stagedNotes = try await stage(.persistNotes, context, meetingID) { () -> MeetingNotes in
             var provenance = notesResult.provenance
             provenance.pipelineVersion = PipelineVersion.current
             provenance.rendererVersion = NotesRenderer.version
             provenance.userName = user.name
             // G13: neutralize S-labels as the LAST write to notes.structured
-            // before stage 12 persists it — stage 13 re-fetches THIS row and
-            // build()s it, and a .preFinalize kill resumes on the clean row.
+            // before stage 12 hands it on — stage 13 build()s exactly this
+            // value, and a .preFinalize kill resumes on a clean row.
             let finalizeSegments = try await TranscriptRepository(database: self.database)
                 .segments(meetingID: meetingID)
             let labelMap = await self.slabelMap(
@@ -3222,9 +5029,11 @@ public actor ProcessingPipeline {
             if let promotedStructuredTitle {
                 renderStructured.title = promotedStructuredTitle
             }
+            // Weave the meeting's margin notes into the markdown.
+            // Presence-gated: no rows → byte-identical markdown.
             let markdown = try NotesRenderer.render(
                 renderStructured, language: dominantLanguage, meetingTitle: renderTitle,
-                userName: user.name)
+                userName: user.name, annotations: correctionRows)
             // G14: the digest is persisted on the same notes row so stage 13's
             // build() picks it up (presence-gated). `memoryDigest` is the
             // ALREADY-neutralized clean digest string (or nil: toggle off, or a
@@ -3243,25 +5052,50 @@ public actor ProcessingPipeline {
                 generatedAt: self.now(),
                 provenance: provenance,
                 memoryDigest: memoryDigest,
-                scopedAliasBindings: context.resolvedScopedAliasBindings ?? [])
-            try await NotesRepository(database: self.database).upsert(notes)
-            try Data(markdown.utf8).write(to: paths.notesURL(meetingID), options: .atomic)
+                scopedAliasBindings: context.resolvedScopedAliasBindings ?? [],
+                // N4: a finalized meeting owes the settle chain nothing —
+                // this transaction delivers everything current — and a fresh
+                // digest is born reconciled (the synthesis was
+                // instruction-aware). The stamp records the version a re-mint
+                // of this row must carry; no digest means no stamp.
+                digestPromptVersion: memoryDigest == nil
+                    ? nil : DigestPromptBuilder.shippedVersion.rawValue)
+            if !deferNotesInstall {
+                try await NotesRepository(database: self.database).upsert(notes)
+                try Data(markdown.utf8).write(to: paths.notesURL(meetingID), options: .atomic)
+            }
+            return notes
         }
 
         // 13. finalize.
         try await stage(.finalize, context, meetingID) {
             guard
                 let finalMeeting = try await MeetingRepository(database: self.database)
-                    .fetch(meetingID),
-                let finalNotes = try await NotesRepository(database: self.database)
-                    .fetch(meetingID: meetingID)
+                    .fetch(meetingID)
             else {
                 throw PipelineError(stage: .finalize, message: "meeting state vanished mid-run")
+            }
+            // Deferred install: the stored row is still the PREVIOUS one, so the
+            // payload is built from the staged value the finalize transaction
+            // installs below.
+            let finalNotes: MeetingNotes
+            if deferNotesInstall {
+                finalNotes = stagedNotes
+            } else {
+                guard
+                    let stored = try await NotesRepository(database: self.database)
+                        .fetch(meetingID: meetingID)
+                else {
+                    throw PipelineError(stage: .finalize, message: "meeting state vanished mid-run")
+                }
+                finalNotes = stored
             }
             let finalSegments = try await TranscriptRepository(database: self.database)
                 .segments(meetingID: meetingID)
             let payload = EvidencePayloadBuilder.build(
-                meeting: finalMeeting, segments: finalSegments, notes: finalNotes, user: user)
+                meeting: finalMeeting, segments: finalSegments, notes: finalNotes, user: user,
+                corrections: correctionRows,
+                includeMemoryDigest: await MemoryDigestSettings.isEnabled(in: self.settings))
             let relativePath = paths.relativeHandoffPayloadPath(
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
@@ -3271,9 +5105,84 @@ public actor ProcessingPipeline {
                 meetingID: meetingID,
                 versionHash: payload.versionHash,
                 payloadPath: relativePath,
-                notes: finalNotes)
+                notes: finalNotes,
+                // The deferred path still owes `notes.md` the row this
+                // transaction installs, so the transaction commits the pending
+                // marker WITH it: between the commit and the promote below,
+                // process death leaves a row the file does not match, and only a
+                // marker committed atomically with the row is guaranteed to be
+                // there to send the self-heal back.
+                pendingMarker: deferNotesInstall
+                    ? NotesPendingClass.marker(NotesPendingClass.notesFilePromoteIncomplete)
+                    : digestPendingReason.map(DigestPendingClass.marker))
             context.record.versionHash = payload.versionHash
             context.record.payloadPath = relativePath
+        }
+
+        // Promote the human artifact only now that the finalize transaction
+        // committed: until this line a failed regeneration has left the previous
+        // `notes.md` bytes on disk, matching the row it did not replace. The
+        // write is atomic (temp file + rename), so the file is never half-new.
+        if deferNotesInstall {
+            PipelineCrashHooks.maybeKill(.notesPromote)
+            try Data(stagedNotes.markdown.utf8)
+                .write(to: paths.notesURL(meetingID), options: .atomic)
+            // File and row agree again: retire the marker. Conditioned on the
+            // exact value so this touches only the marker written above. Where
+            // the digest also failed, the retirement REPLACES rather than
+            // clears — dropping to nil here would drop the digest debt, and a
+            // crash on either side of this write leaves a marker some trigger
+            // still enumerates.
+            let retiredMarker = digestPendingReason.map(DigestPendingClass.marker)
+            try await database.pool.write { db in
+                try db.execute(
+                    sql:
+                        "UPDATE meeting SET last_processing_error = ? WHERE id = ? AND last_processing_error = ?",
+                    arguments: [
+                        retiredMarker,
+                        meetingID,
+                        NotesPendingClass.marker(NotesPendingClass.notesFilePromoteIncomplete),
+                    ])
+            }
+        }
+
+        // Post-finalize bookkeeping: EXACTLY the understanding rows the
+        // request carried flip to `applied` (a row inserted or edited while
+        // the model ran stays `pending` for the next run); annotations
+        // re-anchor against the persisted notes (matched → applied +
+        // occurrence refresh, orphaned → stale). Runs on every path that mints
+        // notes. Failure-soft and idempotent: a crash between finalize and
+        // this write leaves rows `pending`, and the next synthesis run simply
+        // consumes them again (corrections are idempotent instructions;
+        // `applied` is bookkeeping, not correctness).
+        let consumed = context.consumedCorrections
+        let observedActivationID = sleepingNotesEditorActivations[meetingID]?.id
+        let hasPendingUnderstanding = try? await database.pool.write { db -> Bool in
+            let rows = try MeetingCorrectionStore.all(db, meetingID: meetingID)
+            guard !rows.isEmpty else { return false }
+            let appliedIDs = rows.filter { row in
+                row.status == .pending && consumed.contains {
+                    $0.id == row.id && $0.quoted == row.quotedText && $0.text == row.userText
+                }
+            }.map(\.id)
+            try MeetingCorrectionStore.markApplied(db, ids: appliedIDs, at: self.now())
+            guard let structured = try MeetingNotes.fetchOne(db, key: meetingID)?.structured
+            else {
+                return try MeetingCorrectionStore.hasPendingUnderstanding(
+                    db, meetingID: meetingID)
+            }
+            try MeetingCorrectionStore.applyReanchor(
+                db, updates: CorrectionAnchoring.reanchor(annotations: rows, against: structured))
+            return try MeetingCorrectionStore.hasPendingUnderstanding(
+                db, meetingID: meetingID)
+        }
+        if let afterNotesEditorSchedulerDatabaseOperation {
+            await afterNotesEditorSchedulerDatabaseOperation(meetingID)
+        }
+        if hasPendingUnderstanding == false,
+            sleepingNotesEditorActivations[meetingID]?.id == observedActivationID
+        {
+            cancelSleepingNotesEditorActivation(meetingID: meetingID)
         }
     }
 
@@ -3450,16 +5359,34 @@ public actor ProcessingPipeline {
         let userLoad = vocabularyProvider()
         reportGlossaryLoad(userLoad, meetingID: meetingID)
         let vocabulary = userLoad.vocabulary
+        // Proposals apply ONLY when this resume is minting the meeting's first
+        // notes. A meeting that already had notes reaches here through a
+        // parked user rewrite (which passes `applyNameProposals: false`, then
+        // parks with the notes-pending marker) — healing it with `true` would
+        // apply speaker proposals the rewrite itself refused, mutating a
+        // transcript the user's correction was never allowed to touch. The
+        // same reasoning tightens the pre-existing regeneration-class heal: a
+        // second opinion on speaker names is not a reason to rewrite a
+        // transcript the user has already seen (and may have renamed speakers
+        // in) — those names are final.
         return try await notesOnlyStages(
             meeting: meeting, segments: segments, dominantLanguage: dominantLanguage,
             asrProvenance: asrProvenance, context: context, vocabulary: vocabulary,
-            confirmingParticipants: confirmingParticipants, hadNotesBefore: hadNotesBefore)
+            confirmingParticipants: confirmingParticipants, hadNotesBefore: hadNotesBefore,
+            applyNameProposals: !hadNotesBefore)
     }
 
+    /// `applyNameProposals`: a D17 pending-resume that mints the meeting's
+    /// FIRST notes applies the response's speaker-name proposals to the
+    /// persisted transcript (that run never had them). Every other notes-only
+    /// path passes FALSE — the user rewrite directly, and the resume via
+    /// `!hadNotesBefore` — because a notes rewrite must leave the transcript
+    /// byte-identical.
     private func notesOnlyStages(
         meeting: Meeting, segments: [TranscriptSegment], dominantLanguage: String,
         asrProvenance: ASRProvenance, context: RunContext, vocabulary: PipelineVocabulary,
-        confirmingParticipants: Bool = false, hadNotesBefore: Bool = false
+        confirmingParticipants: Bool = false, hadNotesBefore: Bool = false,
+        applyNameProposals: Bool = true
     ) async throws -> PipelineRunRecord {
         let meetingID = meeting.id
         let user = await userIdentity()
@@ -3485,25 +5412,37 @@ public actor ProcessingPipeline {
             emit(.runCompleted(meetingID))
             return context.record
         }
-        // Same prompt inputs as the pending run's stage 9: the persisted
-        // segments ARE that run's stage-9 transcript (a pending run applies
-        // no LLM names — there were no proposals), and the prompt reads only
-        // durable fields (title, startedAt, attendees, dominantLanguage,
-        // vocabulary, user identity). Pinned by the resume request-equality
-        // unit test.
-        let request = NotesRequest(
-            meeting: meeting,
-            transcript: segments,
-            dominantLanguage: dominantLanguage,
-            vocabulary: vocabulary.canonicalTerms,
-            user: user,
-            // #101: SAME derivation as the full-run stage-9 build (same
-            // vocabulary, attendees, persisted stage-9 segments) — pinned
-            // byte-equal by `resumeRebuildsTheSamePromptInputsAsStageNine`.
-            groundedPersonHints: GroundedPersonHints.groundedPersonHints(
-                vocabulary: vocabulary, attendees: meeting.attendees, segments: segments))
-
         do {
+            // The SAME loader the full run's stage 9 uses (path parity), read
+            // inside the do so a store read fault parks the run retryably
+            // instead of proceeding with zero pinned corrections.
+            let correctionRowsForRequest = try await correctionRows(meetingID: meetingID)
+            context.consumedCorrections = correctionRowsForRequest
+                .filter { $0.kind == .understanding && $0.status == .pending }
+                .map { ($0.id, $0.quotedText, $0.userText) }
+            // Same prompt inputs as the pending run's stage 9: the persisted
+            // segments ARE that run's stage-9 transcript (a pending run applies
+            // no LLM names — there were no proposals), and the prompt reads only
+            // durable fields (title, startedAt, attendees, dominantLanguage,
+            // vocabulary, user identity). Pinned by the resume request-equality
+            // unit test.
+            let request = NotesRequest(
+                meeting: meeting,
+                transcript: segments,
+                dominantLanguage: dominantLanguage,
+                vocabulary: vocabulary.canonicalTerms,
+                user: user,
+                // #101: SAME derivation as the full-run stage-9 build (same
+                // vocabulary, attendees, persisted stage-9 segments) — pinned
+                // byte-equal by `resumeRebuildsTheSamePromptInputsAsStageNine`.
+                groundedPersonHints: GroundedPersonHints.groundedPersonHints(
+                    vocabulary: vocabulary, attendees: meeting.attendees, segments: segments),
+                // The resume and the user rewrite inject the same durable rows
+                // as the full run (request parity holds — same loader).
+                corrections: correctionRowsForRequest
+                    .filter { $0.kind == .understanding }
+                    .map(NotesCorrection.init(row:)))
+
             let outcome = try await stage(.notes, context, meetingID) {
                 try await self.generateNotesWithFallback(request, context: context)
             }
@@ -3521,47 +5460,54 @@ public actor ProcessingPipeline {
 
             // applyLLMNames over the persisted transcript; re-persist only
             // when a proposal actually named someone (same validation set as
-            // the full run's stage 10).
-            let captured = meeting.captured || hasMicTrack(meetingID)
-            let storedEvents = try await MeetEventsRepository(database: database)
-                .activeSpeakerEvents(meetingID: meetingID, excludingSelf: captured)
+            // the full run's stage 10). SKIPPED for the user rewrite
+            // (`applyNameProposals == false`): a notes rewrite must leave the
+            // transcript byte-identical — proposals from the rewrite response
+            // are dropped (the transcript's names are already final).
             var finalSegments = segments
-            try await stage(.applyLLMNames, context, meetingID) {
-                finalSegments = self.applyProposals(
-                    notesResult.speakerNameMapping, to: segments, meeting: meeting,
-                    eventNames: Set(storedEvents.map(\.displayName)), user: user,
-                    vocabulary: vocabulary)
-                context.record.namedSegmentCount =
-                    finalSegments.filter { $0.speakerName != nil }.count
-            }
-            // G2 §1/§3: apply the store + rule-3 polish to speaker NAMES before
-            // user renames (a misheard label is outranked by a store row).
-            let labelContext = await nameSubstitutionContext(
-                meeting: meeting, segments: finalSegments, vocabulary: vocabulary)
-            finalSegments = applyStoreToSpeakerLabels(
-                finalSegments, context: labelContext,
-                ownerIdentitySet: OwnerIdentitySet(
-                    user: user, attendees: meeting.attendees))
-
-            // G2 §4: apply durable speaker-rename rows (artifact-present direct
-            // apply; the resume never re-diarizes, so labels are stable).
-            let renames = (try? await database.pool.read { db in
-                try SpeakerRenameStore.all(db, meetingID: meetingID)
-            }) ?? []
-            finalSegments = SpeakerRenameStore.applyRenames(renames, to: finalSegments)
-            context.record.finalSegmentCount = finalSegments.count
-            if finalSegments != segments {
-                try await stage(.persistTranscript, context, meetingID) {
-                    let stored = try await self.database.persistTranscript(
-                        meetingID: meetingID,
-                        segments: finalSegments,
-                        asrProvenance: asrProvenance,
-                        dominantLanguage: dominantLanguage,
-                        updatedAt: self.now())
-                    try self.exportTranscriptJSON(
-                        meetingID: meetingID, segments: stored,
-                        provenance: asrProvenance, dominantLanguage: dominantLanguage)
+            if applyNameProposals {
+                let captured = meeting.captured || hasMicTrack(meetingID)
+                let storedEvents = try await MeetEventsRepository(database: database)
+                    .activeSpeakerEvents(meetingID: meetingID, excludingSelf: captured)
+                try await stage(.applyLLMNames, context, meetingID) {
+                    finalSegments = self.applyProposals(
+                        notesResult.speakerNameMapping, to: segments, meeting: meeting,
+                        eventNames: Set(storedEvents.map(\.displayName)), user: user,
+                        vocabulary: vocabulary)
+                    context.record.namedSegmentCount =
+                        finalSegments.filter { $0.speakerName != nil }.count
                 }
+                // G2 §1/§3: apply the store + rule-3 polish to speaker NAMES before
+                // user renames (a misheard label is outranked by a store row).
+                let labelContext = await nameSubstitutionContext(
+                    meeting: meeting, segments: finalSegments, vocabulary: vocabulary)
+                finalSegments = applyStoreToSpeakerLabels(
+                    finalSegments, context: labelContext,
+                    ownerIdentitySet: OwnerIdentitySet(
+                        user: user, attendees: meeting.attendees))
+
+                // G2 §4: apply durable speaker-rename rows (artifact-present direct
+                // apply; the resume never re-diarizes, so labels are stable).
+                let renames = (try? await database.pool.read { db in
+                    try SpeakerRenameStore.all(db, meetingID: meetingID)
+                }) ?? []
+                finalSegments = SpeakerRenameStore.applyRenames(renames, to: finalSegments)
+                context.record.finalSegmentCount = finalSegments.count
+                if finalSegments != segments {
+                    try await stage(.persistTranscript, context, meetingID) {
+                        let stored = try await self.database.persistTranscript(
+                            meetingID: meetingID,
+                            segments: finalSegments,
+                            asrProvenance: asrProvenance,
+                            dominantLanguage: dominantLanguage,
+                            updatedAt: self.now())
+                        try self.exportTranscriptJSON(
+                            meetingID: meetingID, segments: stored,
+                            provenance: asrProvenance, dominantLanguage: dominantLanguage)
+                    }
+                }
+            } else {
+                context.record.finalSegmentCount = finalSegments.count
             }
 
             // G2 §3: name-substitution pass (pending-resume path) over the
@@ -3569,6 +5515,19 @@ public actor ProcessingPipeline {
             let substituted = await applyNameSubstitution(
                 to: notesResult, meeting: meeting, segments: finalSegments,
                 vocabulary: vocabulary)
+
+            // N3: the same screen, before this site's digest and install. This
+            // site owns its terminal event, so the withheld return emits it
+            // exactly as the site's other early completions do.
+            if try await withholdsResurrectedClaim(
+                meetingID: meetingID, meeting: meeting,
+                corrections: correctionRowsForRequest,
+                candidate: substituted.structured, dominantLanguage: dominantLanguage,
+                context: context)
+            {
+                emit(.runCompleted(meetingID))
+                return context.record
+            }
 
             // G14: the second synthesis call also fires on the notes-only resume
             // (toggle-gated, non-fatal). A resume that produced new notes also
@@ -3582,10 +5541,11 @@ public actor ProcessingPipeline {
             try await persistNotesAndFinalize(
                 meetingID: meetingID, notesResult: substituted,
                 dominantLanguage: dominantLanguage, meetingTitle: meeting.title,
-                user: user, context: context, memoryDigest: digest)
-            if case .failed(let reason) = digestOutcome {
-                await writeDigestPending(meetingID: meetingID, reason: reason)
-            }
+                user: user, context: context, memoryDigest: digest,
+                // No-regress: nothing replaces the stored notes row or notes.md
+                // until the finalize transaction has committed.
+                deferNotesInstall: true,
+                digestPendingReason: Self.digestFailureReason(digestOutcome))
             await handoffKicker.kick()
             await writeTerminalNote(
                 meetingID: meetingID, fallback: context.record.fallback,
@@ -3593,9 +5553,23 @@ public actor ProcessingPipeline {
             emit(.runCompleted(meetingID))
             return context.record
         } catch {
-            // STILL pending: the durable state is unchanged (transcript
-            // persisted, notes absent) — refresh the marker so the next
-            // trigger retries, and surface the failure honestly.
+            // STILL pending. The transcript is untouched on every path the
+            // user rewrite takes (`applyNameProposals == false`); a FIRST-notes
+            // resume that landed name proposals has already re-persisted the
+            // segments above, and that write stands.
+            // What holds for the notes depends on which side of the finalize
+            // commit the failure landed on:
+            //   - before it (everything up to and including the payload write):
+            //     no-regress — the previous notes row and notes.md are exactly
+            //     as they were, or still absent;
+            //   - after it, at the `notes.md` promote: the NEW row is installed
+            //     and enqueued while the file is still the previous one, or
+            //     absent;
+            //   - after it, at the promote-marker clear: the file already
+            //     carries the new row, and only the marker is left standing.
+            // Every case is convergent: the marker refreshed below sends the
+            // next self-heal trigger back to re-mint, which rewrites the file
+            // from the row and retires the marker.
             let message = Self.describe(error)
             let stage = context.currentStage
             logger.error("notes-only resume failed at \(stage.rawValue): \(message)")
@@ -3781,8 +5755,22 @@ public actor ProcessingPipeline {
             // scoped set is already on `notes` (reloaded above), so the re-mint
             // preserves it.
             notes.memoryDigest = clean
+            // The healed digest is instruction-aware and this transaction
+            // delivers it, so the meeting owes the settle chain nothing.
+            notes.digestEditOwed = false
+            notes.deliveryOwed = false
+            notes.digestPromptVersion = DigestPromptBuilder.shippedVersion.rawValue
+            // Read AFTER the digest call returns, not before it: a slice held
+            // across that await could mint a record for a row the user deleted
+            // during the call, and a payload whose set disagrees with durable
+            // state is unrecoverable at mint. A read fault here aborts the
+            // success arm like any other DB fault in it — the digest-pending
+            // marker survives and the next trigger re-runs.
+            let correctionRows = try await correctionRows(meetingID: meetingID)
             let payload = EvidencePayloadBuilder.build(
-                meeting: meeting, segments: segments, notes: notes, user: user)
+                meeting: meeting, segments: segments, notes: notes, user: user,
+                corrections: correctionRows,
+                includeMemoryDigest: await MemoryDigestSettings.isEnabled(in: settings))
             let relativePath = database.paths.relativeHandoffPayloadPath(
                 meetingID: meetingID, versionHash: payload.versionHash)
             try ImmutablePayloadWriter.write(
@@ -3793,8 +5781,17 @@ public actor ProcessingPipeline {
                 _ = try HandoffRepository.enqueue(
                     db, rootURL: rootURL, meetingID: meetingID,
                     versionHash: payload.versionHash, payloadPath: relativePath)
+                // The marker clear joins THIS transaction rather than trailing
+                // it: a crash in the old gap re-fired a model call on a meeting
+                // whose digest had already landed. Still conditional on the
+                // live marker, so a concurrently written one is never clobbered.
+                try db.execute(
+                    sql: """
+                        UPDATE meeting SET last_processing_error = NULL
+                        WHERE id = ? AND last_processing_error LIKE ?
+                        """,
+                    arguments: [meetingID, DigestPendingClass.prefix + "%"])
             }
-            await clearDigestPending(meetingID: meetingID)
             await handoffKicker.kick()
             return true
         case .failed(let reason):
@@ -3947,7 +5944,7 @@ public actor ProcessingPipeline {
                     components.append(degradation)
                 }
                 if let fallback {
-                    components.append("fallback: \(fallback.reason)")
+                    components.append("notes written by the backup engine: \(fallback.reason)")
                 }
                 note = components.isEmpty ? nil : components.joined(separator: "; ")
             }
@@ -3964,6 +5961,28 @@ public actor ProcessingPipeline {
     private func userIdentity() async -> UserIdentity {
         (try? await settings.get(UserIdentity.settingsKey, as: UserIdentity.self))
             ?? .shippedDefault
+    }
+
+    /// The rendering a PERSON reads — the pending reason behind the notes
+    /// toast, and the fallback processing note. `describe` is the DIAGNOSTIC
+    /// rendering and stays that way: it carries the configuration key and the
+    /// engine id for the log and the error record, neither of which means
+    /// anything to someone reading their meeting notes. A phrase, not a
+    /// sentence, because the callers that know WHICH engine failed put its
+    /// display name in front of it. Only the fallback triggers reach a person
+    /// this way, and all but `.configurationMissing` are already plain
+    /// English; anything else is engine free-text (API bodies, ids, key
+    /// paths) and gets the neutral phrase rather than its own words.
+    static func humanReason(_ error: EngineError) -> String {
+        switch error {
+        case .configurationMissing:
+            return "not set up yet — add its details in Settings"
+        case .permanent(let reason), .notAvailable(let reason):
+            return EngineFallbackReason.isFallbackTrigger(error)
+                ? reason : "the notes could not be written"
+        default:
+            return "the notes could not be written"
+        }
     }
 
     static func describe(_ error: any Error) -> String {

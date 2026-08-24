@@ -188,6 +188,74 @@ run_real_asr_kill() {
     rm -rf "$DR"
 }
 
+# ------------------------------------------------- notes-only promote window
+
+# The notes-only paths (user rewrite, first-notes D17 resume) commit finalize
+# BEFORE promoting notes.md from the row it installs. A kill inside that window
+# leaves the row ahead of the file; the invariant under test is that the state
+# left behind carries a recovery trigger and the next launch converges the two.
+run_notes_promote_point() { # <rewrite|first-notes>
+    local caller=$1
+    echo "== deterministic kill point: notes-promote ($caller) =="
+    local DR MID S
+    DR=$(mktemp -d "${TMPDIR:-/tmp}/blaise-crash-promote-XXXXXX")
+    MID=$("$RUNNER" import "$DR" "$WAV") || { echo "import failed"; FAIL=$((FAIL+1)); return; }
+
+    # The rewrite's setup run leaves its own (undelivered) queue row behind.
+    local code file_before expected_queue=1
+    [[ $caller == rewrite ]] && expected_queue=2
+    if [[ $caller == rewrite ]]; then
+        # A ready meeting with notes on disk, then a correction-driven rewrite.
+        "$RUNNER" process "$DR" "$MID" >/dev/null 2>&1 \
+            || { echo "  FAIL: setup run"; FAIL=$((FAIL+1)); rm -rf "$DR"; return; }
+        file_before=$(jfield "$(status_json "$DR" "$MID")" notes_file_sha)
+        check "$(bool "$file_before" != null)" "$caller: notes.md present before the rewrite"
+        BLAISE_CRASH_AT=notes-promote "$RUNNER" rewrite "$DR" "$MID" >/dev/null 2>&1
+        code=$?
+    else
+        # The D17 shape: parked notes (transcript persisted, no notes row, no
+        # file), healed by the launch resume.
+        "$RUNNER" process "$DR" "$MID" --park-notes >/dev/null 2>&1
+        S=$(status_json "$DR" "$MID")
+        file_before=$(jfield "$S" notes_file_sha)
+        check "$(bool "$file_before" == null)" "$caller: no notes.md before the resume"
+        check "$(bool "$(jfield "$S" notes_row_sha)" == null)" "$caller: no notes row before the resume"
+        BLAISE_CRASH_AT=notes-promote "$RUNNER" resume "$DR" >/dev/null 2>&1
+        code=$?
+    fi
+    check "$(bool "$code" -eq 137)" "$caller: process killed by SIGKILL in the window (exit $code)"
+
+    # The window's durable state: row installed and handed off, file behind it.
+    S=$(status_json "$DR" "$MID")
+    local row_after file_after
+    row_after=$(jfield "$S" notes_row_sha)
+    file_after=$(jfield "$S" notes_file_sha)
+    check "$(bool "$row_after" != null)" "$caller: the finalize transaction committed the new notes row"
+    check "$(bool "$(jfield "$S" queue_rows)" -eq "$expected_queue")" "$caller: the new payload is queued"
+    check "$(bool "$file_after" == "$file_before")" "$caller: notes.md is still the pre-run file (the promote never ran)"
+    check "$(bool "$row_after" != "$file_after")" "$caller: row and file diverged, as a kill there must"
+    # …and it carries the recovery trigger, committed WITH the row.
+    check "$(bool "$(jfield "$S" last_error)" == "notes-pending: notes file promote incomplete")" \
+        "$caller: the notes-pending marker survived the kill"
+
+    # Relaunch: the self-heal converges the file to the row.
+    "$RUNNER" resume "$DR" >/dev/null 2>&1
+    check "$(bool $? -eq 0)" "$caller: the launch resume completes"
+    S=$(status_json "$DR" "$MID")
+    local row_final file_final
+    row_final=$(jfield "$S" notes_row_sha)
+    file_final=$(jfield "$S" notes_file_sha)
+    # Both surfaces must EXIST before their equality means convergence:
+    # null == null would otherwise pass with both notes surfaces gone.
+    check "$(bool "$row_final" != null)" "$caller: the notes row is present after the relaunch"
+    check "$(bool "$file_final" != null)" "$caller: notes.md is present after the relaunch"
+    check "$(bool "$file_final" == "$row_final")" \
+        "$caller: notes.md and the notes row agree after the relaunch"
+    check "$(bool "$(jfield "$S" last_error)" == null)" "$caller: marker cleared once the file caught up"
+    check "$(bool "$(jfield "$S" status)" == ready)" "$caller: meeting ready after the relaunch"
+    rm -rf "$DR"
+}
+
 # ---------------------------------------------------------------- entry
 
 MODE=${1:-mock}
@@ -196,6 +264,8 @@ mock)
     run_deterministic_point ingest-encode
     run_deterministic_point persist-transcript
     run_deterministic_point pre-finalize
+    run_notes_promote_point rewrite
+    run_notes_promote_point first-notes
     ;;
 --real | real)
     run_real_asr_kill
@@ -204,6 +274,8 @@ all)
     run_deterministic_point ingest-encode
     run_deterministic_point persist-transcript
     run_deterministic_point pre-finalize
+    run_notes_promote_point rewrite
+    run_notes_promote_point first-notes
     run_real_asr_kill
     ;;
 *)

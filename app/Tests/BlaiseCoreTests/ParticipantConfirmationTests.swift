@@ -33,10 +33,17 @@ import Testing
         }
     }
 
+    /// The dispatched run FINISHED — not merely "the row says ready". The
+    /// notes-only paths flip status at the finalize commit and clear the
+    /// promote marker once `notes.md` carries the row that commit installed.
+    private func settleRunFinished(_ harness: PipelineHarness, _ id: MeetingID) async throws {
+        try await settle(harness, id) { $0?.status == .ready && $0?.lastProcessingError == nil }
+    }
+
     /// The resume dispatched when an answer lands inside the park-commit window
     /// is its own run, queued behind the one that is still finishing.
     private func settleAfterLateAnswer(_ harness: PipelineHarness, _ id: MeetingID) async throws {
-        try await settle(harness, id) { $0?.status == .ready }
+        try await settleRunFinished(harness, id)
     }
 
     /// Counts `.participantConfirmationNeeded` events across `body`, breaking each
@@ -184,7 +191,7 @@ import Testing
         #expect(confirmed)
 
         // The answer returns on the write; its resume runs behind the closed sheet.
-        try await settle(harness, meeting.id) { $0?.status == .ready }
+        try await settleRunFinished(harness, meeting.id)
         let stored = try #require(try await harness.meeting(meeting.id))
         #expect(stored.status == .ready)
         #expect(stored.lastProcessingError == nil, "marker cleared by the resume finalize")
@@ -211,7 +218,7 @@ import Testing
 
         let skipped = try await harness.pipeline.skipParticipantConfirmation(meetingID: meeting.id)
         #expect(skipped)
-        try await settle(harness, meeting.id) { $0?.status == .ready }
+        try await settleRunFinished(harness, meeting.id)
         let stored = try #require(try await harness.meeting(meeting.id))
         #expect(stored.status == .ready)
         #expect(stored.lastProcessingError == nil)
@@ -872,7 +879,7 @@ import Testing
         // The dispatched resume still runs to completion behind the closed sheet.
         gate.release()
         #expect(try await answer.value)
-        try await settle(harness, meetingID) { $0?.status == .ready }
+        try await settleRunFinished(harness, meetingID)
         let stored = try #require(try await harness.meeting(meetingID))
         #expect(stored.status == .ready)
         #expect(stored.lastProcessingError == nil, "the resume's finalize cleared the marker")
@@ -910,7 +917,7 @@ import Testing
 
         gate.release()
         #expect(try await answer.value, "an accepted skip reports success")
-        try await settle(harness, meetingID) { $0?.status == .ready }
+        try await settleRunFinished(harness, meetingID)
         let stored = try #require(try await harness.meeting(meetingID))
         #expect(stored.status == .ready)
         #expect(stored.lastProcessingError == nil)

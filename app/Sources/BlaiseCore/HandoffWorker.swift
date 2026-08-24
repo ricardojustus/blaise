@@ -1040,19 +1040,35 @@ public actor HandoffWorker: HandoffKicking {
     }
 
     /// Re-materializes from durable state. We don't persist which digest
-    /// contract or notes user-action-items key form a queued payload used (no
-    /// migration), so we rebuild across BOTH axes — the SHIPPED digest version
-    /// then any prior one (md-v1, before the md-v2 bump), each with the CURRENT
-    /// then the LEGACY `ric_action_items` key — and return the first build whose
-    /// hash reproduces the stored `version_hash`. This keeps a pre-bump / pre-G4
-    /// queued payload recoverable instead of quarantining; a new payload matches
-    /// the first (shipped / current) combination. The digest axis is a no-op for
-    /// items carrying no memory_digest (those bytes don't change with it).
+    /// contract, notes user-action-items key form, digest-toggle state, or
+    /// retractions wire encoding a queued payload used, so we rebuild across
+    /// ALL FOUR axes — the SHIPPED digest version then any prior one, each with
+    /// the CURRENT then the LEGACY `ric_action_items` key, each with the digest
+    /// PAIR present then absent, each with the retractions key EMITTED then
+    /// OMITTED — and return the first build whose hash reproduces the stored
+    /// `version_hash`. This keeps a pre-bump / pre-G4 / toggle-off / pre-N5
+    /// queued payload recoverable instead of quarantining; a new payload
+    /// matches the first combination. The digest version and presence axes are
+    /// both no-ops for items carrying no memory_digest (those bytes don't
+    /// change with them), so the retractions axis is INNERMOST: every existing
+    /// combination is tried under both encodings.
+    ///
+    /// The correction rows load FRESH from durable state and thread into every
+    /// candidate — the new axis varies how the wire is ENCODED, never the
+    /// inputs. A rebuild therefore reproduces the original bytes exactly or
+    /// refuses: when durable state has MOVED since the mint (a row deleted, a
+    /// correction edited or reopened) no candidate matches and the item
+    /// quarantines as damaged — the same drift class a post-queue rename
+    /// already produces for the title, with the same recovery, the newer
+    /// content's own delivery.
     private func rematerialize(_ item: HandoffItem) async -> EvidencePayloadBuilder.Payload? {
         guard
             let meeting = try? await MeetingRepository(database: database).fetch(item.meetingID),
             let notes = try? await NotesRepository(database: database).fetch(meetingID: item.meetingID),
-            let segments = try? await TranscriptRepository(database: database).segments(meetingID: item.meetingID)
+            let segments = try? await TranscriptRepository(database: database).segments(meetingID: item.meetingID),
+            let corrections = try? await database.pool.read({ db in
+                try MeetingCorrectionStore.all(db, meetingID: item.meetingID)
+            })
         else { return nil }
         let user = (try? await settingsStore.get(UserIdentity.settingsKey, as: UserIdentity.self))
             ?? nil ?? UserIdentity.shippedDefault
@@ -1061,11 +1077,19 @@ public actor HandoffWorker: HandoffKicking {
         var firstBuild: EvidencePayloadBuilder.Payload?
         for digestVersion in digestVersions {
             for key in [EvidencePayloadBuilder.UserActionItemsKey.current, .legacy] {
-                let candidate = EvidencePayloadBuilder.build(
-                    meeting: meeting, segments: segments, notes: notes, user: user,
-                    userActionItemsKey: key, digestPromptVersion: digestVersion)
-                if candidate.versionHash == item.versionHash { return candidate }
-                if firstBuild == nil { firstBuild = candidate }
+                for includeDigest in [true, false] {
+                    for retractionsKey in [
+                        EvidencePayloadBuilder.RetractionsKey.current, .preN5Absent,
+                    ] {
+                        let candidate = EvidencePayloadBuilder.build(
+                            meeting: meeting, segments: segments, notes: notes, user: user,
+                            corrections: corrections,
+                            userActionItemsKey: key, digestPromptVersion: digestVersion,
+                            includeMemoryDigest: includeDigest, retractionsKey: retractionsKey)
+                        if candidate.versionHash == item.versionHash { return candidate }
+                        if firstBuild == nil { firstBuild = candidate }
+                    }
+                }
             }
         }
         return firstBuild

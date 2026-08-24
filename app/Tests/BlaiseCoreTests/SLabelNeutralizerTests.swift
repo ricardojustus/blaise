@@ -335,7 +335,7 @@ enum SLabelFixture {
         notes.markdown = markdown
         let payload = EvidencePayloadBuilder.build(
             meeting: meeting, segments: segments, notes: notes,
-            user: UserIdentity(name: "", aliases: [], email: ""))
+            user: UserIdentity(name: "", aliases: [], email: ""), corrections: [])
 
         let json = try #require(
             try JSONSerialization.jsonObject(with: payload.bytes) as? [String: Any])
@@ -389,15 +389,29 @@ enum SLabelFixture {
     /// G14: the neutralize family now includes `SLabelNeutralizer.neutralizeText`
     /// — the flat-string entry point that cleans the produced memory-DIGEST
     /// string. The digest-only resume's build (`digestOnlyBody`) is preceded by
-    /// `generateMemoryDigest`'s `neutralizeText` (its own window's neutralize),
-    /// so the build count is 5; the neutralize-family count is 8 — the digest
-    /// path neutralizes the synthesis DRAFT, the md-v6 COMBINED-AUDIT output, AND
-    /// (md-v5 rollback branch) the verify/repair output + the notes-RECONCILED
-    /// output (FOUR `neutralizeText` calls present in `generateMemoryDigest`: the
-    /// md-v6 path runs synth→combined-audit, the md-v5 path runs
-    /// synth→verify→reconcile, and both branches' neutralizes live in the source
-    /// the grep counts); renders stay 4 (the digest resume re-mints WITHOUT
-    /// re-rendering the notes markdown).
+    /// `generateMemoryDigest`'s `neutralizeText` (its own window's neutralize).
+    /// The digest path neutralizes the synthesis DRAFT, the COMBINED-AUDIT
+    /// output, AND (md-v5 rollback branch) the verify/repair output + the
+    /// notes-RECONCILED output (FOUR `neutralizeText` calls present in
+    /// `generateMemoryDigest`: the shipped path runs synth→combined-audit, the
+    /// md-v5 path runs synth→verify→reconcile, and both branches' neutralizes
+    /// live in the source the grep counts); N4's digest reconcile adds a fifth,
+    /// cleaning the edited digest before it persists.
+    ///
+    /// N4: the notes-editor pass and the annotation re-mint no longer BUILD —
+    /// they record owed bits and the pooled settle delivery mints once — so the
+    /// build count falls while the render count rises by the delivery's own
+    /// re-render.
+    ///
+    /// N3 admits a neutralize seam of a THIRD kind: the absence check's gate
+    /// screens the candidate as stage 12 would persist it, so it neutralizes to
+    /// DECIDE and consumes neither a render nor a build. It is counted in the
+    /// family (its surface must still pass `groundedMLabels:`) but owns no mint
+    /// window, so the ordinal pairing below no longer maps one neutralize to
+    /// one render/build — it maps the i-th family call to the i-th render and
+    /// the i-th build, which stays sound (every render and build is still
+    /// preceded by a neutralize) while the COUNT pins are what catch a deleted
+    /// or added seam.
     @Test func everyForwardRenderAndBuildFollowsANeutralize() {
         let source = Self.pipelineSource
         #expect(!source.isEmpty, "could not read ProcessingPipeline.swift")
@@ -417,12 +431,18 @@ enum SLabelFixture {
         ).sorted()
 
         // The forward mint seams: title rename, speaker rename, notes-correction,
-        // finalize, AND the G14 digest-only resume (build only — it does not
-        // re-render the notes markdown). Pinning the counts is load-bearing: a
-        // NEW unguarded forward flow shifts a count and fails here.
-        #expect(renderSites.count == 4, "expected 4 forward render sites, found \(renderSites.count)")
-        #expect(buildSites.count == 5, "expected 5 forward build sites, found \(buildSites.count)")
-        #expect(neutralizeSites.count == 8, "expected 8 neutralize-family calls, found \(neutralizeSites.count)")
+        // the annotation re-mint and the notes-editor pass (both
+        // neutralize → render, and NEITHER mints any more — N4 replaced their
+        // deliveries with owed bits), the N4 settle delivery
+        // (neutralize → render → build), finalize, and the G14 digest-only
+        // resume (build only — it does not re-render the notes markdown). Two
+        // neutralize-only seams own no mint window: the N3 absence-check gate,
+        // which screens a candidate, and the N4 digest reconcile, which cleans
+        // the edited digest string. Pinning the counts is load-bearing: a NEW
+        // unguarded forward flow shifts a count and fails here.
+        #expect(renderSites.count == 7, "expected 7 forward render sites, found \(renderSites.count)")
+        #expect(buildSites.count == 6, "expected 6 forward build sites, found \(buildSites.count)")
+        #expect(neutralizeSites.count == 13, "expected 13 neutralize-family calls, found \(neutralizeSites.count)")
 
         // Mint-window discipline: pair the neutralize-family sites to the render
         // and build sites in line order; each render and each build must follow
@@ -470,6 +490,6 @@ enum SLabelFixture {
                 window.joined(separator: "\n").contains("groundedMLabels:"),
                 "neutralize seam at line \(index + 1) does not pass groundedMLabels:")
         }
-        #expect(checked == 8, "expected 8 neutralize-family seams, found \(checked)")
+        #expect(checked == 13, "expected 13 neutralize-family seams, found \(checked)")
     }
 }

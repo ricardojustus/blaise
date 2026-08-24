@@ -160,8 +160,18 @@ struct MeetingDetailView: View {
             let detail = MeetingDetailModel(database: appEnv.database, meetingID: meetingID)
             detail.start()
             model = detail
+            // N4: this meeting now has a live reading session, so its settle
+            // waits out the idle window instead of firing at once.
+            await appEnv.pipeline.settleViewAttached(meetingID)
         }
-        .onDisappear { model?.stop() }
+        .onDisappear {
+            model?.stop()
+            // The session is over: the settle chain runs now (unless the app is
+            // terminating, which the pipeline's own flag decides).
+            let pipeline = appEnv.pipeline
+            let id = meetingID
+            Task { await pipeline.settleViewDetached(id) }
+        }
         .onChange(of: uiState.detailRequest) {
             applyDetailRequest()
         }
@@ -282,10 +292,158 @@ private struct DetailContent: View {
 
 // MARK: - Notes pane (native structured rendering)
 
+/// The app-menu full-rewrite banner: nil on success; explicit copy when the
+/// rewrite was parked (notes-pending, e.g. no engine configured) or refused.
+func rewriteFeedback(_ record: PipelineRunRecord?) -> String? {
+    guard let record else {
+        return "The notes could not be re-written because the meeting is not ready."
+    }
+    if record.notesPending != nil {
+        // The pipeline's reason is an engineering token (a missing settings
+        // key, by name) and never reaches the reader.
+        return "The re-write is waiting on the notes engine and will run automatically when it becomes available."
+    }
+    return nil
+}
+
+@MainActor
+func saveUnderstandingCorrectionAction(
+    save: () async throws -> Void
+) async -> String? {
+    do {
+        try await save()
+        return nil
+    } catch {
+        return "Could not save the correction: \(error.localizedDescription)"
+    }
+}
+
+@MainActor
+func sendToNotesEditorAction(
+    meetingID: MeetingID,
+    send: (MeetingID) async throws -> Void
+) async -> String? {
+    do {
+        try await send(meetingID)
+        return nil
+    } catch {
+        return "Could not send changes to Notes Editor: \(error.localizedDescription)"
+    }
+}
+
+/// The honest banner for a saved margin note. nil when the note is already in
+/// notes.md and the minted payload. A note written during a run is durable at
+/// once, but its re-mint queues behind that run — so the copy says so instead
+/// of implying the notes already carry it.
+func noteFeedback(remintRefused: Bool, runActive: Bool) -> String? {
+    if remintRefused {
+        return "Note saved — it will appear in the delivered notes when processing completes."
+    }
+    if runActive {
+        return "Note saved — it appears in the notes when the current run finishes."
+    }
+    return nil
+}
+
+/// What to report when the delete path threw. The row is deleted before the
+/// re-mint that publishes the change can throw, so a surviving row is a real
+/// failure while a row that is gone was deleted — only its publication lags.
+/// `nil` is the third case: the store could not be read, so the outcome is
+/// unknown and must be reported as unknown rather than as a delete.
+func deleteFeedback(rowSurvived: Bool?, error: any Error) -> String {
+    switch rowSurvived {
+    case true:
+        return "Could not delete: \(error.localizedDescription)"
+    case false:
+        return "Deleted — the notes could not be re-written just now; they catch up on the next run."
+    case nil:
+        return "Could not confirm the delete (\(error.localizedDescription)) — reopen the meeting to see whether it is still listed."
+    }
+}
+
+/// Whether NEW correction/note entry is offered. A row saved while a run holds
+/// the meeting is never seen by that run's synthesis (it built its request
+/// before the save) — a silent no-op — so the block affordances close for the
+/// duration. Management (delete = undo) uses the base availability instead.
+func correctionEntryEnabled(available: Bool, runActive: Bool, rewriteBusy: Bool) -> Bool {
+    available && !runActive && !rewriteBusy
+}
+
+/// The anchor id of one of the reader's OWN action items. Its own prefix, so it
+/// can never collide with the meeting-wide action list's.
+enum UserActionAnchor {
+    static func id(_ index: Int) -> String { "notes-user-action-\(index)" }
+}
+
+/// Groups rows by the RENDERED block they belong beside: the one whose text
+/// carries the row's quote. `uiTexts` is the pane's own markdown-block list,
+/// which is finer than the fold-split anchor space — a bullet list is one anchor
+/// block and many rendered blocks — so the quote is re-resolved against what the
+/// reader actually sees. A row whose quote matches no rendered block falls to
+/// the section's last block, where it still reads correctly because it names its
+/// quote.
+func rowsByRenderedBlock(
+    _ rows: [MeetingCorrection], uiTexts: CorrectionAnchoring.FoldedBlocks
+) -> [Int: [MeetingCorrection]] {
+    guard !uiTexts.blocks.isEmpty else { return [:] }
+    let fallback = uiTexts.blocks.count - 1
+    var grouped: [Int: [MeetingCorrection]] = [:]
+    for row in rows {
+        let index =
+            CorrectionAnchoring.resolve(
+                quote: row.quotedText, occurrence: row.occurrence, in: uiTexts)?.blockIndex
+            ?? fallback
+        grouped[index, default: []].append(row)
+    }
+    return grouped
+}
+
+/// The occurrence each block of a rendered list carries: its position among the
+/// blocks whose folded text matches its own, so two blocks with the same words
+/// anchor distinctly. Computed for the whole list at once — every block of the
+/// list asks the question in the same pass.
+func blockOccurrences(in blocks: CorrectionAnchoring.FoldedBlocks) -> [Int] {
+    blocks.blocks.indices.map { CorrectionAnchoring.occurrence(ofBlockAt: $0, in: blocks) }
+}
+
+/// The rows of one kind that stand beside each block of a rendered list,
+/// grouped by block index. The reading column's own filters decide which rows
+/// are on the page at all — an annotation leaves it when it is resolved, a
+/// correction when it is applied or resolved — and each survivor is placed on
+/// the block its anchor resolves to. A row that resolves to nothing is omitted
+/// from the grouping entirely: an unanchored ANNOTATION is surfaced by the
+/// "Your notes" tail, which carries annotations only.
+func rowsByAnchoredBlock(
+    _ rows: [MeetingCorrection], kind: MeetingCorrection.Kind,
+    section: MeetingCorrection.Section, blocks: CorrectionAnchoring.FoldedBlocks
+) -> [Int: [MeetingCorrection]] {
+    var grouped: [Int: [MeetingCorrection]] = [:]
+    for row in rows where row.kind == kind && row.section == section {
+        switch kind {
+        case .annotation:
+            guard row.status != .resolved else { continue }
+        case .understanding:
+            guard row.status != .applied, row.status != .resolved else { continue }
+        }
+        guard
+            let resolved = CorrectionAnchoring.resolve(
+                quote: row.quotedText, occurrence: row.occurrence, in: blocks)
+        else { continue }
+        grouped[resolved.blockIndex, default: []].append(row)
+    }
+    return grouped
+}
+
 private struct NotesPane: View {
     @Environment(AppEnvironment.self) private var appEnv
     @Environment(AppUIState.self) private var uiState
     @Environment(LibraryModel.self) private var library
+    // The live pipeline activity — a correction save that races an in-flight
+    // run would never be seen by that run's synthesis.
+    @Environment(PipelineActivityHolder.self) private var activity
+    /// The live margin-note placement + callout state, so a Settings change
+    /// re-renders the open notes without a relaunch.
+    @Environment(NotesPresentationHolder.self) private var notesPresentation
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let meeting: Meeting
     let notes: MeetingNotes?
@@ -312,8 +470,91 @@ private struct NotesPane: View {
     /// G15: the participant-confirmation sheet (opened from the pending banner).
     @State private var showParticipantConfirm = false
 
+    // Correction/note flow state. `correctionRows` mirrors the durable table
+    // (loaded on appear, refreshed after every mutation); `correctionBusy` is
+    // the in-flight rewrite indicator.
+    @State private var editingTarget: EditingTarget?
+    /// The composer's typed draft, held here rather than in the composer: the
+    /// re-synthesis that reopens the correction gate can take the composing
+    /// block out of the notes, and the draft has to outlive its block.
+    @State private var composerDraft = ""
+    /// The settle-activity debounce clock (N4: at most one signal a second).
+    @State private var lastSettleActivitySignal = Date.distantPast
+    @State private var correctionRows: [MeetingCorrection] = []
+    /// Bumped by every corrections load, so a slower earlier read cannot
+    /// overwrite the rows a later one already assigned.
+    @State private var correctionLoadGeneration = 0
+    @State private var showChangesPanel = false
+    @State private var correctionBusy = false
+    /// The block the overview last sent the reader to, and the request that
+    /// carries them there. The anchor doubles as the arrival mark, cleared once
+    /// the reader has had time to see where they landed.
+    @State private var navigationAnchor: String?
+    @State private var navigationRequest = 0
+    /// The text selected inside a block, if any — only one block ever holds
+    /// one — and where in that block it sits, which is what the action bar
+    /// stands against.
+    @State private var selection: BlockSelection?
+    @State private var selectionFrame: SelectionFrame?
+    /// The notes block that has been picked — by a click on it or by the
+    /// keyboard travelling to it — and the whole-block target built from it.
+    /// The aim is kept in state beside the focus id because the commands need
+    /// the block's whole anchor, which only the block itself can build.
+    @FocusState private var focusedBlock: String?
+    @State private var focusedAim: BlockSelection?
+    /// The block a click picked, and the whole-block target built from it. Held
+    /// apart from the keyboard's own aim because it outlives it: the prose host
+    /// hands the keyboard back a moment after a click that selected no words,
+    /// and a pick that died with the keyboard would take the control away as
+    /// the person was reaching for it.
+    @State private var pickedBlock: BlockSelection?
+    /// Block anchor ids whose narrow-mode note chip is expanded.
+    @State private var expandedChips: Set<String> = []
+    /// The pane's own size: the width decides whether the margin rail fits, the
+    /// height where the selection bar can stand.
+    @State private var paneWidth: CGFloat = NotesEditingLayout.railMinimumWidth
+    @State private var paneHeight: CGFloat = 900
+    /// Where each block sits, kept out of the view state.
+    @State private var geometry = BlockGeometryCache()
+
+    /// The pane's own coordinate space, so a block can say where it sits in the
+    /// part of the document the reader can actually see.
+    private nonisolated static let paneSpace = "notes-pane"
+    /// The document's own space, which does not move when the pane scrolls —
+    /// where the one selection bar is placed.
+    private nonisolated static let contentSpace = "notes-content"
+
+    /// One block an entry path can aim at, carrying the block's own anchor so
+    /// every path builds the identical target from it. `span` is the selection
+    /// inside the block; empty text means the whole block, which is what a
+    /// selection-less invocation anchors to.
+    struct BlockSelection: Equatable {
+        var blockID: String
+        var section: MeetingCorrection.Section
+        var blockText: String
+        var occurrence: Int
+        var span: SelectedSpan
+        /// The text the block's host renders, which is the space `span`'s
+        /// occurrence was counted in — the same space the wash paints in.
+        var hostText: String
+    }
+
     /// Anchor id for the user-action box ("My Action Items" opens the detail here).
     static let userActionBoxAnchor = "user-action-box"
+
+    /// The block ids on screen for these notes, including the user action items.
+    /// An open composer is looked up here, so what is rendered and what the
+    /// composer believes still exists cannot drift apart.
+    private func renderedAnchorIDs(_ structured: NotesStructured) -> [String] {
+        NotesBlockAnchor.rendered(in: structured)
+            + Self.presentableItems(structured.userActionItems).indices.map(UserActionAnchor.id)
+    }
+
+    /// Action items with text, in render order — the anchor space both action
+    /// lists are counted in (a blank item never fold-matches a quote).
+    static func presentableItems(_ items: [ActionItem]) -> [ActionItem] {
+        items.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -323,6 +564,32 @@ private struct NotesPane: View {
                 }
                 .onChange(of: searchRequest) {
                     scrollToFirstSearchMatch(proxy, animated: true)
+                }
+                .onChange(of: navigationRequest) {
+                    guard let anchor = navigationAnchor else { return }
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.22)) {
+                        proxy.scrollTo(anchor, anchor: .center)
+                    }
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(1600))
+                        guard navigationAnchor == anchor else { return }
+                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.3)) {
+                            navigationAnchor = nil
+                        }
+                    }
+                }
+                .onChange(of: editingTarget?.anchorID) { _, anchor in
+                    if let anchor { scrollComposerIntoView(proxy, anchor: anchor) }
+                }
+                // Keyboard travel that leaves the ring below the fold is travel
+                // with nothing to see. The minimum scroll rather than a centring
+                // one: a click takes focus too, and a block already on screen
+                // must not jump out from under the pointer that just picked it.
+                .onChange(of: focusedBlock) { _, anchor in
+                    guard let anchor else { return }
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                        proxy.scrollTo(anchor, anchor: nil)
+                    }
                 }
                 .onAppear {
                     if !searchTerms.isEmpty {
@@ -368,73 +635,109 @@ private struct NotesPane: View {
     private var scrollCore: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                header
+                // The header and its banners belong to the reading column, not
+                // to the pane: they end where the prose ends.
+                VStack(alignment: .leading, spacing: 24) {
+                    header
 
-                if !searchTerms.isEmpty {
-                    SearchDestinationBanner(terms: searchTerms, location: "notes")
-                }
-
-                if let note = meeting.processingNote, !note.isEmpty {
-                    HStack(alignment: .top, spacing: 8) {
-                        QuietBanner(
-                            text: note, systemImage: "info.circle", tint: .secondary,
-                            accessibilityPrefix: "Processing note")
-                        // C11: a capture-recovery note survives runs until a
-                        // both-tracks run completes OR the user dismisses it.
-                        if note.hasPrefix(CaptureRecovery.notePrefix) {
-                            Button {
-                                let database = appEnv.database
-                                let meetingID = meeting.id
-                                Task {
-                                    await CaptureRecovery.dismissRecoveryNote(
-                                        database: database, meetingID: meetingID)
-                                }
-                            } label: {
-                                Image(systemName: "xmark.circle")
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Dismiss capture recovery note")
-                            .help("Dismiss this note (the damaged capture file stays on disk)")
-                        }
+                    if !searchTerms.isEmpty {
+                        SearchDestinationBanner(terms: searchTerms, location: "notes")
                     }
-                }
-                if let error = meeting.lastProcessingError, !error.isEmpty {
-                    if NotesPendingClass.isAwaitingParticipantConfirmation(error) {
-                        // G15: the participant-confirmation gate — calm banner
-                        // plus the action that opens the confirm sheet.
-                        HStack(spacing: 10) {
+
+                    if let note = meeting.processingNote, !note.isEmpty {
+                        HStack(alignment: .top, spacing: 8) {
                             QuietBanner(
-                                text: "Confirm the participants to finish the notes",
-                                systemImage: "person.2", tint: .secondary,
-                                accessibilityPrefix: "Confirm participants")
-                            Button("Confirm Participants…") { showParticipantConfirm = true }
-                                .buttonStyle(.borderless)
+                                text: note, systemImage: "info.circle", tint: .secondary,
+                                accessibilityPrefix: "Processing note")
+                            // C11: a capture-recovery note survives runs until a
+                            // both-tracks run completes OR the user dismisses it.
+                            if note.hasPrefix(CaptureRecovery.notePrefix) {
+                                Button {
+                                    let database = appEnv.database
+                                    let meetingID = meeting.id
+                                    Task {
+                                        await CaptureRecovery.dismissRecoveryNote(
+                                            database: database, meetingID: meetingID)
+                                    }
+                                } label: {
+                                    Image(systemName: "xmark.circle")
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Dismiss capture recovery note")
+                                .help("Dismiss this note (the damaged capture file stays on disk)")
+                            }
                         }
-                    } else if NotesPendingClass.isPending(error) {
-                        // D17: calm, distinct from failed — keyed on the
-                        // reserved prefix, never on free-form text.
-                        QuietBanner(
-                            text: "Notes pending — will complete automatically",
-                            systemImage: "clock", tint: .secondary,
-                            accessibilityPrefix: "Notes pending")
-                    } else {
-                        QuietBanner(
-                            text: error, systemImage: "exclamationmark.triangle", tint: .orange,
-                            accessibilityPrefix: "Last processing error")
+                    }
+                    if let error = meeting.lastProcessingError, !error.isEmpty {
+                        if NotesPendingClass.isAwaitingParticipantConfirmation(error) {
+                            // G15: the participant-confirmation gate — calm banner
+                            // plus the action that opens the confirm sheet.
+                            HStack(spacing: 10) {
+                                QuietBanner(
+                                    text: "Confirm the participants to finish the notes",
+                                    systemImage: "person.2", tint: .secondary,
+                                    accessibilityPrefix: "Confirm participants")
+                                Button("Confirm Participants…") { showParticipantConfirm = true }
+                                    .buttonStyle(.borderless)
+                            }
+                        } else if NotesPendingClass.isPending(error) {
+                            // D17: calm, distinct from failed — keyed on the
+                            // reserved prefix, never on free-form text.
+                            QuietBanner(
+                                text: "Notes pending — will complete automatically",
+                                systemImage: "clock", tint: .secondary,
+                                accessibilityPrefix: "Notes pending")
+                        } else {
+                            QuietBanner(
+                                text: error, systemImage: "exclamationmark.triangle", tint: .orange,
+                                accessibilityPrefix: "Last processing error")
+                        }
                     }
                 }
-
-                Divider()
+                .frame(maxWidth: readingWidth, alignment: .leading)
 
                 if let notes {
-                    VStack(alignment: .leading, spacing: 24) {
-                        structuredSections(notes.structured)
+                    // The bar is a sibling of the sections rather than an
+                    // overlay inside one block: a view drawn outside its
+                    // parent's bounds is not hit-testable, and a bar standing
+                    // under a one-line block is entirely outside it. Here its
+                    // parent is the whole document, so it can be clicked
+                    // wherever it stands — and there is structurally one.
+                    ZStack(alignment: .topLeading) {
+                        VStack(alignment: .leading, spacing: 24) {
+                            structuredSections(notes.structured)
+                        }
+                        selectionBar
                     }
+                    .coordinateSpace(.named(Self.contentSpace))
                     // Fluido: the result-card glare when notes materialize.
                     // A moving glare — suppressed under Reduce Motion.
                     .changeEffect(
                         .shine(duration: 1.1), value: shineTick,
                         isEnabled: Design.direction == .fluido && !reduceMotion)
+                    .task(id: meeting.id) { await loadCorrections() }
+                    .onChange(of: notes.structured) { _, _ in
+                        // The prose under both aims was just rewritten. Keyed
+                        // on the prose itself, not the synthesis timestamp: a
+                        // name correction rewrites the structured notes and
+                        // upserts them without stamping `generatedAt`.
+                        selection = nil
+                        selectionFrame = nil
+                        focusedAim = nil
+                        pickedBlock = nil
+                        Task { await loadCorrections() }
+                    }
+                    .onChange(of: activity.activeRuns[meeting.id] != nil) { was, isNow in
+                        // Run completion, observed independently of the prose,
+                        // so a rewrite to structurally identical text still
+                        // refreshes the rows. The falling edge is the only
+                        // point that reads the flipped statuses: completion is
+                        // signalled after the pipeline's post-finalize
+                        // bookkeeping, which is where the flip happens.
+                        if was, !isNow {
+                            Task { await loadCorrections() }
+                        }
+                    }
                 } else if meeting.status == .processing || meeting.status == .recording {
                     Text("Notes will appear here when processing finishes.")
                         .foregroundStyle(.secondary)
@@ -452,8 +755,166 @@ private struct NotesPane: View {
             }
             .padding(.horizontal, 36)
             .padding(.vertical, 28)
-            .frame(maxWidth: 740, alignment: .leading)  // C's generous measure (~68ch)
+            // C's generous measure (~68ch) for the prose, plus the margin rail
+            // when that placement is active and the window is wide enough.
+            .frame(maxWidth: notesColumnWidth, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
+            // Clicking off every block gives the page back: the mark goes and
+            // the bar withdraws. Behind the content, so a click that lands on a
+            // block still reaches the block.
+            .background {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { clearAim() }
+            }
+        }
+        .coordinateSpace(.named(Self.paneSpace))
+        // N4: the three activity signals that reset a running settle window —
+        // scrolling, changing the selection, and typing in the composer.
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y } action: { _, _ in
+            noteSettleActivity()
+        }
+        .onChange(of: selection) { _, _ in noteSettleActivity() }
+        .onChange(of: composerDraft) { _, _ in noteSettleActivity() }
+        .onGeometryChange(for: CGSize.self, of: \.size) {
+            paneWidth = $0.width
+            paneHeight = $0.height
+        }
+        .onChange(of: uiState.notesEditingRequest) { _, request in
+            applyEditingRequest(request)
+        }
+        // The keyboard's aim lives exactly as long as the ring the person can
+        // see; a keyboard that travels to another block ends the pick a click
+        // made, so the mark and the bar never stand on two different blocks.
+        .onChange(of: focusedBlock) { _, id in
+            if id == nil {
+                focusedAim = nil
+            } else if id != pickedBlock?.blockID {
+                pickedBlock = nil
+            }
+        }
+        .onChange(of: correctionsAvailable) { _, available in
+            // Its host leaves the pane with the chip, so a request left
+            // standing would spring the panel open again when the run ends.
+            if !available { showChangesPanel = false }
+        }
+        .onChange(of: editingContext, initial: true) { _, context in
+            uiState.notesEditingContext = context
+        }
+        .onDisappear {
+            if uiState.notesEditingContext.meetingID == meeting.id {
+                uiState.notesEditingContext = AppUIState.NotesEditingContext()
+            }
+        }
+    }
+
+    /// At most one activity signal a second reaches the pipeline: the three
+    /// classes fire far faster than the ten-minute window they reset needs.
+    private func noteSettleActivity() {
+        let instant = Date()
+        guard instant.timeIntervalSince(lastSettleActivitySignal) >= 1 else { return }
+        lastSettleActivitySignal = instant
+        let pipeline = appEnv.pipeline
+        let id = meeting.id
+        Task { await pipeline.noteMeetingActivity(id) }
+    }
+
+    /// The notes column's own inset from the pane, on both sides.
+    private static let columnInset: CGFloat = 36
+
+    /// The prose measure, widened for the annotation lane when the pane can
+    /// hold one. Everything that belongs to the reading column keeps
+    /// `readingWidth`.
+    private var notesColumnWidth: CGFloat {
+        NotesEditingLayout.proseMeasure
+            + (laneWidth.map { NotesEditingLayout.railGutter + $0 } ?? 0)
+    }
+
+    /// The one measure the reading column is built on: the prose measure inside
+    /// the column's own insets. A block's text, a note card, the user's action
+    /// box and the header all end here, so the column has one right edge rather
+    /// than four. Only the annotation lane lies outside it.
+    private var readingWidth: CGFloat {
+        NotesEditingLayout.proseMeasure - Self.columnInset * 2
+    }
+
+    /// The lane beside the reading column, and how wide it is. It carries the
+    /// margin notes and nothing else — the transient control stands at the
+    /// selection, so the lane exists only where the rail placement is live and
+    /// there is exactly one width question to answer about it.
+    private var laneWidth: CGFloat? {
+        layoutMode.usesRail ? NotesEditingLayout.railWidth : nil
+    }
+
+    /// How margin notes present right now: the Setting, resolved against the
+    /// width actually available for the notes column.
+    private var layoutMode: NotesLayoutMode {
+        // The pane's own width, undiminished: the column measure the resolver
+        // compares it against already carries the column's insets.
+        NotesEditingLayout.mode(notesPresentation.marginNotesPlacement, width: paneWidth)
+    }
+
+    /// A run (a full pipeline run or the interim rewrite, which announces
+    /// itself the same way) holds this meeting.
+    private var runActive: Bool {
+        activity.activeRuns[meeting.id] != nil || correctionBusy
+    }
+
+    private var editingContext: AppUIState.NotesEditingContext {
+        AppUIState.NotesEditingContext(
+            meetingID: meeting.id, surfaceReady: correctionsAvailable && notes != nil,
+            hasTarget: commandTarget != nil, correctionEnabled: correctionsEnabled,
+            engineCanEditNotes: engineCanEditNotes)
+    }
+
+    /// What the surface aims at, in rank order: the live selection, then the
+    /// block the keyboard is on, then the block a click picked. A blank `text`
+    /// anchors the whole block, which is the same invocation right-click makes.
+    /// Where the pointer is resting is not a rank — it aims nothing on this
+    /// surface. The bar stands at this, so what the menu acts on and what the
+    /// control acts on cannot drift apart.
+    private var commandTarget: BlockSelection? {
+        selection ?? focusedAim ?? pickedBlock
+    }
+
+    /// Gives the page back: nothing marked, nothing aimed at, nothing standing.
+    private func clearAim() {
+        selection = nil
+        selectionFrame = nil
+        pickedBlock = nil
+        focusedBlock = nil
+    }
+
+    /// The menu-bar commands land here: the same entry the hover group uses,
+    /// aimed at the selection or, without one, at the whole block.
+    private func applyEditingRequest(_ request: AppUIState.NotesEditingRequest?) {
+        guard let request, request.meetingID == meeting.id,
+            NotesEditingEntry.allowed(
+                request.kind, correctionEnabled: correctionsEnabled,
+                engineCanEditNotes: engineCanEditNotes),
+            let target = commandTarget
+        else { return }
+        uiState.notesEditingRequest = nil
+        beginEditing(
+            request.kind, section: target.section, anchorID: target.blockID,
+            blockText: target.blockText, occurrence: target.occurrence,
+            selection: target.span, hostText: target.hostText)
+    }
+
+    /// Brings a freshly opened composer into view. The anchor id belongs to the
+    /// whole editable block — prose, composer and pending row together — so
+    /// centring it puts the input field and its buttons on screen wherever in
+    /// the document the block sits.
+    ///
+    /// The wait is load-bearing: the composer expands over `NotesEditingMotion.
+    /// expand`'s duration, and until that height is in the layout the scroll
+    /// clamps to the shorter content and stops short of the commit buttons.
+    private func scrollComposerIntoView(_ proxy: ScrollViewProxy, anchor: String) {
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(reduceMotion ? 200 : 360))
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.22)) {
+                proxy.scrollTo(anchor, anchor: .center)
+            }
         }
     }
 
@@ -532,7 +993,15 @@ private struct NotesPane: View {
 
     private var headerCore: some View {
         VStack(alignment: .leading, spacing: 8) {
-            EditableTitle(meeting: meeting)
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                EditableTitle(meeting: meeting)
+                if runActive, notes != nil {
+                    Text("Updating notes…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Design.accent)
+                        .transition(.opacity)
+                }
+            }
             HStack(spacing: 14) {
                 MetaItem(
                     icon: "calendar",
@@ -563,20 +1032,86 @@ private struct NotesPane: View {
         }
     }
 
-    /// Quiet, honest engine provenance + the G2 name-correction affordances.
-    @ViewBuilder
-    private var provenanceLine: some View {
-        let parts: [String] = [
+    /// The engine identifiers. They name the machinery, never the meeting, and
+    /// nobody acts on them — so they ride the stamp they belong to instead of
+    /// taking a line of the reading surface.
+    private var engineProvenance: String {
+        [
             meeting.asrProvenance.map { "ASR: \($0.engine)" },
             notes.map { "Notes: \($0.provenance.engine)" },
-            notes.map { "generated \(BlaiseDateFormat.dayMonthYearTime($0.generatedAt))" },
-        ].compactMap(\.self)
-        HStack(spacing: 8) {
-            if !parts.isEmpty {
-                Text(parts.joined(separator: " · "))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.quaternary)
+        ].compactMap(\.self).joined(separator: " · ")
+    }
+
+    /// What stands above the prose: the row — when these notes were written,
+    /// the G2 name-correction affordances, the overview's door, and Copy Notes
+    /// — and, under it, the send action's own line.
+    @ViewBuilder
+    private var provenanceLine: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // One row where the measure carries it, the stamp over its controls
+            // where it does not. Wrapping instead leaves a label broken across
+            // three lines and the row's baselines ragged.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    provenanceStamp
+                    provenanceControls
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    provenanceStamp
+                    HStack(spacing: 8) { provenanceControls }
+                }
             }
+            notesEditorSendLine
+        }
+        .transientScrollIndicators()
+    }
+
+    /// The pending batch's own control, on a line of its own under the row: an
+    /// act, not another thing to manage, so it carries a border instead of
+    /// standing in a stream of borderless labels. It comes and goes with the
+    /// pending row and the notes below it shift; no space is held for it.
+    @ViewBuilder
+    private var notesEditorSendLine: some View {
+        if correctionsAvailable,
+            notesEditorSendOffered(rows: correctionRows, engineCanEditNotes: engineCanEditNotes)
+        {
+            Button {
+                sendToNotesEditorNow()
+            } label: {
+                Label(
+                    runActive ? NotesEditorPanelCopy.busyLabel : NotesEditorPanelCopy.actionLabel,
+                    systemImage: "arrow.clockwise")
+                    .font(.system(size: 11))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            .disabled(runActive)
+            .help(NotesEditorPanelCopy.help)
+        }
+    }
+
+    @ViewBuilder
+    private var provenanceStamp: some View {
+        // Non-breaking: a wrap that leaves the time on a line of its own reads
+        // as a second fact rather than as the stamp's other half.
+        if let notes {
+            let stamp =
+                "generated\u{00A0}"
+                + BlaiseDateFormat.dayMonthYearTime(notes.generatedAt)
+                    .replacingOccurrences(of: " ", with: "\u{00A0}")
+            Text(stamp)
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .help(engineProvenance)
+                .accessibilityLabel(
+                    engineProvenance.isEmpty ? stamp : "\(stamp). \(engineProvenance)")
+        }
+    }
+
+    @ViewBuilder
+    private var provenanceControls: some View {
+        Group {
             // G2 §3: the substitution report — shown in an info popover.
             if let substitutions = notes?.provenance.nameSubstitutions, !substitutions.isEmpty {
                 Button {
@@ -611,8 +1146,71 @@ private struct NotesPane: View {
                         .frame(width: 360)
                 }
             }
+            // The Changes panel's entry point, and the pane's only standing sign
+            // that its notes can be corrected and annotated at all. It shows
+            // whenever the capability is live, empty list or not — a place to go
+            // rather than an instruction on the page. Gated on the BASE
+            // availability (not `correctionsEnabled`) so it stays open while a
+            // rewrite runs.
+            if correctionsAvailable {
+                Button {
+                    showChangesPanel.toggle()
+                } label: {
+                    Label(correctionChipTitle, systemImage: "list.bullet.rectangle")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+                .popover(isPresented: $showChangesPanel) {
+                    ChangesPanel(
+                        rows: correctionRows, runActive: runActive, busy: correctionBusy,
+                        engineCanEditNotes: engineCanEditNotes,
+                        resolvedIDs: resolvedRowIDs,
+                        pinTargets: { pinTargets(for: $0) },
+                        onNavigate: { navigate(to: $0) },
+                        onResolve: { row, resolved in setResolved(row, resolved) },
+                        onDelete: { deleteCorrectionRow($0) },
+                        onEdit: { editCorrectionRow($0, text: $1) },
+                        onPin: { row, index in
+                            pinNote(row, toBlockAt: index, in: pinTargets(for: row))
+                        },
+                        onSend: { sendToNotesEditorNow() })
+                }
+            }
+            // Copy is a utility of the meeting, not a third way to manage what
+            // the notes say: the rule divides it from the two affordances that
+            // are. It stands on the same gate as those two, so it never opens
+            // a set that is not there.
+            if correctionsAvailable {
+                // The system rule renders at a contrast this ground swallows
+                // entirely, so the seam is drawn explicitly, sized to the
+                // labels it stands between rather than to the row.
+                Rectangle()
+                    .fill(.white.opacity(0.28))
+                    .frame(width: 1, height: 13)
+                    .accessibilityHidden(true)
+            }
+            // Copy All (V1.1): the rendered notes markdown — the human artifact,
+            // verbatim. It sits with the meeting's other utilities rather than
+            // on a row of its own between the reader and the first sentence.
+            if let notes {
+                let portuguese = (meeting.dominantLanguage ?? "").lowercased().hasPrefix("pt")
+                CopyAllButton(
+                    label: portuguese ? "Copiar Notas" : "Copy Notes",
+                    copiedLabel: portuguese ? "Copiado" : "Copied",
+                    accessibilityLabel: "Copy all notes as markdown", quiet: true
+                ) { notes.markdown }
+            }
         }
-        .transientScrollIndicators()
+        .lineLimit(1)
+    }
+
+    private var correctionChipTitle: String {
+        let corrections = correctionRows.filter { $0.kind == .understanding }.count
+        let notesCount = correctionRows.count - corrections
+        var parts: [String] = []
+        if corrections > 0 { parts.append("\(corrections) correction\(corrections == 1 ? "" : "s")") }
+        if notesCount > 0 { parts.append("\(notesCount) note\(notesCount == 1 ? "" : "s")") }
+        return parts.isEmpty ? "Changes" : "Changes · \(parts.joined(separator: " · "))"
     }
 
     private var timeAndDuration: String {
@@ -622,6 +1220,432 @@ private struct NotesPane: View {
             line += " · \(max(1, Int(ended.timeIntervalSince(meeting.startedAt) / 60))) min"
         }
         return line
+    }
+
+    // MARK: - Correction/note actions
+
+    /// The base gate: final notes on a ready meeting (the same gate as the
+    /// correct-name flow). Correction/note ROWS may exist and be managed
+    /// (viewed, deleted) whenever this holds — including while a rewrite is
+    /// in flight, so the busy chip stays visible.
+    private var correctionsAvailable: Bool {
+        notes != nil && meeting.status == .ready
+    }
+
+    /// NEW corrections/notes may be INITIATED only when no pipeline run is in
+    /// flight for this meeting and no rewrite is already running.
+    private var correctionsEnabled: Bool {
+        correctionEntryEnabled(
+            available: correctionsAvailable,
+            runActive: activity.activeRuns[meeting.id] != nil,
+            rewriteBusy: correctionBusy)
+    }
+
+    /// Whether the notes surface offers the correction path at all: only an
+    /// engine that can edit notes can serve one. Read from the live selection,
+    /// so selecting another engine in Settings reaches this surface at once.
+    private var engineCanEditNotes: Bool {
+        notesEditingEngineCanEdit(
+            selectedSummarizationID: appEnv.engineSettings.selectedSummarizationID,
+            registry: appEnv.registry)
+    }
+
+    /// The occurrence to STORE for a submitted correction, resolved against
+    /// the section's real anchor blocks — the popover lets the user trim the
+    /// quote, which moves it into a different match space than the block it
+    /// came from.
+    private func storedOccurrence(for submission: CorrectionSubmission) -> Int {
+        guard let structured = notes?.structured else { return submission.occurrence }
+        return CorrectionAnchoring.occurrence(
+            forQuote: submission.quotedText, takenFrom: submission.blockText,
+            blockOccurrence: submission.occurrence,
+            in: CorrectionAnchoring.blocks(of: structured, section: submission.section))
+    }
+
+    /// Rows the person has put away in the overview, read from the rows
+    /// themselves: the status IS the answer, so it survives a relaunch and
+    /// every synthesis run in between.
+    private var resolvedRowIDs: Set<String> {
+        Set(correctionRows.filter { $0.status == .resolved }.map(\.id))
+    }
+
+    /// Resolve / Reopen from the overview, written to the row. Reopening asks
+    /// the notes where the row stands now — matched or stale for a note, and
+    /// pending for a correction the rewrite has not consumed.
+    private func setResolved(_ row: MeetingCorrection, _ resolved: Bool) {
+        let pipeline = appEnv.pipeline
+        let structuredNotes = notes?.structured
+        Task {
+            try? await pipeline.setCorrectionResolved(
+                meetingID: meeting.id, id: row.id, resolved: resolved,
+                structuredNotes: structuredNotes)
+            await loadCorrections()
+        }
+    }
+
+    /// The loaded margin-note rows (annotations) the reading column shows. A
+    /// resolved note leaves the page for the overview's Resolved half — it is
+    /// still there, and it no longer marks a passage the reader is done with.
+    private var annotationRows: [MeetingCorrection] {
+        correctionRows.filter { $0.kind == .annotation && $0.status != .resolved }
+    }
+
+    /// The rows of one kind in `section` whose anchor, resolved against
+    /// `blocks`, satisfies `matching`. The reading column's filters differ only
+    /// in the source set and in what they ask of a resolved anchor: an
+    /// annotation leaves the page when it is resolved, a correction when it is
+    /// applied or resolved.
+    private func rows(
+        kind: MeetingCorrection.Kind, section: MeetingCorrection.Section, blocks: [String],
+        matching: ((blockIndex: Int, occurrence: Int)?) -> Bool
+    ) -> [MeetingCorrection] {
+        let source: [MeetingCorrection]
+        switch kind {
+        case .annotation:
+            source = annotationRows
+        case .understanding:
+            source = correctionRows.filter {
+                $0.kind == .understanding && $0.status != .applied && $0.status != .resolved
+            }
+        }
+        return source.filter { row in
+            row.section == section
+                && matching(
+                    CorrectionAnchoring.resolve(
+                        quote: row.quotedText, occurrence: row.occurrence, in: blocks))
+        }
+    }
+
+    /// Correction rows in `section` that resolve to SOME block, for the coarse
+    /// sections whose UI blocks do not map 1:1 onto the anchoring blocks.
+    private func anchoredCorrections(
+        section: MeetingCorrection.Section, structured: NotesStructured
+    ) -> [MeetingCorrection] {
+        rows(
+            kind: .understanding, section: section,
+            blocks: CorrectionAnchoring.blocks(of: structured, section: section)
+        ) { $0 != nil }
+    }
+
+    /// Annotation rows in `section` that resolve to SOME block. Placement onto a
+    /// rendered block is `rowsByRenderedBlock`'s job.
+    private func anchoredAnnotations(
+        section: MeetingCorrection.Section, structured: NotesStructured
+    ) -> [MeetingCorrection] {
+        rows(
+            kind: .annotation, section: section,
+            blocks: CorrectionAnchoring.blocks(of: structured, section: section)
+        ) { $0 != nil }
+    }
+
+    /// Annotation rows whose anchor no longer fold-matches any block in their
+    /// section — surfaced under the "Your notes" tail with a stale badge,
+    /// never silently dropped.
+    private func unanchoredAnnotations(_ structured: NotesStructured) -> [MeetingCorrection] {
+        annotationRows.filter { row in
+            let blocks = CorrectionAnchoring.blocks(of: structured, section: row.section)
+            return CorrectionAnchoring.resolve(
+                quote: row.quotedText, occurrence: row.occurrence, in: blocks) == nil
+        }
+    }
+
+    /// Display load only — failure-soft (an empty list is a display state, not
+    /// a synthesis input). The assignment carries the surface's motion, so the
+    /// pending row's dissolve and a note card's appearance run their
+    /// transitions instead of snapping.
+    ///
+    /// Returns what the store actually said, or nil when it could not be read.
+    /// The display shows an empty list either way; a caller adjudicating a
+    /// MUTATION must not read an unreadable store as an answer.
+    @discardableResult
+    private func loadCorrections() async -> [MeetingCorrection]? {
+        let database = appEnv.database
+        let meetingID = meeting.id
+        correctionLoadGeneration += 1
+        let generation = correctionLoadGeneration
+        let rows: [MeetingCorrection]? = try? await database.pool.read { db in
+            try MeetingCorrectionStore.all(db, meetingID: meetingID)
+        }
+        // Latest wins: two loads can complete out of order, and an earlier
+        // snapshot (taken before a status flip) must not overwrite a later one.
+        // The caller still gets what its own read said.
+        guard generation == correctionLoadGeneration else { return rows }
+        withAnimation(NotesEditingMotion.expand(reduceMotion: reduceMotion)) {
+            correctionRows = rows ?? []
+        }
+        return rows
+    }
+
+    /// Opens the composer for one invocation, whatever path raised it. Every
+    /// path consults the same gate first, and any editing action retires the
+    /// teaching callout.
+    private func beginEditing(
+        _ kind: EditingTarget.Kind, section: MeetingCorrection.Section, anchorID: String,
+        blockText: String, occurrence: Int, selection: SelectedSpan? = nil,
+        hostText: String? = nil
+    ) {
+        guard NotesEditingEntry.allowed(
+            kind, correctionEnabled: correctionsEnabled,
+            engineCanEditNotes: engineCanEditNotes)
+        else { return }
+        beginEditing(
+            NotesEditingEntry.target(
+                kind, section: section, anchorID: anchorID, blockText: blockText,
+                occurrence: occurrence, selection: selection, hostText: hostText))
+    }
+
+    /// Opens the composer on a target a seam has already built and gated.
+    private func beginEditing(_ target: EditingTarget) {
+        appEnv.notesPresentation.retireEditingCallout(in: appEnv.settings)
+        composerDraft = ""
+        withAnimation(NotesEditingMotion.expand(reduceMotion: reduceMotion)) {
+            editingTarget = target
+        }
+    }
+
+    private func closeComposer() {
+        composerDraft = ""
+        // The aim has been acted on, so the bar it summoned has nothing left to
+        // offer; left standing it sits over the note just written.
+        clearAim()
+        withAnimation(NotesEditingMotion.expand(reduceMotion: reduceMotion)) {
+            editingTarget = nil
+        }
+    }
+
+    /// Submits whatever the composer holds, down the path its kind names. The
+    /// gate is consulted before anything closes, so a refusal keeps the draft.
+    private func submitComposer(_ target: EditingTarget, text: String) {
+        notesEditingCommitAction(
+            target, correctionEnabled: correctionsEnabled,
+            engineCanEditNotes: engineCanEditNotes
+        ) { target in
+            closeComposer()
+            switch target.kind {
+            case .correct:
+                submitCorrection(
+                    CorrectionSubmission(
+                        section: target.section, quotedText: target.quotedText, userText: text,
+                        occurrence: target.occurrence, blockText: target.blockText))
+            case .note:
+                submitNote(target: target, text: text)
+            }
+        }
+    }
+
+    /// Understanding correction: save the durable row. The pipeline scheduler
+    /// owns the editor activation; this UI path starts no synthesis itself.
+    private func submitCorrection(_ submission: CorrectionSubmission) {
+        guard !correctionBusy else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        // Resolved against the CURRENT notes, on the main actor, before the
+        // task detaches.
+        let occurrence = storedOccurrence(for: submission)
+        correctionBusy = true
+        Task {
+            defer { correctionBusy = false }
+            uiState.lastActionError = await saveUnderstandingCorrectionAction {
+                _ = try await pipeline.addCorrection(
+                    meetingID: meetingID, kind: .understanding,
+                    section: submission.section, quotedText: submission.quotedText,
+                    occurrence: occurrence, userText: submission.userText)
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// Margin note: deterministic, instant, no engine call.
+    private func submitNote(target: EditingTarget, text: String) {
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        // Mid-run, the re-mint still runs — it queues behind the run on the
+        // single-flight chain and weaves the note when the run drains, so the
+        // note cannot be lost in the window after the run's own weave. But it
+        // is NOT instant any more, and the copy says so.
+        let runActive = activity.activeRuns[meeting.id] != nil
+        // A selection anchors the note to the span, not the whole block, so the
+        // occurrence is recomputed in the trimmed quote's match space.
+        let occurrence = storedOccurrence(
+            for: CorrectionSubmission(
+                section: target.section, quotedText: target.quotedText, userText: text,
+                occurrence: target.occurrence, blockText: target.blockText))
+        Task {
+            do {
+                let result = try await pipeline.addCorrection(
+                    meetingID: meetingID, kind: .annotation,
+                    section: target.section, quotedText: target.quotedText,
+                    occurrence: occurrence, userText: text)
+                uiState.lastActionError = noteFeedback(
+                    remintRefused: result.remintRefused, runActive: runActive)
+            } catch {
+                uiState.lastActionError = "Could not add the note: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// Deleting cancels a correction that has not run, and stops a processed
+    /// one affecting later runs. It never reverts written notes, so it is never
+    /// presented as an undo.
+    private func deleteCorrectionRow(_ row: MeetingCorrection) {
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        Task {
+            do {
+                // An annotation delete that could not re-mint has NOT left the
+                // delivered notes yet.
+                let refused = try await pipeline.deleteCorrection(
+                    meetingID: meetingID, id: row.id)
+                uiState.lastActionError = refused
+                    ? "Note deleted — it leaves the delivered notes when processing completes."
+                    : nil
+            } catch {
+                // The row is deleted before the re-mint that publishes the
+                // change can throw, so a throw here does not mean the delete
+                // failed. The STORED outcome decides what the user is told —
+                // and a store that cannot be read holds no outcome to report.
+                let stored = await loadCorrections()
+                uiState.lastActionError = deleteFeedback(
+                    rowSurvived: stored.map { rows in rows.contains { $0.id == row.id } },
+                    error: error)
+            }
+            await loadCorrections()
+        }
+    }
+
+    /// Edit the row's TEXT, keeping its anchor. An annotation edit re-mints;
+    /// an understanding edit returns the row to `pending` and re-arms the
+    /// editor timer.
+    private func editCorrectionRow(_ row: MeetingCorrection, text: String) {
+        guard !text.isEmpty, text != row.userText, !correctionBusy else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        Task {
+            do {
+                let refused = try await pipeline.updateCorrection(
+                    meetingID: meetingID, id: row.id, quotedText: row.quotedText,
+                    occurrence: row.occurrence, userText: text)
+                uiState.lastActionError = editFeedback(row, refused: refused)
+            } catch {
+                uiState.lastActionError = "Could not edit: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    private func editFeedback(_ row: MeetingCorrection, refused: Bool) -> String? {
+        if row.kind == .understanding { return nil }
+        return refused
+            ? "Note updated — it reaches the delivered notes when processing completes."
+            : nil
+    }
+
+    /// The rendered blocks of one section, in the order the pane draws them —
+    /// the finer list a row's quote is re-resolved against, since a bullet list
+    /// is one anchoring block and many rendered ones.
+    private func renderedTexts(
+        _ section: MeetingCorrection.Section, in structured: NotesStructured
+    ) -> [String] {
+        switch section {
+        case .summary:
+            return MarkdownBlocks.parse(structured.summary).map { String($0.text.characters) }
+        case .detailedNotes:
+            let body = structured.detailedNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+            return body.isEmpty ? [] : MarkdownBlocks.parse(body).map { String($0.text.characters) }
+        case .decision:
+            return structured.decisions
+        case .actionItem:
+            return Self.presentableItems(structured.actionItems).map(\.text)
+        case .userActionItem:
+            return Self.presentableItems(structured.userActionItems).map(\.text)
+        }
+    }
+
+    /// The anchor id of a section's nth rendered block.
+    private func anchorID(_ section: MeetingCorrection.Section, at index: Int) -> String {
+        switch section {
+        case .summary: return NotesBlockAnchor.summary(index)
+        case .detailedNotes: return NotesBlockAnchor.detailed(index)
+        case .decision: return NotesBlockAnchor.decision(index)
+        case .actionItem: return NotesBlockAnchor.actionItem(index)
+        case .userActionItem: return UserActionAnchor.id(index)
+        }
+    }
+
+    /// Take the reader to the passage a row is anchored to, and mark it when
+    /// they arrive. A row whose quote no longer matches anything is left where
+    /// it is: it is stale, it says so, and there is nowhere honest to go.
+    private func navigate(to row: MeetingCorrection) {
+        guard let structured = notes?.structured else { return }
+        let texts = renderedTexts(row.section, in: structured)
+        guard
+            let resolved = CorrectionAnchoring.resolve(
+                quote: row.quotedText, occurrence: row.occurrence, in: texts)
+        else { return }
+        showChangesPanel = false
+        navigationAnchor = anchorID(row.section, at: resolved.blockIndex)
+        navigationRequest += 1
+    }
+
+    /// The blocks a stale row can be pinned back onto: its own section's,
+    /// without the blanks. A blank block can never fold-match a non-empty
+    /// quote, so it is unpinnable, AND its absence cannot shift the occurrence
+    /// `CorrectionAnchoring.occurrence(ofBlockAt:in:)` computes when one is
+    /// picked.
+    private func pinTargets(for row: MeetingCorrection) -> [String] {
+        guard let structured = notes?.structured else { return [] }
+        return CorrectionAnchoring.blocks(of: structured, section: row.section)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    /// PIN PICKER: re-anchor a stale note onto the block the user picked. The
+    /// block's CURRENT text becomes the quote (that is what the note is now
+    /// about) with its fold-match occurrence, so a paragraph repeated verbatim
+    /// still anchors distinctly. `updateCorrection` re-mints for annotations,
+    /// so notes.md + the payload follow without a second call.
+    private func pinNote(_ row: MeetingCorrection, toBlockAt index: Int, in blocks: [String]) {
+        // The menu is disabled while a run/rewrite is in flight (the same gate
+        // as the block affordances); a queued interaction could still land here.
+        guard correctionsEnabled, blocks.indices.contains(index) else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        let quote = blocks[index]
+        let occurrence = CorrectionAnchoring.occurrence(ofBlockAt: index, in: blocks)
+        Task {
+            do {
+                let refused = try await pipeline.updateCorrection(
+                    meetingID: meetingID, id: row.id, quotedText: quote,
+                    occurrence: occurrence, userText: row.userText)
+                uiState.lastActionError = refused
+                    ? "Note pinned — it moves in the delivered notes when processing completes."
+                    : nil
+            } catch {
+                uiState.lastActionError = "Could not pin the note: \(error.localizedDescription)"
+            }
+            await loadCorrections()
+        }
+    }
+
+    private func sendToNotesEditorNow() {
+        // Never launch a second editor activation over an in-flight one.
+        guard !correctionBusy else { return }
+        let pipeline = appEnv.pipeline
+        let meetingID = meeting.id
+        let uiState = uiState
+        correctionBusy = true
+        Task {
+            defer { correctionBusy = false }
+            uiState.lastActionError = await sendToNotesEditorAction(meetingID: meetingID) { id in
+                try await pipeline.sendPendingNotesToEditor(meetingID: id)
+            }
+            await loadCorrections()
+        }
     }
 
     /// Marks/unmarks one user item done (`action_item_state`, local-only).
@@ -657,7 +1681,11 @@ private struct NotesPane: View {
         return portuguese ? "\(name) — Itens de Ação" : "\(name) — Action Items"
     }
 
-    private func userActionItemRow(_ item: ActionItem, done: Bool) -> some View {
+    private func userActionItemRow(
+        _ item: ActionItem, done: Bool, selectable: Bool = false,
+        washedSpan: SelectedSpan? = nil,
+        onSelection: @escaping (SelectedSpan?, SelectionFrame?) -> Void = { _, _ in }
+    ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Button {
                 setDone(item, done: !done)
@@ -680,57 +1708,146 @@ private struct NotesPane: View {
                         isEnabled: done && Design.direction == .fluido && !reduceMotion)
             }
             .buttonStyle(.plain)
+            // The completion effect's particle canvas is far larger than the
+            // checkbox and is what assistive technology would otherwise be
+            // handed as the control's position and size.
+            .contentShape(.accessibility, Rectangle())
             .accessibilityLabel(done ? "Mark not done: \(item.text)" : "Mark done: \(item.text)")
             .help(done ? "Mark as not done" : "Mark as done")
-            SearchHighlightedText(source: AttributedString(item.text), terms: searchTerms)
-                .font(Design.readingFont(14, weight: done ? .regular : .medium))
-                .strikethrough(done)
-                .foregroundStyle(done ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-                .textSelection(.enabled)
+            if selectable {
+                NotesBlockText(
+                    source: AttributedString(item.text), terms: searchTerms, selectable: true,
+                    washedSpan: washedSpan, onSelectionChange: onSelection)
+                    .font(Design.readingFont(14, weight: .medium))
+                    .textSelection(.enabled)
+            } else {
+                SearchHighlightedText(source: AttributedString(item.text), terms: searchTerms)
+                    .font(Design.readingFont(14, weight: done ? .regular : .medium))
+                    .strikethrough(done)
+                    .foregroundStyle(done ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                    .textSelection(.enabled)
+            }
         }
+    }
+
+    /// A user action item with the same editing reach as every other line: its
+    /// own anchor space, so a quote here never resolves into the meeting-wide
+    /// action list. `index` is the item's position in the filtered user list,
+    /// which is the space its occurrence is counted in.
+    private func editableUserActionRow(
+        _ item: ActionItem, index: Int, occurrence: Int,
+        notes noteRows: [MeetingCorrection], pending pendingRows: [MeetingCorrection],
+        portuguese: Bool
+    ) -> some View {
+        editableBlock(
+            section: .userActionItem, blockText: item.text,
+            occurrence: occurrence,
+            anchorID: UserActionAnchor.id(index),
+            notes: noteRows,
+            pending: pendingRows,
+            portuguese: portuguese
+        ) { selectable, washedSpan, onSelection in
+            userActionItemRow(
+                item, done: false, selectable: selectable, washedSpan: washedSpan,
+                onSelection: onSelection)
+        }
+    }
+
+    /// The one first-run teaching line, standing under the summary paragraph it
+    /// is about. Its ✕ retires it through the same path any correction or note
+    /// action takes, so the surface has one way of putting it away.
+    private var editingCallout: some View {
+        HStack(alignment: .top, spacing: 8) {
+            QuietBanner(
+                text: NotesEditingCallout.text, systemImage: "text.cursor",
+                tint: .secondary, accessibilityPrefix: "Tip")
+            Button {
+                appEnv.notesPresentation.retireEditingCallout(in: appEnv.settings)
+            } label: {
+                Image(systemName: "xmark.circle")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss this tip")
+            .help("Dismiss this tip")
+        }
+        .frame(maxWidth: readingWidth, alignment: .leading)
     }
 
     @ViewBuilder
     private func structuredSections(_ structured: NotesStructured) -> some View {
         let portuguese = (meeting.dominantLanguage ?? "").lowercased().hasPrefix("pt")
 
-        if let notes {
-            // Copy All (V1.1): the rendered notes markdown — the human
-            // artifact, verbatim.
-            CopyAllButton(
-                label: portuguese ? "Copiar Notas" : "Copy Notes",
-                copiedLabel: portuguese ? "Copiado" : "Copied",
-                accessibilityLabel: "Copy all notes as markdown"
-            ) { notes.markdown }
-        }
-
         NoteSection(title: portuguese ? "Resumo" : "Summary", kind: .summary) {
-            MarkdownBlocksView(
-                markdown: structured.summary, searchTerms: searchTerms,
-                anchorPrefix: "notes-summary")
+            VStack(alignment: .leading, spacing: 8) {
+                // The summary's UI blocks do not map 1:1 onto its single
+                // anchoring block, so its instructions hang off the last block
+                // and always name their quote.
+                let summaryBlocks = MarkdownBlocks.parse(structured.summary)
+                let summaryFolds = CorrectionAnchoring.FoldedBlocks(
+                    summaryBlocks.map { String($0.text.characters) })
+                let summaryOccurrences = blockOccurrences(in: summaryFolds)
+                let summaryNotes = rowsByRenderedBlock(
+                    anchoredAnnotations(section: .summary, structured: structured),
+                    uiTexts: summaryFolds)
+                let summaryPending = rowsByRenderedBlock(
+                    anchoredCorrections(section: .summary, structured: structured),
+                    uiTexts: summaryFolds)
+                let calloutAnchor = NotesEditingCallout.anchorIndex(
+                    seen: notesPresentation.editingCalloutSeen, summaryBlocks: summaryBlocks)
+                ForEach(Array(summaryBlocks.enumerated()), id: \.element.id) { index, block in
+                    editableBlock(
+                        section: .summary, blockText: String(block.text.characters),
+                        occurrence: summaryOccurrences[index],
+                        anchorID: NotesBlockAnchor.summary(block.id),
+                        notes: summaryNotes[index] ?? [],
+                        pending: summaryPending[index] ?? [],
+                        portuguese: portuguese, alwaysQuote: true
+                    ) { selectable, washedSpan, onSelection in
+                        MarkdownBlockView(
+                            block: block, searchTerms: searchTerms, selectable: selectable,
+                            washedSpan: washedSpan, onSelectionChange: onSelection)
+                    }
+                    // The teaching line stands against the passage it teaches
+                    // on, so it is drawn inside the summary's own stack, under
+                    // that block — never floating over the document.
+                    if index == calloutAnchor { editingCallout }
+                }
+            }
         }
 
         // Drop blank user action items (empty text) before the box renders.
-        let userActionItems = structured.userActionItems.filter {
-            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
+        let userActionItems = Self.presentableItems(structured.userActionItems)
         if !userActionItems.isEmpty {
             // The load-bearing user-action box — visually unmissable, the one accent.
             // V1.1: click-to-toggle done; done items collapse into
             // "Completed" (keyed by normalized text hash — a regenerated
             // item whose text changed loses its mark, documented).
-            let open = userActionItems.filter {
-                !doneActionKeys.contains(ActionItemKey.key(for: $0.text))
+            // Partitioned WITH indices: an item's anchor occurrence is counted
+            // in the whole user list, not in the open or completed half.
+            let userActionFolds = CorrectionAnchoring.FoldedBlocks(userActionItems.map(\.text))
+            let userActionOccurrences = blockOccurrences(in: userActionFolds)
+            let userActionNotes = rowsByAnchoredBlock(
+                correctionRows, kind: .annotation, section: .userActionItem,
+                blocks: userActionFolds)
+            let userActionPending = rowsByAnchoredBlock(
+                correctionRows, kind: .understanding, section: .userActionItem,
+                blocks: userActionFolds)
+            let indexedItems = Array(userActionItems.enumerated())
+            let open = indexedItems.filter {
+                !doneActionKeys.contains(ActionItemKey.key(for: $0.element.text))
             }
-            let completed = userActionItems.filter {
+            let completed = indexedItems.map(\.element).filter {
                 doneActionKeys.contains(ActionItemKey.key(for: $0.text))
             }
             let userActionSection = NoteSection(
                 title: userActionSectionTitle(portuguese: portuguese), kind: .userActions
             ) {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(open.enumerated()), id: \.offset) { _, item in
-                        userActionItemRow(item, done: false)
+                    ForEach(open, id: \.offset) { index, item in
+                        editableUserActionRow(
+                            item, index: index, occurrence: userActionOccurrences[index],
+                            notes: userActionNotes[index] ?? [],
+                            pending: userActionPending[index] ?? [], portuguese: portuguese)
                             .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .leading)))
                     }
                     if open.isEmpty {
@@ -767,6 +1884,13 @@ private struct NotesPane: View {
                         ? .spring(duration: 0.45, bounce: 0.2) : nil,
                     value: doneActionKeys)
                 .modifier(UserActionBoxChrome())
+                // The box is a block of the reading column, so it ends where
+                // the prose ends rather than at the pane's edge.
+                .frame(maxWidth: readingWidth, alignment: .leading)
+                // Named as a CONTAINER: its rows carry their own controls now,
+                // and a plain label on the box is inherited by every one of
+                // them, so each button announces the box instead of itself.
+                .accessibilityElement(children: .contain)
                 .accessibilityLabel("Your action items")
                 .id(Self.userActionBoxAnchor)
             }
@@ -784,19 +1908,37 @@ private struct NotesPane: View {
         if !structured.decisions.isEmpty {
             NoteSection(title: portuguese ? "Decisões" : "Decisions", kind: .decisions) {
                 VStack(alignment: .leading, spacing: 8) {
+                    let decisionFolds = CorrectionAnchoring.FoldedBlocks(structured.decisions)
+                    let decisionOccurrences = blockOccurrences(in: decisionFolds)
+                    let decisionNotes = rowsByAnchoredBlock(
+                        correctionRows, kind: .annotation, section: .decision,
+                        blocks: decisionFolds)
+                    let decisionPending = rowsByAnchoredBlock(
+                        correctionRows, kind: .understanding, section: .decision,
+                        blocks: decisionFolds)
                     ForEach(Array(structured.decisions.enumerated()), id: \.offset) { index, decision in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "checkmark.seal.fill")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Design.support)
-                                .accessibilityHidden(true)
-                            SearchHighlightedText(
-                                source: AttributedString(decision), terms: searchTerms)
-                                .font(Design.readingFont(14))
-                                .lineSpacing(Design.readingLineSpacing - 2)
-                                .textSelection(.enabled)
+                        editableBlock(
+                            section: .decision, blockText: decision,
+                            occurrence: decisionOccurrences[index],
+                            anchorID: NotesBlockAnchor.decision(index),
+                            notes: decisionNotes[index] ?? [],
+                            pending: decisionPending[index] ?? [],
+                            portuguese: portuguese
+                        ) { selectable, washedSpan, onSelection in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Design.support)
+                                    .accessibilityHidden(true)
+                                NotesBlockText(
+                                    source: AttributedString(decision), terms: searchTerms,
+                                    selectable: selectable, washedSpan: washedSpan,
+                                    onSelectionChange: onSelection)
+                                    .font(Design.readingFont(14))
+                                    .lineSpacing(Design.readingLineSpacing - 2)
+                                    .textSelection(.enabled)
+                            }
                         }
-                        .id("notes-decision-\(index)")
                     }
                 }
             }
@@ -810,18 +1952,45 @@ private struct NotesPane: View {
         if !actionItems.isEmpty {
             NoteSection(title: portuguese ? "Itens de Ação" : "Action Items", kind: .actions) {
                 VStack(alignment: .leading, spacing: 8) {
+                    let actionFolds = CorrectionAnchoring.FoldedBlocks(actionItems.map(\.text))
+                    let actionOccurrences = blockOccurrences(in: actionFolds)
+                    let actionNotes = rowsByAnchoredBlock(
+                        correctionRows, kind: .annotation, section: .actionItem,
+                        blocks: actionFolds)
+                    let actionPending = rowsByAnchoredBlock(
+                        correctionRows, kind: .understanding, section: .actionItem,
+                        blocks: actionFolds)
                     ForEach(Array(actionItems.enumerated()), id: \.offset) { index, item in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text("•").foregroundStyle(Design.support)
-                            SearchHighlightedText(
-                                source: AttributedString(
-                                    item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                        ? item.text : "\(item.owner): \(item.text)"),
-                                terms: searchTerms)
-                            .font(Design.readingFont(14))
+                        // Blank items are already dropped from `actionItems`,
+                        // and a blank block can never fold-match a non-empty
+                        // quote — so the occurrence computed over this FILTERED
+                        // list equals the one the full block list yields at
+                        // resolve time.
+                        // The host renders the owner-prefixed line, so that —
+                        // not the item's text — is the space a selection's
+                        // occurrence and the wash are counted in.
+                        let rendered =
+                            item.owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? item.text : "\(item.owner): \(item.text)"
+                        editableBlock(
+                            section: .actionItem, blockText: item.text,
+                            occurrence: actionOccurrences[index],
+                            anchorID: NotesBlockAnchor.actionItem(index),
+                            notes: actionNotes[index] ?? [],
+                            pending: actionPending[index] ?? [],
+                            portuguese: portuguese, hostText: rendered
+                        ) { selectable, washedSpan, onSelection in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text("•")
+                                    .foregroundStyle(Design.support)
+                                NotesBlockText(
+                                    source: AttributedString(rendered),
+                                    terms: searchTerms, selectable: selectable,
+                                    washedSpan: washedSpan, onSelectionChange: onSelection)
+                                .font(Design.readingFont(14))
+                            }
+                            .textSelection(.enabled)
                         }
-                        .textSelection(.enabled)
-                        .id("notes-action-\(index)")
                     }
                 }
             }
@@ -830,10 +1999,348 @@ private struct NotesPane: View {
         let detailed = structured.detailedNotes.trimmingCharacters(in: .whitespacesAndNewlines)
         if !detailed.isEmpty {
             NoteSection(title: portuguese ? "Notas Detalhadas" : "Detailed Notes", kind: .detailed) {
-                MarkdownBlocksView(
-                    markdown: detailed, searchTerms: searchTerms,
-                    anchorPrefix: "notes-detailed")
+                VStack(alignment: .leading, spacing: 8) {
+                    // These are the UI's markdown blocks, not the fold-split
+                    // anchoring blocks — a bullet list is many of the former and
+                    // one of the latter. Each row is placed beside the rendered
+                    // block carrying its quote, re-resolved against this finer
+                    // list. The occurrence each block carries is its position
+                    // among the blocks whose folded text matches its own, and a
+                    // trimmed quote is recomputed against the real anchor space
+                    // at save time (`storedOccurrence`). Where the two lists
+                    // diverge the stored occurrence can still name a different
+                    // anchoring block: the re-anchor pass surfaces that as a
+                    // stale note when it resolves to nothing.
+                    let detailedBlocks = MarkdownBlocks.parse(detailed)
+                    let detailedFolds = CorrectionAnchoring.FoldedBlocks(
+                        detailedBlocks.map { String($0.text.characters) })
+                    let detailedOccurrences = blockOccurrences(in: detailedFolds)
+                    let detailedNoteRows = rowsByRenderedBlock(
+                        anchoredAnnotations(section: .detailedNotes, structured: structured),
+                        uiTexts: detailedFolds)
+                    let detailedPending = rowsByRenderedBlock(
+                        anchoredCorrections(section: .detailedNotes, structured: structured),
+                        uiTexts: detailedFolds)
+                    ForEach(Array(detailedBlocks.enumerated()), id: \.element.id) { index, block in
+                        editableBlock(
+                            section: .detailedNotes, blockText: String(block.text.characters),
+                            occurrence: detailedOccurrences[index],
+                            anchorID: NotesBlockAnchor.detailed(block.id),
+                            notes: detailedNoteRows[index] ?? [],
+                            pending: detailedPending[index] ?? [],
+                            portuguese: portuguese, alwaysQuote: true
+                        ) { selectable, washedSpan, onSelection in
+                            MarkdownBlockView(
+                                block: block, searchTerms: searchTerms, selectable: selectable,
+                                washedSpan: washedSpan, onSelectionChange: onSelection)
+                        }
+                    }
+                }
             }
+        }
+
+        // The composer whose block the notes no longer have: a re-synthesis can
+        // remove or reorder blocks, and the positional id it opened on goes
+        // with them. It keeps its quote, its draft and its commit here rather
+        // than vanishing mid-sentence.
+        if let target = editingTarget,
+            NotesEditingEntry.offered(target.kind, engineCanEditNotes: engineCanEditNotes),
+            composerIsOrphaned(target, renderedAnchorIDs: renderedAnchorIDs(structured))
+        {
+            InlineComposer(
+                target: target, sectionName: sectionName(target.section, portuguese: portuguese),
+                commitEnabled: correctionsEnabled, orphaned: true, userText: $composerDraft,
+                onCancel: { closeComposer() },
+                onSubmit: { submitComposer(target, text: $0) })
+                .frame(maxWidth: readingWidth, alignment: .leading)
+                .transition(.move(edge: .top).combined(with: .opacity))
+        }
+
+        // Annotations whose anchor no longer fold-matches any block land under
+        // a "Your notes" tail with their original quote + an anchor-missing
+        // badge — still visible, still shipped, and pinnable back onto a block.
+        // Understanding rows are never here (they weave nothing).
+        let unanchored = unanchoredAnnotations(structured)
+        if !unanchored.isEmpty {
+            NoteSection(title: portuguese ? "Suas notas" : "Your notes", kind: .detailed) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(unanchored, id: \.id) { note in
+                        let targets = pinTargets(for: note)
+                        InlineNoteCard(
+                            note: NotesEditingPresentation.marginNotes([note])[0],
+                            portuguese: portuguese, pinBlocks: targets,
+                            pinDisabled: !correctionsEnabled,
+                            onPin: { pinNote(note, toBlockAt: $0, in: targets) })
+                    }
+                }
+                .frame(maxWidth: readingWidth, alignment: .leading)
+            }
+        }
+    }
+
+    /// One editable notes block: the action bar that arrives at a selection
+    /// inside it, the same actions on right-click, the anchor wash, the composer
+    /// and pending row that hang under it, and its margin notes presented per
+    /// the placement Setting. The content builder receives whether this block
+    /// hosts a selection and the callback that reports one.
+    @ViewBuilder
+    private func editableBlock<Content: View>(
+        section: MeetingCorrection.Section, blockText: String, occurrence: Int,
+        anchorID: String, notes noteRows: [MeetingCorrection],
+        pending pendingRows: [MeetingCorrection], portuguese: Bool, alwaysQuote: Bool = false,
+        hostText: String? = nil,
+        @ViewBuilder content: @escaping (
+            Bool, SelectedSpan?, @escaping (SelectedSpan?, SelectionFrame?) -> Void
+        ) -> Content
+    ) -> some View {
+        // The space this block's selections and wash are counted in: what the
+        // host renders, which is the block's own text unless the host composes
+        // the line from more than it.
+        let host = hostText ?? blockText
+        let mode = layoutMode
+        let composing = composerPresented(
+            editingTarget, inBlockWith: anchorID, engineCanEditNotes: engineCanEditNotes)
+        // This block holds the selection, which is the louder of the two marks
+        // a picked block can wear: the wash rides the words themselves, so the
+        // block must not also wear the outline that means the whole of it.
+        let selected = selection?.blockID == anchorID && !composing
+        // A whole-block invocation washes the block; a selection washes the
+        // exact span, which means the wash rides the text rather than the row.
+        let composedSpan = composing
+            ? editingTarget.flatMap {
+                $0.isWholeBlock
+                    ? nil : SelectedSpan(text: $0.quotedText, occurrence: $0.spanOccurrence)
+            } : nil
+        // The mark a standing row leaves on the block: the row's own quote,
+        // painted on the glyphs it names rather than filled across the row. An
+        // instruction waiting to run outranks a note, as it does in the wash.
+        let markedSpan =
+            composedSpan
+            ?? (composing
+                ? nil
+                : AnchorWash.washedSpan(for: pendingRows) ?? AnchorWash.washedSpan(for: noteRows))
+        let noteModels = NotesEditingPresentation.marginNotes(noteRows)
+        let chipExpanded = expandedChips.contains(anchorID)
+
+        HStack(alignment: .top, spacing: NotesEditingLayout.railGutter) {
+            VStack(alignment: .leading, spacing: 6) {
+                content(true, markedSpan) { span, frame in
+                    selection = span.map {
+                        BlockSelection(
+                            blockID: anchorID, section: section, blockText: blockText,
+                            occurrence: occurrence, span: $0, hostText: host)
+                    }
+                    selectionFrame = span == nil
+                        ? nil
+                        : frame?.offset(by: geometry.blocks[anchorID]?.window.origin ?? .zero)
+                    // A click that selected no words has picked the whole block
+                    // instead, and the bar stands at it. Without this the only
+                    // way in is to drag across the words, which a person who
+                    // does not already know the actions are there never thinks
+                    // to try. The host is left to speak first, so a drag that
+                    // DOES select words is never interrupted.
+                    if span == nil {
+                        pickedBlock = BlockSelection(
+                            blockID: anchorID, section: section, blockText: blockText,
+                            occurrence: occurrence, span: SelectedSpan(text: ""), hostText: host)
+                    }
+                }
+                // The prose host stays out of the key loop: the BLOCK is what
+                // the keyboard travels between, and a text host that takes the
+                // Tab never hands the key back, so the traversal stops at the
+                // first block.
+                .focusable(false)
+                // Behind the whole block only where a mark on the glyphs cannot
+                // be drawn: a whole-block instruction, and the arrival flash the
+                // overview leaves when it sends the reader here.
+                .anchorWash(
+                    navigationAnchor == anchorID
+                        ? .note : (composing && composedSpan == nil ? .composing : .none),
+                    emphasized: navigationAnchor == anchorID)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // The bar is an overlay, so it takes no space and the page does
+                // not move to make room for it. It is read from the block's own
+                // top edge in the visible pane, which only the selected block
+                // ever reports.
+                // Where this block sits, kept outside the view state: the bar
+                // needs the block's own origin to turn a selection rectangle
+                // into a position inside it, and a block's position changes on
+                // every scroll tick — which no view should be redrawn for.
+                .onGeometryChange(for: BlockGeometry.self) {
+                    BlockGeometry(
+                        window: $0.frame(in: .global),
+                        pane: $0.frame(in: .named(Self.paneSpace)),
+                        content: $0.frame(in: .named(Self.contentSpace)))
+                } action: { geometry.blocks[anchorID] = $0 }
+
+                if mode == .marginChip, !noteModels.isEmpty {
+                    MarginNoteChip(
+                        count: noteModels.count, expanded: chipExpanded, portuguese: portuguese
+                    ) {
+                        withAnimation(NotesEditingMotion.expand(reduceMotion: reduceMotion)) {
+                            if chipExpanded {
+                                expandedChips.remove(anchorID)
+                            } else {
+                                expandedChips.insert(anchorID)
+                            }
+                        }
+                    }
+                }
+
+                // A composer already on screen withdraws when its action stops
+                // being offered — a correction under an engine that cannot edit
+                // notes has nothing to commit to, and a control that does
+                // nothing is worse than one that is gone. `composing` carries
+                // that condition, so the block's marks withdraw with it.
+                if composing, let target = editingTarget {
+                    InlineComposer(
+                        target: target,
+                        sectionName: alwaysQuote ? sectionName(section, portuguese: portuguese) : nil,
+                        commitEnabled: correctionsEnabled, userText: $composerDraft,
+                        onCancel: { closeComposer() },
+                        onSubmit: { submitComposer(target, text: $0) })
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                ForEach(pendingRows, id: \.id) { row in
+                    if let status = pendingRowStatus(
+                        kind: row.kind, status: row.status, runActive: runActive)
+                    {
+                        Button {
+                            showChangesPanel = true
+                        } label: {
+                            PendingInstructionRow(statement: row.userText, status: status)
+                        }
+                        .buttonStyle(.plain)
+                        // The panel hangs off the Changes chip, which a full
+                        // run takes off screen with the meeting's status; the
+                        // row itself stays, so it must not act while its
+                        // destination is gone.
+                        .disabled(!correctionsAvailable)
+                        .help("Open Changes")
+                        .transition(.opacity)
+                    }
+                }
+
+                if mode == .inlineCards || (mode == .marginChip && chipExpanded) {
+                    ForEach(noteModels) { note in
+                        InlineNoteCard(note: note, portuguese: portuguese)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                }
+            }
+
+            // The margin rail, when that placement is live. It carries the
+            // person's own notes and nothing transient.
+            if let laneWidth {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(noteModels) { note in
+                        MarginRailNote(note: note, portuguese: portuguese)
+                    }
+                }
+                .frame(width: laneWidth, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        // Escape gives the block back: the mark goes, the bar withdraws, and
+        // nothing is left aimed at.
+        .onExitCommand { clearAim() }
+        .notesBlockFocus(id: anchorID, focus: $focusedBlock, marked: !selected) {
+            focusedAim = BlockSelection(
+                blockID: anchorID, section: section, blockText: blockText,
+                occurrence: occurrence, span: SelectedSpan(text: ""), hostText: host)
+        }
+        .contextMenu {
+            // One name for one action, everywhere the action is offered.
+            if NotesEditingEntry.offered(.correct, engineCanEditNotes: engineCanEditNotes) {
+                Button("\(SelectionActionBar.title(.correct))…") {
+                    contextMenuInvoke(
+                        .correct, section: section, blockText: blockText,
+                        occurrence: occurrence, blockID: anchorID, hostText: host)
+                }
+                .disabled(
+                    !NotesEditingEntry.allowed(
+                        .correct, correctionEnabled: correctionsEnabled,
+                        engineCanEditNotes: engineCanEditNotes))
+            }
+            Button("Add Note…") {
+                contextMenuInvoke(
+                    .note, section: section, blockText: blockText, occurrence: occurrence,
+                    blockID: anchorID, hostText: host)
+            }
+        }
+        .animation(reduceMotion ? nil : NotesEditingMotion.push, value: composing)
+        .id(anchorID)
+    }
+
+    private func contextMenuInvoke(
+        _ kind: EditingTarget.Kind, section: MeetingCorrection.Section, blockText: String,
+        occurrence: Int, blockID: String, hostText: String
+    ) {
+        notesEditingContextMenuAction(
+            kind, section: section, blockText: blockText, occurrence: occurrence,
+            blockID: blockID, selection: selection.map { ($0.blockID, $0.span) },
+            correctionEnabled: correctionsEnabled,
+            engineCanEditNotes: engineCanEditNotes, hostText: hostText,
+            begin: { beginEditing($0) })
+    }
+
+    /// The surface's ONE transient control, standing at whatever the person has
+    /// aimed at: the passage they selected, or the whole block they picked —
+    /// under it where there is room, above it where there is not, pointing at
+    /// its first word and never covering any of it. A host that cannot report
+    /// where the selection landed still gets a bar, at the block's own first
+    /// line — the way in never depends on the geometry.
+    @ViewBuilder
+    private var selectionBar: some View {
+        if let aim = commandTarget,
+            !composerPresented(
+                editingTarget, inBlockWith: aim.blockID,
+                engineCanEditNotes: engineCanEditNotes),
+            let block = geometry.blocks[aim.blockID]
+        {
+            let placement = SelectionBarPlacement.resolve(
+                selection: barExtent(aim, in: block),
+                measure: readingWidth, blockTop: block.pane.minY, paneHeight: paneHeight)
+            SelectionActionBar(
+                correctionEnabled: correctionsEnabled,
+                engineCanEditNotes: engineCanEditNotes, pointsUp: !placement.above,
+                tailOffset: placement.tailOffset
+            ) { kind in
+                beginEditing(
+                    kind, section: aim.section, anchorID: aim.blockID,
+                    blockText: aim.blockText, occurrence: aim.occurrence,
+                    selection: aim.span, hostText: aim.hostText)
+            }
+            .offset(
+                x: block.content.minX + placement.origin.x,
+                y: block.content.minY + placement.origin.y)
+            .transition(.opacity)
+        }
+    }
+
+    /// The text the bar has to stand clear of. A selection acts on its own
+    /// lines, so it clears those; a whole-block aim acts on every line the
+    /// block has, so it clears the whole of it — standing under the first line
+    /// would put the bar on the second, which is text the action would rewrite.
+    private func barExtent(_ aim: BlockSelection, in block: BlockGeometry) -> SelectionFrame {
+        guard aim.span.text.isEmpty else { return selectionFrame ?? SelectionFrame.blockStart }
+        return SelectionFrame(
+            first: CGRect(
+                x: 0, y: 0, width: 0, height: SelectionFrame.blockStart.first.height),
+            last: CGRect(x: 0, y: block.content.height, width: 0, height: 0))
+    }
+
+    private func sectionName(
+        _ section: MeetingCorrection.Section, portuguese: Bool
+    ) -> String {
+        switch section {
+        case .summary: return portuguese ? "Resumo" : "Summary"
+        case .detailedNotes: return portuguese ? "Notas Detalhadas" : "Detailed Notes"
+        case .decision: return portuguese ? "Decisões" : "Decisions"
+        case .actionItem: return portuguese ? "Itens de Ação" : "Action Items"
+        case .userActionItem: return portuguese ? "Suas ações" : "Your action items"
         }
     }
 }
@@ -1008,21 +2515,14 @@ private struct UserActionBoxChrome: ViewModifier {
 /// Renders exact destination matches with three cues: stronger weight,
 /// underline, and a quiet accent field. When no search is active the original
 /// AttributedString is returned unchanged, preserving Markdown inline styles.
+/// Non-selectable text (transcript rows, action items, table cells) — the notes
+/// blocks that host a selection use `NotesBlockText` directly.
 private struct SearchHighlightedText: View {
     let source: AttributedString
     let terms: [String]
 
     var body: some View {
-        Text(highlighted)
-            .accessibilityHint(containsMatch ? "Contains the current search match" : "")
-    }
-
-    private var containsMatch: Bool {
-        SearchTextMatcher.contains(String(source.characters), terms: terms)
-    }
-
-    private var highlighted: AttributedString {
-        SearchHighlight.applied(to: source, terms: terms)
+        NotesBlockText(source: source, terms: terms)
     }
 }
 
@@ -1099,41 +2599,43 @@ private struct SearchDestinationBanner: View {
     }
 }
 
-struct MarkdownBlocksView: View {
-    let markdown: String
+/// One parsed markdown block, rendered per its kind. `selectable` hands prose
+/// to the selection-capable host (macOS 26) so a within-block selection can
+/// raise the capsule.
+struct MarkdownBlockView: View {
+    let block: MarkdownBlock
     var searchTerms: [String] = []
-    var anchorPrefix: String?
+    var selectable = false
+    /// The span an open composer targets inside this block, if it targets less
+    /// than the whole of it.
+    var washedSpan: SelectedSpan?
+    var onSelectionChange: ((SelectedSpan?, SelectionFrame?) -> Void)?
 
     var body: some View {
-        let blocks = MarkdownBlocks.parse(markdown)
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(blocks) { block in
-                anchoredBlock(block)
-            }
-        }
+        blockView(block)
     }
 
     @ViewBuilder
-    private func anchoredBlock(_ block: MarkdownBlock) -> some View {
-        if let anchorPrefix {
-            blockView(block)
-                .id("\(anchorPrefix)-\(block.id)")
-        } else {
-            blockView(block)
-        }
+    private func proseText(_ text: AttributedString) -> some View {
+        NotesBlockText(
+            source: text, terms: searchTerms, selectable: selectable, washedSpan: washedSpan,
+            onSelectionChange: onSelectionChange)
     }
 
     @ViewBuilder
     private func blockView(_ block: MarkdownBlock) -> some View {
         switch block.kind {
         case .paragraph, .blockQuote:
-            SearchHighlightedText(source: block.text, terms: searchTerms)
+            proseText(block.text)
                 .font(Design.readingFont(14))
                 .lineSpacing(Design.readingLineSpacing)
                 .foregroundStyle(.primary.opacity(0.9))
                 .textSelection(.enabled)
         case .header:
-            SearchHighlightedText(source: block.text, terms: searchTerms)
+            // The selection-capable host, like every other anchorable block:
+            // the block's right-click menu is carried by that host, and a
+            // sub-heading is as correctable as the lines under it.
+            proseText(block.text)
                 .font(Design.readingFont(14, weight: .semibold))
                 .padding(.top, 4)
                 .textSelection(.enabled)
@@ -1142,7 +2644,7 @@ struct MarkdownBlocksView: View {
                 Text(ordinal.map { "\($0)." } ?? "•")
                     .font(.system(size: 13).monospacedDigit())
                     .foregroundStyle(Design.direction == .caderno ? AnyShapeStyle(Design.accent.opacity(0.7)) : AnyShapeStyle(.tertiary))
-                SearchHighlightedText(source: block.text, terms: searchTerms)
+                proseText(block.text)
                     .font(Design.readingFont(14))
                     .lineSpacing(Design.readingLineSpacing - 2)
                     .foregroundStyle(.primary.opacity(0.88))
@@ -2216,10 +3718,22 @@ struct CopyAllButton: View {
     let label: String
     var copiedLabel = "Copied"
     let accessibilityLabel: String
+    /// A permanent utility must not outrank the contextual actions beside it:
+    /// on the notes header it wears the same borderless type as its neighbours.
+    var quiet = false
     let text: () -> String
     @State private var copied = false
 
+    @ViewBuilder
     var body: some View {
+        if quiet {
+            button.buttonStyle(.borderless)
+        } else {
+            button
+        }
+    }
+
+    private var button: some View {
         Button {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
@@ -2231,7 +3745,7 @@ struct CopyAllButton: View {
             }
         } label: {
             Label(copied ? copiedLabel : label, systemImage: copied ? "checkmark" : "doc.on.doc")
-                .font(.system(size: 12))
+                .font(.system(size: quiet ? 11 : 12))
         }
         .accessibilityLabel(accessibilityLabel)
     }

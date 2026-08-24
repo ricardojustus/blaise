@@ -101,7 +101,8 @@ func seedDeliverable(
         throw TestFailure()
     }
     let payload = EvidencePayloadBuilder.build(
-        meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault)
+        meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault,
+        corrections: [])
     let relative = database.paths.relativeHandoffPayloadPath(
         meetingID: meeting.id, versionHash: payload.versionHash)
     try ImmutablePayloadWriter.write(payload.bytes, to: database.rootURL.appendingPathComponent(relative))
@@ -880,7 +881,8 @@ func makeWorker(
         }
         let segments = try await TranscriptRepository(database: database).segments(meetingID: item.meetingID)
         let newPayload = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: segments, notes: newNotes, user: .shippedDefault)
+            meeting: meeting, segments: segments, notes: newNotes, user: .shippedDefault,
+            corrections: [])
         let newPath = database.paths.relativeHandoffPayloadPath(
             meetingID: item.meetingID, versionHash: newPayload.versionHash)
         try ImmutablePayloadWriter.write(
@@ -918,7 +920,8 @@ func makeWorker(
         }
         let segments = try await TranscriptRepository(database: database).segments(meetingID: old.meetingID)
         let newPayload = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: segments, notes: newNotes, user: .shippedDefault)
+            meeting: meeting, segments: segments, notes: newNotes, user: .shippedDefault,
+            corrections: [])
         let newPath = database.paths.relativeHandoffPayloadPath(
             meetingID: old.meetingID, versionHash: newPayload.versionHash)
         try ImmutablePayloadWriter.write(
@@ -1004,7 +1007,8 @@ func makeWorker(
         else { throw TestFailure() }
         let segments = try await TranscriptRepository(database: database).segments(meetingID: item.meetingID)
         let rebuilt = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: segments, notes: notes, user: .shippedDefault)
+            meeting: meeting, segments: segments, notes: notes, user: .shippedDefault,
+            corrections: [])
         #expect(rebuilt.versionHash == item.versionHash)
         let stored = try Data(contentsOf: database.rootURL.appendingPathComponent(item.payloadPath))
         #expect(rebuilt.bytes == stored)
@@ -1041,6 +1045,7 @@ func makeWorker(
         // Mint the payload the OLD way: legacy `ric_action_items` key form.
         let legacy = EvidencePayloadBuilder.build(
             meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault,
+            corrections: [],
             userActionItemsKey: .legacy)
         #expect(String(decoding: legacy.bytes, as: UTF8.self).contains("ric_action_items"))
         let relative = database.paths.relativeHandoffPayloadPath(
@@ -1072,14 +1077,14 @@ func makeWorker(
     @Test func queuedMdV2DigestPayloadReMaterializesAndRecoversAfterShippedBump() async throws {
         // T3.2 / AC6: a payload minted under a PRIOR digest contract (md-v2)
         // carries a memory_digest, so its version_hash bakes in `md-v2`. After
-        // the shipped bump (now md-v6), that queued item's file is damaged/missing
+        // the shipped bump (now md-v7), that queued item's file is damaged/missing
         // and re-materialization must reproduce the md-v2 hash — the worker
         // rebuilds across the SHIPPED version then each prior one
-        // (md-v1 … md-v5 via `DigestPromptVersion.allCases`), so the md-v2 build
+        // (md-v1 … md-v6 via `DigestPromptVersion.allCases`), so the md-v2 build
         // matches and the item RECOVERS instead of quarantining. Every prior
         // contract is retained append-only, which is what makes this loop reach
         // the matching build.
-        #expect(DigestPromptBuilder.shippedVersion == .mdV6, "precondition: md-v6 is shipped")
+        #expect(DigestPromptBuilder.shippedVersion == .mdV7, "precondition: md-v7 is shipped")
         let database = try makeDatabase()
         try await seedHandoffConfig(database)  // valid destination (empty default would pause the worker)
         let meeting = makeMeeting(title: "Quoll Harbor roadmap", attendees: [
@@ -1106,13 +1111,15 @@ func makeWorker(
         // Mint the payload under the PRIOR contract: md-v2 (no longer shipped).
         let priorContract = EvidencePayloadBuilder.build(
             meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault,
+            corrections: [],
             digestPromptVersion: .mdV2)
         #expect(String(decoding: priorContract.bytes, as: UTF8.self)
             .contains("\"prompt_version\":\"md-v2\""))
         // The SHIPPED build (md-v3) produces a DIFFERENT hash — so recovery cannot
         // come from the shipped combination; it must reach the md-v2 build.
         let shippedBuild = EvidencePayloadBuilder.build(
-            meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault)
+            meeting: finalMeeting, segments: stored, notes: notes, user: .shippedDefault,
+            corrections: [])
         #expect(shippedBuild.versionHash != priorContract.versionHash)
         let relative = database.paths.relativeHandoffPayloadPath(
             meetingID: meeting.id, versionHash: priorContract.versionHash)

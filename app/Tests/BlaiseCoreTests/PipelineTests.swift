@@ -441,7 +441,9 @@ import Testing
         #expect(harness.notesFallback.state.withLock { $0.prepareCalls } == 1)
         let stored = try #require(try await harness.meeting(meeting.id))
         #expect(stored.status == .ready)
-        #expect(stored.processingNote == "fallback: \(EngineFallbackReason.inputTooLong)")
+        #expect(
+            stored.processingNote
+                == "notes written by the backup engine: \(EngineFallbackReason.inputTooLong)")
         // Provenance names the engine that actually ran.
         let notes = try #require(
             try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
@@ -459,7 +461,16 @@ import Testing
         #expect(record.fallback?.fallbackEngineID == "pipeline-mock-notes-fallback")
         let stored = try #require(try await harness.meeting(meeting.id))
         #expect(stored.status == .ready)
-        #expect(stored.processingNote?.starts(with: "fallback: configuration missing") == true)
+        // The note is read by a person, so it names the engine's state in plain
+        // words — never the configuration key that was missing, and never the
+        // pipeline's own word for the hop.
+        #expect(
+            stored.processingNote
+                == "notes written by the backup engine: "
+                    + ProcessingPipeline.humanReason(
+                        .configurationMissing(key: "engine.claude-sonnet.apiKey")))
+        #expect(stored.processingNote?.contains("apiKey") == false)
+        #expect(stored.processingNote?.hasPrefix("fallback:") == false)
     }
 
     @Test func monthlyCeilingAndOOMAreTriggers() async throws {
@@ -487,7 +498,11 @@ import Testing
         #expect(stored.processingNote == nil)
     }
 
-    @Test func bothEnginesFailingRecordsBothReasons() async throws {
+    /// The stage message is what the meeting's error banner shows verbatim, so
+    /// it names both engines the way the screen names them and carries neither
+    /// an engine id nor an engine's own free text. The ids and the raw reasons
+    /// are recorded in the log.
+    @Test func bothEnginesFailingNamesBothEnginesInWordsAPersonReads() async throws {
         let harness = try await makePipelineHarness()
         harness.notesPrimary.state.withLock {
             $0.error = .permanent(EngineFallbackReason.inputTooLong)
@@ -496,9 +511,11 @@ import Testing
         let meeting = try await harness.importTestMeeting()
         let error = try await expectFailure(harness, meeting.id, stage: .notes)
         #expect(error.message.contains(EngineFallbackReason.inputTooLong))
-        #expect(error.message.contains("load failure"))
-        #expect(error.message.contains("pipeline-mock-notes-primary"))
-        #expect(error.message.contains("pipeline-mock-notes-fallback"))
+        #expect(error.message.contains(harness.notesPrimary.displayName))
+        #expect(error.message.contains(harness.notesFallback.displayName))
+        #expect(error.message.contains("load failure") == false)
+        #expect(error.message.contains("pipeline-mock-notes-primary") == false)
+        #expect(error.message.contains("pipeline-mock-notes-fallback") == false)
     }
 
     @Test func triggerWithNoSecondEngineFailsHonestly() async throws {
@@ -508,7 +525,9 @@ import Testing
         }
         let meeting = try await harness.importTestMeeting()
         let error = try await expectFailure(harness, meeting.id, stage: .notes)
-        #expect(error.message.contains("no fallback engine"))
+        #expect(error.message.contains("no other notes engine is set up"))
+        #expect(error.message.contains(EngineFallbackReason.inputTooLong))
+        #expect(error.message.contains("pipeline-mock-notes-primary") == false)
     }
 
     @Test func rendererRefusalFailsPersistNotes() async throws {

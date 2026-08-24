@@ -312,12 +312,49 @@ final class PrepareControlledASR: ASREngine, @unchecked Sendable {
         #expect(bad.state.withLock { $0.prepareCalls } == 2)
     }
 
+    @Test func theRowsInlineFailureNamesTheStateAndNeverTheConfigurationKey() async throws {
+        let (model, _, bad, _) = try await makeModel()
+        bad.state.withLock {
+            $0.prepareError = .configurationMissing(key: "engine.bad-asr.apiKey")
+        }
+        await model.select("bad-asr", slot: .asr)
+        #expect(
+            model.asrPrepare
+                == .failed(
+                    engineID: "bad-asr",
+                    reason: ProcessingPipeline.humanReason(
+                        .configurationMissing(key: "engine.bad-asr.apiKey"))))
+        guard case .failed(_, let reason) = model.asrPrepare else {
+            Issue.record("expected failed prepare, got \(model.asrPrepare)")
+            return
+        }
+        #expect(reason.contains("apiKey") == false)
+    }
+
     @Test func launchRetryFiresPrepareForSelectedEngines() async throws {
         let (model, good, _, _) = try await makeModel()
         await model.prepareSelectedEnginesAtLaunch()
         #expect(good.state.withLock { $0.prepareCalls } >= 1)
         #expect(model.asrPrepare == .idle)
         #expect(model.summarizationPrepare == .idle)
+    }
+
+    /// The published selection is what the notes surface reads its engine
+    /// capability from; every run and every pending-correction re-arm resolves
+    /// the PERSISTED key instead. A selection published over a failed write
+    /// would leave those two disagreeing until the next launch, so the
+    /// observable follows the write rather than leading it.
+    @Test func aFailedSettingsWriteLeavesTheSelectionAsPersisted() async throws {
+        let (model, _, _, settings) = try await makeModel()
+        #expect(model.selectedSummarizationID == "mock-sum")
+        // A store that cannot take the write at all.
+        try await settings.database.pool.write { db in
+            try db.execute(sql: "DROP TABLE app_setting")
+        }
+        await model.select("other-sum", slot: .summarization)
+        #expect(model.selectedSummarizationID == "mock-sum")
+        await model.select("bad-asr", slot: .asr)
+        #expect(model.selectedASRID == "good-asr")
     }
 
     @Test func rowsCarryAvailabilityAndKind() async throws {

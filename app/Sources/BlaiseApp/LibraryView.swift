@@ -93,10 +93,11 @@ struct LibraryView: View {
         // transparent toolbar, repeating "All Meetings" / "Search" here reads
         // as leftover chrome rather than useful orientation.
         .toolbar(removing: .title)
-        // Window-level action-failure banner (rename, done toggle): the
+        // Window-level action-outcome banner (rename, done toggle): the
         // split-view analog of the menu bar's `lastActionError` line —
-        // visible wherever the failed action happened, dismissible, replaced
-        // by the next success.
+        // visible wherever the action happened, dismissible, replaced by the
+        // next one. The channel carries both outcomes: a saved note reports
+        // through it too, so the text is the only thing that names one.
         .overlay(alignment: .bottom) {
             if let error = uiState.lastActionError {
                 HStack(spacing: 10) {
@@ -112,13 +113,18 @@ struct LibraryView: View {
                         Image(systemName: "xmark.circle")
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss error")
+                    .accessibilityLabel("Dismiss")
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .modifier(GlassCapsule())
                 .padding(.bottom, 18)
-                .accessibilityLabel("Action failed: \(error)")
+                // The capsule speaks for nothing: a label here replaces the
+                // dismiss button's own name with the whole message, and the
+                // channel carries successes ("Note saved…") as well as
+                // failures, so no single outcome word can be put in front of
+                // the text. The message states its own outcome.
+                .accessibilityElement(children: .contain)
             }
         }
         // Handoff persistent-failure banner (owner directive refining hard

@@ -180,7 +180,8 @@ private func parsePayload(_ harness: PipelineHarness, path: String) throws -> [S
         let finalMeeting = try #require(try await harness.meeting(meeting.id))
         let segments = try await harness.segments(meeting.id)
         let rebuilt = EvidencePayloadBuilder.build(
-            meeting: finalMeeting, segments: segments, notes: notes, user: SelfHealFixtures.user)
+            meeting: finalMeeting, segments: segments, notes: notes, user: SelfHealFixtures.user,
+            corrections: [])
         let rebuiltParsed = try #require(
             try JSONSerialization.jsonObject(with: rebuilt.bytes) as? [String: Any])
         #expect(rebuiltParsed["memory_digest"] as? String == digestNow)
@@ -239,7 +240,8 @@ private func parsePayload(_ harness: PipelineHarness, path: String) throws -> [S
         let notes = try #require(try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
         let m = try #require(try await harness.meeting(meeting.id))
         let segs = try await harness.segments(meeting.id)
-        let payload = EvidencePayloadBuilder.build(meeting: m, segments: segs, notes: notes, user: SelfHealFixtures.user)
+        let payload = EvidencePayloadBuilder.build(
+            meeting: m, segments: segs, notes: notes, user: SelfHealFixtures.user, corrections: [])
         let parsed = try #require(try JSONSerialization.jsonObject(with: payload.bytes) as? [String: Any])
         #expect((parsed["memory_digest"] as? String)?.contains("Okoro") == true)
     }

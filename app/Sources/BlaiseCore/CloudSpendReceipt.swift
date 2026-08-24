@@ -30,6 +30,14 @@ public enum CloudSpendPurpose: String, Codable, Sendable, CaseIterable, Equatabl
     /// nothing. A name-edit rewrite of the stored digest spends nothing (no LLM
     /// call), so it leaves no receipt.
     case digest
+    /// N2: a cloud pass that applies pooled correction operations to the
+    /// current structured notes. Migration v21 widens the persisted purpose
+    /// CHECK for this value.
+    case notesEditor = "notes-editor"
+    /// N4: a cloud pass that applies find/replace operations to the stored
+    /// memory digest so it stops contradicting the user's corrections.
+    /// Migration v22 widens the persisted purpose CHECK for this value.
+    case digestEditor = "digest-editor"
 
     /// The plural display noun for the per-purpose subtotal strip.
     public var displayPlural: String {
@@ -39,6 +47,8 @@ public enum CloudSpendPurpose: String, Codable, Sendable, CaseIterable, Equatabl
         case .validation: return "Validation"
         case .smoke: return "Smoke"
         case .digest: return "Memory digests"
+        case .notesEditor: return "Notes edits"
+        case .digestEditor: return "Digest edits"
         }
     }
 }
@@ -140,11 +150,12 @@ public struct CloudSpendMonthReceipts: Sendable, Equatable {
 
     /// Per-purpose subtotals in the canonical display order, ALWAYS including
     /// generation/regeneration/validation (the strip the spec names), and
-    /// smoke only when present.
+    /// smoke/digest/notes-editor only when present.
     public var subtotalsByPurpose: [(purpose: CloudSpendPurpose, totalUSD: Double)] {
         var order: [CloudSpendPurpose] = [.generation, .regeneration, .validation]
         if receipts.contains(where: { $0.purpose == .smoke }) { order.append(.smoke) }
         if receipts.contains(where: { $0.purpose == .digest }) { order.append(.digest) }
+        if receipts.contains(where: { $0.purpose == .notesEditor }) { order.append(.notesEditor) }
         return order.map { purpose in
             (purpose, receipts.filter { $0.purpose == purpose }.reduce(0) { $0 + $1.costUSD })
         }

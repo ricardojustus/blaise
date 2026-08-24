@@ -3,11 +3,11 @@ import Testing
 
 @testable import BlaiseCore
 
-// Regression: the `claude -p` (Account) notes path has NO server-side json_schema
-// enforcement, so the model can emit a free-text phrase in the `meeting_type` ENUM
+// Regression: the `claude -p` (Account) notes path has a fallback that carries no
+// json_schema, so the model can emit a free-text phrase in the `meeting_type` ENUM
 // field. The notes decode must tolerate that (unknown value -> nil) instead of
-// failing the ENTIRE notes. Valid values still map to their case (no-op for the
-// schema-enforced API/MLX engines). FICTIONAL data only.
+// failing the ENTIRE notes. Valid values still map to their case (no-op on every
+// schema-enforced path). FICTIONAL data only.
 @Suite struct NotesMeetingTypeLeniencyTests {
     private func notesJSON(meetingType: String) -> Data {
         Data(

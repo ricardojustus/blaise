@@ -86,6 +86,13 @@ public enum DemoSeeder {
                     meetingID: id, markdown: markdown, structured: structured,
                     language: mock.language, generatedAt: started.addingTimeInterval(3600),
                     provenance: provenance))
+            // The real pipeline writes the notes file beside the database row, and
+            // every later notes mutation rewrites that file in place. A seeded
+            // meeting with only the row has no directory to write into, so the
+            // first correction or note on it fails on a missing folder.
+            try FileManager.default.createDirectory(
+                at: database.paths.meetingDirectory(id), withIntermediateDirectories: true)
+            try Data(markdown.utf8).write(to: database.paths.notesURL(id), options: .atomic)
         }
 
         // 3. G7 cloud-spend receipts for THIS month — the Settings → Cloud
@@ -94,10 +101,62 @@ public enum DemoSeeder {
         // so the reconciliation line shows its "before receipts existed"
         // labeling honestly.
         try await seedDemoReceipts(database: database, readyMeetings: readyMeetingIDs, now: now)
+        try await seedDemoAnnotations(database: database, readyMeetings: readyMeetingIDs, now: now)
 
         return Summary(
             meetingCount: Self.mockMeetings.count,
             segmentCount: segmentCount)
+    }
+
+    /// Margin notes and one pending correction on the first seeded meeting.
+    /// Every annotation surface — anchor wash, gutter marker, note card, pending
+    /// row, changes overview — renders nothing at all until rows exist, so the
+    /// states cannot be screenshotted or reviewed without them. Quotes are the
+    /// seeded fictional notes verbatim; a quote that missed its block would seed
+    /// the stale state instead of the anchored one.
+    private static func seedDemoAnnotations(
+        database: BlaiseDatabase, readyMeetings: [(id: MeetingID, started: Date)], now: Date
+    ) async throws {
+        guard let meeting = readyMeetings.first else { return }
+        let rows:
+            [(
+                kind: MeetingCorrection.Kind, section: MeetingCorrection.Section, quote: String,
+                text: String, status: MeetingCorrection.Status
+            )] = [
+                (
+                    .annotation, .summary,
+                    "Patch 1.4 ships Thursday with the stealth-AI fixes.",
+                    "This is the line to quote in the studio update.", .applied
+                ),
+                (
+                    .annotation, .decision,
+                    "Patch 1.4 locked for Thursday; no new scope after code freeze on Wednesday.",
+                    "Code freeze moved to Tuesday in the end.", .applied
+                ),
+                (
+                    .annotation, .detailedNotes,
+                    "Stealth-AI detection cone fix verified by QA on NovaDeck.",
+                    "Ask QA whether the cone fix covers the crouch case too.", .applied
+                ),
+                (
+                    // The action-item anchor space is the item TEXTS: the owner
+                    // prefix belongs to the rendered line, not to the block, so
+                    // a quote carrying it fold-matches nothing and the pending
+                    // state never appears on the page.
+                    .understanding, .actionItem,
+                    "File the takedown animation for the 1.5 cycle.",
+                    "Sofia Almeida owns the takedown animation, not Marcos.", .pending
+                ),
+            ]
+        try await database.pool.write { db in
+            for (index, row) in rows.enumerated() {
+                try MeetingCorrection(
+                    meetingID: meeting.id, kind: row.kind, section: row.section,
+                    quotedText: row.quote, userText: row.text, status: row.status,
+                    createdAt: now.addingTimeInterval(Double(index) * -600)
+                ).insert(db)
+            }
+        }
     }
 
     /// Inserts fixture receipts + a deliberately larger accumulator (the

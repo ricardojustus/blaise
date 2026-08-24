@@ -131,7 +131,7 @@ import Testing
         ]
         let payload = EvidencePayloadBuilder.build(
             meeting: meeting, segments: segments, notes: makeFixedNotes(meetingID: meeting.id),
-            user: user)
+            user: user, corrections: [])
 
         let expected =
             #"{"attendees":[{"email":"sam.rivera@vexatron.test","name":"Sam"},{"name":"Mariana Costa"}],"#
@@ -140,7 +140,9 @@ import Testing
             + #""notes_structured":{"action_items":[{"owner":"Sam","text":"enviar proposta"}],"decisions":["Decisão 1"],"detailed_notes":"Detalhes.","summary":"Resumo.","title":"Reunião fixa","user_action_items":[{"owner":"Sam","text":"enviar proposta"}]},"#
             + #""owner":{"email":"sam.rivera@vexatron.test","name":"Sam"},"#
             + #""provenance":{"asr":{"engine":"mlx-whisper-large-v3-turbo","engine_version":"0.4.3","language_hint":null,"model":"mlx-community/whisper-large-v3-turbo","runtime":"mlx-whisper/subprocess","transcribed_at_ms":1770000100000,"vocabulary_hints_applied":false},"notes":{"engine":"mlx-gemma4-26b","model":"mlx-community/gemma-4-26b-a4b-it-4bit","prompt_version":"c6-v1","renderer_version":"1","runtime":"mlx-lm/subprocess"},"pipeline_version":"1.0"},"#
-            + #""source":"blaise","started_at_ms":1770000000000,"#
+            // `retractions` is the one top-level field that is NOT
+            // presence-gated: it rides every payload, empty array included.
+            + #""retractions":[],"source":"blaise","started_at_ms":1770000000000,"#
             // Newlines in string values travel as \u000a (control-char escaping).
             + ##""summary_markdown":"# Reunião fixa\u000a\u000a## Resumo\u000a\u000aResumo.\u000a","summary_text":"Resumo.","title":"Reunião fixa","##
             + #""transcript":[{"end_time_ms":2500,"speaker":{"diarization_label":"S0","name":"Sam Rivera","source":"microphone"},"start_time_ms":0,"text":"Olá, vamos começar."},{"end_time_ms":5000,"speaker":{"diarization_label":"S1","name":null,"source":"speaker"},"start_time_ms":2750,"text":"Perfeito."}],"#
@@ -162,7 +164,7 @@ import Testing
         // canonicalization — makes the token-substituted comparison FAIL.
         let oldPayload = EvidencePayloadBuilder.build(
             meeting: meeting, segments: segments, notes: makeFixedNotes(meetingID: meeting.id),
-            user: user, userActionItemsKey: .legacy)
+            user: user, corrections: [], userActionItemsKey: .legacy)
         let newText = String(decoding: payload.bytes, as: UTF8.self)
         let oldText = String(decoding: oldPayload.bytes, as: UTF8.self)
         // The two streams differ (the key changed AND canonical sort reacts to
@@ -229,11 +231,11 @@ import Testing
         let meeting = makeFixedMeeting()
         let before = EvidencePayloadBuilder.build(
             meeting: meeting, segments: [], notes: makeFixedNotes(meetingID: meeting.id),
-            user: user)
+            user: user, corrections: [])
         var notes = makeFixedNotes(meetingID: meeting.id)
         notes.structured.meetingType = .externalCall
         let after = EvidencePayloadBuilder.build(
-            meeting: meeting, segments: [], notes: notes, user: user)
+            meeting: meeting, segments: [], notes: notes, user: user, corrections: [])
 
         let beforeText = String(decoding: before.bytes, as: UTF8.self)
         let afterText = String(decoding: after.bytes, as: UTF8.self)
@@ -280,7 +282,7 @@ import Testing
         let meeting = makeFixedMeeting()
         let payload = EvidencePayloadBuilder.build(
             meeting: meeting, segments: [], notes: makeFixedNotes(meetingID: meeting.id),
-            user: UserIdentity.shippedDefault)  // empty
+            user: UserIdentity.shippedDefault, corrections: [])  // empty
         let parsed = try #require(
             try JSONSerialization.jsonObject(with: payload.bytes) as? [String: Any])
         let owner = try #require(parsed["owner"] as? [String: Any])
@@ -331,8 +333,10 @@ import Testing
         meetingA.id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
         meetingB.id = "01ARZ3NDEKTSV4RRFFQ69G5FB0"
         let notesA = makeFixedNotes(meetingID: meetingA.id)
-        let a = EvidencePayloadBuilder.build(meeting: meetingA, segments: [], notes: notesA, user: user)
-        let b = EvidencePayloadBuilder.build(meeting: meetingB, segments: [], notes: notesA, user: user)
+        let a = EvidencePayloadBuilder.build(
+            meeting: meetingA, segments: [], notes: notesA, user: user, corrections: [])
+        let b = EvidencePayloadBuilder.build(
+            meeting: meetingB, segments: [], notes: notesA, user: user, corrections: [])
         #expect(a.versionHash != b.versionHash)
     }
 

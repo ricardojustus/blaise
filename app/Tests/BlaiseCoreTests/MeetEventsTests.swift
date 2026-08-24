@@ -797,7 +797,7 @@ func finalizeGoldenMeeting(
     }
     let notes = makeNotes(meetingID: meetingID)
     let payload = EvidencePayloadBuilder.build(
-        meeting: stored, segments: [], notes: notes, user: user)
+        meeting: stored, segments: [], notes: notes, user: user, corrections: [])
     let relative = database.paths.relativeHandoffPayloadPath(
         meetingID: meetingID, versionHash: payload.versionHash)
     try database.paths.createMeetingDirectory(meetingID)
@@ -828,7 +828,7 @@ func finalizeGoldenMeeting(
         let notes = try #require(try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
         let segments = try await TranscriptRepository(database: harness.database).segments(meetingID: meeting.id)
         let rebuilt = EvidencePayloadBuilder.build(
-            meeting: after, segments: segments, notes: notes, user: .onboardedUser)
+            meeting: after, segments: segments, notes: notes, user: .onboardedUser, corrections: [])
         #expect(rebuilt.versionHash == item.versionHash)
     }
 
@@ -926,7 +926,7 @@ func finalizeGoldenMeeting(
         let segments = try await TranscriptRepository(database: harness.database)
             .segments(meetingID: meeting.id)
         let rebuilt = EvidencePayloadBuilder.build(
-            meeting: after, segments: segments, notes: notes, user: .onboardedUser)
+            meeting: after, segments: segments, notes: notes, user: .onboardedUser, corrections: [])
         #expect(rebuilt.versionHash == newest.versionHash)
     }
 

@@ -153,6 +153,13 @@ public struct NotesRequest: Codable, Sendable, Equatable {
     /// block). Decoded via `decodeIfPresent ?? []` so payloads predating the
     /// field round-trip unchanged.
     public var groundedPersonHints: [GroundedPersonHint]
+    /// The meeting's durable user corrections, injected into every synthesis
+    /// run (partial or full — a later Regenerate can never erase user truth).
+    /// Understanding rows ONLY: a margin note is the user's own text and never
+    /// enters a prompt, so both request seams filter `.annotation` out. Empty
+    /// renders NO block (byte-identical user message); `decodeIfPresent ?? []`
+    /// keeps requests predating the field round-tripping.
+    public var corrections: [NotesCorrection]
 
     public init(
         meeting: Meeting,
@@ -160,7 +167,8 @@ public struct NotesRequest: Codable, Sendable, Equatable {
         dominantLanguage: String,
         vocabulary: [String],
         user: UserIdentity,
-        groundedPersonHints: [GroundedPersonHint] = []
+        groundedPersonHints: [GroundedPersonHint] = [],
+        corrections: [NotesCorrection] = []
     ) {
         self.meeting = meeting
         self.transcript = transcript
@@ -168,10 +176,11 @@ public struct NotesRequest: Codable, Sendable, Equatable {
         self.vocabulary = vocabulary
         self.user = user
         self.groundedPersonHints = groundedPersonHints
+        self.corrections = corrections
     }
 
     enum CodingKeys: String, CodingKey {
-        case meeting, transcript, vocabulary, user
+        case meeting, transcript, vocabulary, user, corrections
         case dominantLanguage = "dominant_language"
         case groundedPersonHints = "grounded_person_hints"
     }
@@ -186,6 +195,8 @@ public struct NotesRequest: Codable, Sendable, Equatable {
         // Presence-preserving: payloads predating #101 carry no key → [].
         self.groundedPersonHints =
             try container.decodeIfPresent([GroundedPersonHint].self, forKey: .groundedPersonHints) ?? []
+        self.corrections =
+            try container.decodeIfPresent([NotesCorrection].self, forKey: .corrections) ?? []
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -196,6 +207,7 @@ public struct NotesRequest: Codable, Sendable, Equatable {
         try container.encode(vocabulary, forKey: .vocabulary)
         try container.encode(user, forKey: .user)
         try container.encode(groundedPersonHints, forKey: .groundedPersonHints)
+        try container.encode(corrections, forKey: .corrections)
     }
 }
 
@@ -278,12 +290,12 @@ public struct NotesStructured: Codable, Sendable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.title = try container.decodeIfPresent(String.self, forKey: .title)
         self.summary = try container.decode(String.self, forKey: .summary)
-        // Lenient: `meeting_type` is an OPTIONAL classification. The API/MLX engines
-        // get schema-enforced enum values, but the `claude -p` (Account) engine has
-        // NO server-side json_schema enforcement and can emit a free-text phrase here
-        // — an UNRECOGNIZED value decodes to nil (treated as `general` downstream)
-        // rather than failing the ENTIRE notes. A valid raw value still maps to its
-        // case, so this is a no-op for the schema-enforced engines.
+        // Lenient: `meeting_type` is an OPTIONAL classification. Every engine's notes
+        // call enforces this enum server-side, but the `claude -p` (Account) engine also
+        // has a fallback path carrying no schema, where the model can emit a free-text
+        // phrase here — an UNRECOGNIZED value decodes to nil (treated as `general`
+        // downstream) rather than failing the ENTIRE notes. A valid raw value still maps
+        // to its case, so this is a no-op on every schema-enforced path.
         self.meetingType = (try container.decodeIfPresent(String.self, forKey: .meetingType))
             .flatMap(MeetingType.init(rawValue:))
         self.detailedNotes = try container.decode(String.self, forKey: .detailedNotes)

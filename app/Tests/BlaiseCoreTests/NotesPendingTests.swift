@@ -28,7 +28,8 @@ import Testing
         let (harness, meeting, record) = try await makePendingMeeting()
 
         // The run COMPLETED (no throw); the record carries the pending reason.
-        #expect(record.notesPending == "configuration missing: apiKey")
+        #expect(record.notesPending == ProcessingPipeline.humanReason(.configurationMissing(key: "apiKey")))
+        #expect(record.notesPending?.contains("apiKey") == false)
         #expect(record.fallback == nil)
         #expect(record.notesEngineID == nil)
 
@@ -91,7 +92,9 @@ import Testing
         // though a LIGHTWEIGHT fallback is registered (which would normally hop),
         // a fallback-trigger failure leaves the notes PENDING with a warning — it
         // is NEVER silently routed to the metered/other engine. The pending reason
-        // names the engine + cause so the marker is user-visible.
+        // names the engine + cause so the marker is user-visible — by the
+        // engine's display name, which is how the person picked it, never by
+        // its id.
         let harness = try await makePipelineHarness()
         let meeting = try await harness.importTestMeeting()
         harness.notesPrimary.state.withLock {
@@ -104,8 +107,9 @@ import Testing
         // fallback record; the fallback engine was never invoked.
         #expect(record.notesPending != nil)
         #expect(
-            record.notesPending?.contains("pipeline-mock-notes-primary") == true,
+            record.notesPending?.contains(harness.notesPrimary.displayName) == true,
             "the pending reason names the selected engine")
+        #expect(record.notesPending?.contains("oauthToken") == false)
         #expect(record.fallback == nil)
         #expect(record.notesEngineID == nil)
         #expect(
@@ -489,5 +493,55 @@ import Testing
         let again = try await harness.pipeline.processNotesOnly(meetingID: meeting.id)
         #expect(again == nil)
         #expect(try await harness.queueRows(meeting.id) == 1)
+    }
+
+    // MARK: - What a person is shown
+
+    /// camelCase and dotted key paths are the shapes a variable name takes and
+    /// a sentence does not.
+    private func identifierShaped(_ token: some StringProtocol) -> Bool {
+        let characters = Array(token)
+        for index in characters.indices.dropFirst()
+        where characters[index].isUppercase && characters[index - 1].isLowercase {
+            return true
+        }
+        return characters.dropLast().contains(".")
+    }
+
+    @Test func identifierShapedIsTheRightInstrument() {
+        #expect(identifierShaped("apiKey"))
+        #expect(identifierShaped("binaryPath"))
+        #expect(identifierShaped("engine.claude.apiKey"))
+        #expect(!identifierShaped("Settings"))
+        #expect(!identifierShaped("memory."))
+        #expect(!identifierShaped("—"))
+    }
+
+    /// The pending reason and the fallback processing note are sentences a
+    /// person reads after their meeting. No configuration key, engine id, or
+    /// API error body reaches either; `describe` keeps those for the log.
+    @Test func theHumanReasonCarriesNoInternalIdentifier() {
+        let errors: [EngineError] = [
+            .configurationMissing(key: "apiKey"),
+            .configurationMissing(key: "binaryPath"),
+            .configurationMissing(key: "engine.claude-sonnet.apiKey"),
+            .permanent(EngineFallbackReason.inputTooLong),
+            .permanent(EngineFallbackReason.outOfMemory),
+            .notAvailable(reason: EngineFallbackReason.monthlyCeiling),
+            .notAvailable(reason: EngineFallbackReason.insufficientMemory),
+            .transient("API 429 rate_limit_error: engine.claude.apiKey throttled"),
+            .permanent("API 400 invalid_request_error: maxTokens exceeded"),
+            .notAvailable(reason: "engine 'claude-account' is not registered"),
+            .duplicateEngineID("claude-account"),
+            .noEnginesRegistered(slot: "summarization"),
+            .invalidStructuredNotes("missing actionItems"),
+            .cancelled,
+        ]
+        for error in errors {
+            let sentence = ProcessingPipeline.humanReason(error)
+            for token in sentence.split(separator: " ") {
+                #expect(!identifierShaped(token), "\(sentence) carries \(token)")
+            }
+        }
     }
 }

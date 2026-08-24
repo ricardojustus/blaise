@@ -102,16 +102,23 @@ public final class EngineSettingsModel {
         slot == .asr ? asrPrepare : summarizationPrepare
     }
 
-    /// Select + eager prepare. The settings write happens FIRST and is never
-    /// rolled back on prepare failure.
+    /// Select + eager prepare. The settings write happens FIRST and the
+    /// published selection follows it: every run and every re-arm resolves the
+    /// PERSISTED key, so a selection published over a failed write would leave
+    /// the surface advertising an engine nothing else agrees with until the next
+    /// launch. A write that fails leaves the previous selection standing, which
+    /// is the one still persisted; a prepare failure is never rolled back.
     public func select(_ id: String, slot: EngineSlot) async {
+        let key = slot == .asr
+            ? EngineResolver.asrSettingsKey : EngineResolver.summarizationSettingsKey
+        do {
+            try await settings.set(key, to: id)
+        } catch {
+            return
+        }
         switch slot {
-        case .asr:
-            selectedASRID = id
-            try? await settings.set(EngineResolver.asrSettingsKey, to: id)
-        case .summarization:
-            selectedSummarizationID = id
-            try? await settings.set(EngineResolver.summarizationSettingsKey, to: id)
+        case .asr: selectedASRID = id
+        case .summarization: selectedSummarizationID = id
         }
         await prepare(slot: slot, engineID: id)
     }
@@ -151,14 +158,20 @@ public final class EngineSettingsModel {
         } catch {
             guard prepareGeneration[slot] == generation else { return }
             let reason = await failureReason(slot: slot, engineID: engineID, error: error)
-            logger.warning("prepare failed for \(engineID, privacy: .public): \(reason, privacy: .public)")
+            logger.warning(
+                "prepare failed for \(engineID, privacy: .public): \(ProcessingPipeline.describe(error), privacy: .public)"
+            )
             setPrepareState(.failed(engineID: engineID, reason: reason), slot: slot)
         }
         await refreshRows()
     }
 
     /// Prefer the engine's own availability reason (the inline message the
-    /// spec pins); fall back to the thrown error.
+    /// spec pins); fall back to the thrown error. This text is the row's
+    /// inline failure line, which a person reads beside the engine's own
+    /// name — so an `EngineError` renders as its human phrase. `describe` is
+    /// the diagnostic rendering (it carries the configuration key) and stays
+    /// in the log.
     private func failureReason(slot: EngineSlot, engineID: String, error: any Error) async -> String {
         let availability: EngineAvailability? =
             switch slot {
@@ -166,6 +179,7 @@ public final class EngineSettingsModel {
             case .summarization: await registry.summarizationEngine(id: engineID)?.availability()
             }
         if case .unavailable(let reason) = availability { return reason }
+        if let error = error as? EngineError { return ProcessingPipeline.humanReason(error) }
         return ProcessingPipeline.describe(error)
     }
 

@@ -234,6 +234,29 @@ private final class ClockBox: @unchecked Sendable {
         #expect(!month.reconciles)
     }
 
+    @Test("AC-15: notes-editor subtotal is conditional and uses its plural display noun")
+    func notesEditorSubtotalAppearsOnlyWhenReceipted() async throws {
+        let database = try makeDatabase()
+        let ledger = CloudSpendLedger(database: database)
+        let empty = try await ledger.monthReceipts()
+        #expect(!empty.subtotalsByPurpose.contains { $0.purpose == .notesEditor })
+        #expect(CloudSpendPurpose.notesEditor.rawValue == "notes-editor")
+        #expect(CloudSpendPurpose.notesEditor.displayPlural == "Notes edits")
+
+        try await ledger.add(
+            0.04,
+            receipt: CloudSpendLedger.ReceiptDraft(
+                engineID: "claude-sonnet", model: "claude-sonnet-4-6",
+                purpose: .notesEditor, meetingID: nil,
+                inputTokens: 1_200, outputTokens: 80))
+
+        let month = try await ledger.monthReceipts()
+        let subtotal = try #require(
+            month.subtotalsByPurpose.first { $0.purpose == .notesEditor })
+        #expect(abs(subtotal.totalUSD - 0.04) < 1e-9)
+        #expect(month.label(for: try #require(month.receipts.first)) == "Notes edits")
+    }
+
     /// M-3 (the FK dropped-receipt class): a receipt whose `meetingID` has no
     /// meeting row must NOT be dropped on its FK violation. The ledger detects
     /// the missing row and writes the receipt with meeting_id NULL — the money

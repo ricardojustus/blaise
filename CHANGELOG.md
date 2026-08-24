@@ -2,6 +2,39 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [1.6.0] — 24/08/2026
+
+The biggest release since 1.0: meeting notes are now correctable — select a passage,
+say what's wrong in plain words, and an editing pass applies it without touching
+anything else.
+
+### Added
+- **Corrections in plain language.** Select text in the notes, right-click (or use the
+  control on the selection), and state what's wrong. Corrections pool for a few minutes
+  and apply in one pass. Applied corrections never silently revert: a regenerated
+  transcript-to-notes run screens every withdrawn claim so it cannot resurrect.
+- **Margin notes** — proposed and first implemented by Arthur Soares (PR #10). Attach a
+  note to a passage without changing the text; placement Setting (inline card or margin
+  rail). The shipped version integrates his work with the correction/pooling engine.
+- **Removals travel downstream.** A correction that withdraws a claim adds a
+  `retractions` record to the handoff payload (additive field; existing consumers
+  unaffected). Delivery stays pooled, crash-safe, and strictly ordered.
+- **Regenerate Notes** — rebuilds a meeting's notes from the transcript on demand,
+  honoring every stored correction.
+- A **one-time tip** teaches the editing surface on first open.
+
+### Fixed
+- A crash after Mac sleep/wake with the app open during a Slack Huddles session — a
+  WebSocket ping callback could fire twice; it now resumes exactly once.
+
+### Under the hood
+- Database migrations v20-v22 run automatically on first launch; ~250 lines of dead
+  code removed; cloud spend receipts now also ledger a billed response whose content
+  fails to parse.
+- Upgrading: same signing identity as 1.5.3 — no permission re-prompts.
+
+Community contribution: Arthur Soares (PR #10).
+
 ## [1.5.3] — 01/08/2026
 
 Blaise now runs on macOS Sequoia. The minimum OS drops from macOS 26 to 15.6.1 with no

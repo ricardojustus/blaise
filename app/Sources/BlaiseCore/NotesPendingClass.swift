@@ -12,6 +12,12 @@ import Foundation
 /// API key save in Settings, and network-path restoration each re-dispatch
 /// pending meetings through the pipeline's notes-only resume.
 ///
+/// `notesFilePromoteIncomplete` is the ONE reason that does not fit that
+/// paragraph: it marks the deferred install's commit-to-promote window, where
+/// the notes row DID commit and the payload IS enqueued and only `notes.md` is
+/// behind. It shares the prefix because it wants exactly the same self-heal —
+/// re-mint from the row — and the re-mint converges the file either way.
+///
 /// Every consumer (pipeline, UI pill/banner, the self-heal triggers) MUST
 /// compile against these constants.
 public enum NotesPendingClass {
@@ -25,6 +31,15 @@ public enum NotesPendingClass {
     /// updatedAt). Distinct from every engine/ceiling pending reason so the
     /// self-heal, the UI banner, and the notification key off it precisely.
     public static let awaitingParticipantConfirmation = "awaiting participant confirmation"
+
+    /// The reserved reason committed INSIDE the finalize transaction of a
+    /// deferred run and cleared once `notes.md` carries the row that commit
+    /// installed. A meeting found carrying it is `ready` with a new notes row
+    /// whose file may still be the previous one (or absent) — the durable
+    /// state process death in that window leaves behind — and the self-heal
+    /// (launch / key save / network restore) re-mints it, which rewrites the
+    /// file from the row.
+    public static let notesFilePromoteIncomplete = "notes file promote incomplete"
 
     /// `last_processing_error` value for a notes-pending meeting.
     public static func marker(_ reason: String) -> String {

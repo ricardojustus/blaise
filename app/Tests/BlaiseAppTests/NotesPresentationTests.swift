@@ -22,7 +22,8 @@ import Testing
     /// Defect 1: the table must lay out inside the notes column — no
     /// horizontally-scrolling wrapper anywhere in the block renderer.
     @Test func tableRendersWithoutAHorizontalScrollWrapper() {
-        let layout = String(describing: type(of: MarkdownBlocksView(markdown: proseTable).body))
+        let block = MarkdownBlocks.parse(proseTable)[0]
+        let layout = String(describing: type(of: MarkdownBlockView(block: block).body))
         #expect(!layout.contains("ScrollView"))
         #expect(layout.contains("Grid"))
     }
@@ -181,7 +182,8 @@ import Testing
 
     private func height(_ markdown: String, width: Double) -> Double {
         let renderer = ImageRenderer(
-            content: MarkdownBlocksView(markdown: markdown).frame(width: width))
+            content: MarkdownBlockView(block: MarkdownBlocks.parse(markdown)[0])
+                .frame(width: width))
         return Double(renderer.nsImage?.size.height ?? -1)
     }
 
@@ -220,7 +222,8 @@ import Testing
         func png(_ separator: String) -> Data? {
             let markdown = "| Feature | Detail |\n\(separator)\n| Warp | x |\n| Quoll | wider cell |"
             let renderer = ImageRenderer(
-                content: MarkdownBlocksView(markdown: markdown).frame(width: 400))
+                content: MarkdownBlockView(block: MarkdownBlocks.parse(markdown)[0])
+                    .frame(width: 400))
             return renderer.nsImage?.tiffRepresentation
         }
         let left = png("| --- | --- |")

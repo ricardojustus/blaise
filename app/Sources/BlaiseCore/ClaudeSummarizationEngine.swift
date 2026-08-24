@@ -12,7 +12,9 @@ import os
 /// user's name and aliases, the dominant language. All of it travels inside
 /// the two prompt strings assembled by the shared `NotesPromptBuilder`;
 /// asserted by a unit test over the assembled request.
-public actor ClaudeSummarizationEngine: SummarizationEngine {
+public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
+    DigestEditingEngine
+{
     public static let engineID = "claude-sonnet"
     /// Engine identity = model + runtime (D5). Both the notes and the digest
     /// calls run on this model (Sonnet) — the cost/receipt accounting is keyed on
@@ -135,6 +137,119 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
         try await chain.run { try await self.generateNotesBody(request, purpose: purpose) }
     }
 
+    public func editNotes(
+        _ request: NotesEditorRequest, purpose: CloudSpendPurpose
+    ) async throws -> NotesEditorResult {
+        try await chain.run { try await self.editNotesBody(request, purpose: purpose) }
+    }
+
+    private func editNotesBody(
+        _ request: NotesEditorRequest, purpose: CloudSpendPurpose
+    ) async throws -> NotesEditorResult {
+        let result = try await editBody(
+            system: NotesEditorWireContract.systemPrompt,
+            user: { try NotesEditorWireContract.userMessage(for: request) },
+            schema: NotesEditorWireContract.schemaJSON,
+            label: "notes-editor",
+            meetingID: request.meetingID,
+            purpose: purpose,
+            decode: NotesEditorWireContract.decodeOperations(from:))
+        return NotesEditorResult(operations: result.operations, usage: result.usage)
+    }
+
+    /// The two editors' shared body: the same key fetch, ceiling check,
+    /// cancellation checks, ONE constrained attempt, and the same contract on
+    /// what comes back — a refusal, a bodyless 200 and an undecodable payload
+    /// are all permanent at this boundary. Only the wire contract differs, and
+    /// each editor keeps its own.
+    private func editBody<T>(
+        system: String, user: () throws -> String, schema: String, label: String,
+        meetingID: MeetingID, purpose: CloudSpendPurpose,
+        decode: (Data) throws -> [T]
+    ) async throws -> (operations: [T], usage: EngineUsage) {
+        if Task.isCancelled || CancellationToken.current?.isCancelled == true {
+            throw EngineError.cancelled
+        }
+
+        let apiKey: String?
+        do {
+            apiKey = try await configuration.value(for: Self.apiKeyConfigKey)
+        } catch {
+            throw EngineError.configurationMissing(key: Self.apiKeyConfigKey)
+        }
+        guard let apiKey, !apiKey.isEmpty else {
+            throw EngineError.configurationMissing(key: Self.apiKeyConfigKey)
+        }
+        if try await ledger.ceilingReached() {
+            throw EngineError.notAvailable(reason: EngineFallbackReason.monthlyCeiling)
+        }
+
+        let message: String
+        do {
+            message = try user()
+        } catch {
+            throw EngineError.permanent("could not encode \(label) request: \(error)")
+        }
+
+        if CancellationToken.current?.isCancelled == true { throw EngineError.cancelled }
+        let response = try await performAttempt(
+            apiKey: apiKey,
+            system: system,
+            user: message,
+            maxTokens: Self.maxTokensFirstAttempt,
+            timeout: Self.firstAttemptTimeout,
+            meetingID: meetingID,
+            purpose: purpose,
+            schema: schema,
+            label: label,
+            unparsableIsPermanent: true)
+
+        if response.stopReason == "refusal" {
+            throw EngineError.permanent("model refused the \(label) request")
+        }
+        guard let text = response.content.first(where: { $0.type == "text" })?.text else {
+            throw EngineError.permanent(
+                "\(label) response carried no text content block (stop_reason: \(response.stopReason ?? "nil"))")
+        }
+        let operations: [T]
+        do {
+            operations = try decode(Data(text.utf8))
+        } catch {
+            throw EngineError.permanent(
+                "\(label) response text was not schema-shaped JSON: \(error)")
+        }
+        return (
+            operations,
+            EngineUsage(
+                inputUnits: response.usage.inputTokens,
+                outputUnits: response.usage.outputTokens,
+                estimatedCostUSD: Self.cost(of: response.usage)))
+    }
+
+    /// N4: ONE constrained transport attempt with ZERO internal transient
+    /// retries — the activation owns the retries. The error contract is the
+    /// notes editor's: `transient` only where no usable body arrived,
+    /// `permanent` where a body arrived and would not decode.
+    public func editDigest(
+        _ request: DigestEditorRequest, purpose: CloudSpendPurpose
+    ) async throws -> DigestEditorResult {
+        try await chain.run { try await self.editDigestBody(request, purpose: purpose) }
+    }
+
+    private func editDigestBody(
+        _ request: DigestEditorRequest, purpose: CloudSpendPurpose
+    ) async throws -> DigestEditorResult {
+        let result = try await editBody(
+            system: DigestEditorWireContract.systemPrompt,
+            user: { DigestEditorWireContract.userMessage(for: request) },
+            schema: DigestEditorWireContract.schemaJSON,
+            label: "digest-editor",
+            meetingID: request.meetingID,
+            purpose: purpose,
+            decode: DigestEditorWireContract.decodeOperations(from:))
+        return DigestEditorResult(operations: result.operations, usage: result.usage)
+    }
+
     private func generateNotesBody(_ request: NotesRequest, purpose: CloudSpendPurpose) async throws -> NotesResult {
         if Task.isCancelled { throw EngineError.cancelled }
 
@@ -181,7 +296,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
         let first = try await performAttempt(
             apiKey: apiKey, system: system, user: user,
             maxTokens: Self.maxTokensFirstAttempt, timeout: Self.firstAttemptTimeout,
-            request: request, purpose: purpose)
+            meetingID: request.meeting.id, purpose: purpose)
         var final: APIResponse
         if first.stopReason == "max_tokens" {
             logger.warning("notes output hit max_tokens at \(Self.maxTokensFirstAttempt); retrying at \(Self.maxTokensRetryAttempt)")
@@ -191,7 +306,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
             let second = try await performAttempt(
                 apiKey: apiKey, system: system, user: user,
                 maxTokens: Self.maxTokensRetryAttempt, timeout: Self.retryAttemptTimeout,
-                request: request, purpose: purpose)
+                meetingID: request.meeting.id, purpose: purpose)
             if second.stopReason == "max_tokens" {
                 throw EngineError.permanent("output exceeds retry budget")
             }
@@ -237,7 +352,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
                         let retry = try await performAttempt(
                             apiKey: apiKey, system: system, user: user,
                             maxTokens: Self.maxTokensRetryAttempt, timeout: Self.retryAttemptTimeout,
-                            request: request, purpose: purpose)
+                            meetingID: request.meeting.id, purpose: purpose)
                         let retryDecoded = Self.decodeNotes(retry)
                         let firstCand = StubCandidate(
                             attempt: .first, response: first, decoded: firstDecoded,
@@ -806,7 +921,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
             let auditModel = model
             (data, http) = try await Task.detached {
                 let (data, http) = try await transport(urlRequest)
-                if http.statusCode == 200, let usage = Self.decodeUsage(from: data) {
+                if http.statusCode == 200, let usage = Self.decodeEditorUsage(from: data) {
                     try await ledger.add(
                         Self.cost(of: usage, model: auditModel),
                         receipt: CloudSpendLedger.ReceiptDraft(
@@ -876,12 +991,23 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
     /// ledger — billed failures count. G7: that same accounting write also
     /// leaves a receipt (one transaction; receipt-failure isolation lives in
     /// the ledger).
+    ///
+    /// `label` names the caller in the error text where the call is not the
+    /// plain notes path. `unparsableIsPermanent` is the one contract fork: a
+    /// 200 body that will not decode is permanent at the editors' protocol
+    /// boundary and transient on the notes path, where a later attempt can
+    /// still produce a usable document.
     private func performAttempt(
         apiKey: String, system: String, user: String, maxTokens: Int, timeout: TimeInterval,
-        request: NotesRequest, purpose: CloudSpendPurpose
+        meetingID: MeetingID, purpose: CloudSpendPurpose,
+        schema: String = NotesResponseSchema.json,
+        label: String? = nil,
+        unparsableIsPermanent: Bool = false
     ) async throws -> APIResponse {
         let urlRequest = try Self.buildURLRequest(
-            apiKey: apiKey, system: system, user: user, maxTokens: maxTokens, timeout: timeout)
+            apiKey: apiKey, system: system, user: user, maxTokens: maxTokens, timeout: timeout,
+            schema: schema)
+        let named = label.map { "\($0) " } ?? ""
 
         let data: Data
         let http: HTTPURLResponse
@@ -907,14 +1033,14 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
                 // Ledger inside the shield, BEFORE returning, ONLY on a billed
                 // 200 (a crash can at worst under-count one call; accepted).
                 // G7: the same write leaves a receipt.
-                if http.statusCode == 200, let usage = Self.decodeUsage(from: data) {
+                if http.statusCode == 200, let usage = Self.decodeEditorUsage(from: data) {
                     try await ledger.add(
                         Self.cost(of: usage),
                         receipt: CloudSpendLedger.ReceiptDraft(
                             engineID: id,
                             model: Self.model,
                             purpose: purpose,
-                            meetingID: request.meeting.id,
+                            meetingID: meetingID,
                             inputTokens: usage.inputTokens,
                             outputTokens: usage.outputTokens))
                 }
@@ -923,20 +1049,20 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
         } catch let error as EngineError {
             throw error
         } catch let error as URLError where error.code == .timedOut {
-            throw EngineError.transient("request timed out after \(Int(timeout)) s")
+            throw EngineError.transient("\(named)request timed out after \(Int(timeout)) s")
         } catch {
-            throw EngineError.transient("network failure: \(error)")
+            throw EngineError.transient("\(named)network failure: \(error)")
         }
 
         if http.statusCode == 200 {
-            let response: APIResponse
             do {
-                response = try JSONDecoder().decode(APIResponse.self, from: data)
+                // The spend for this 200 was ALREADY ledgered inside the shield.
+                return try JSONDecoder().decode(APIResponse.self, from: data)
             } catch {
-                throw EngineError.transient("unparseable API response: \(error)")
+                let reason = "unparseable \(named)API response: \(error)"
+                throw unparsableIsPermanent
+                    ? EngineError.permanent(reason) : EngineError.transient(reason)
             }
-            // The spend for this 200 was ALREADY ledgered inside the shield.
-            return response
         }
 
         let apiError = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data)
@@ -989,19 +1115,19 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
             + Double(usage.outputTokens) / 1_000_000 * price.output
     }
 
-    /// The billed `usage` from a 200 body, or nil if the body is not
-    /// schema-shaped. Used inside the cancellation shield to ledger the spend
-    /// of an in-flight attempt BEFORE returning; an unparseable 200 ledgers
-    /// nothing (the caller then maps it to `.transient`, unchanged).
-    static func decodeUsage(from data: Data) -> APIUsage? {
-        (try? JSONDecoder().decode(APIResponse.self, from: data))?.usage
+    /// Usage is independently decodable so a billed 200 can be recorded even
+    /// when its content envelope or operations later fail to decode.
+    static func decodeEditorUsage(from data: Data) -> APIUsage? {
+        struct UsageEnvelope: Decodable { var usage: APIUsage }
+        return (try? JSONDecoder().decode(UsageEnvelope.self, from: data))?.usage
     }
 
     /// Request construction (unit-tested: URL, headers minus the real key,
     /// the json_schema block, decoding pins — temperature ONLY, no top_p:
     /// the API rejects both together on Claude 4+ models).
     static func buildURLRequest(
-        apiKey: String, system: String, user: String, maxTokens: Int, timeout: TimeInterval
+        apiKey: String, system: String, user: String, maxTokens: Int, timeout: TimeInterval,
+        schema: String = NotesResponseSchema.json
     ) throws -> URLRequest {
         // The schema is spliced in as its RAW authored JSON, not via
         // JSONSerialization: dictionary round-trips destroy property order
@@ -1032,7 +1158,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine {
             throw EngineError.permanent("request body serialization failed")
         }
         let spliced = template.replacingOccurrences(
-            of: "\"\(placeholder)\"", with: NotesResponseSchema.json)
+            of: "\"\(placeholder)\"", with: schema)
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = timeout

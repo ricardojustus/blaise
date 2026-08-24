@@ -110,6 +110,12 @@ func makeNotesHarness(
 }
 
 @Suite(.serialized) struct MLXSummarizationEngineTests {
+    @Test func localEngineDoesNotExposeTheNotesEditorProtocol() async throws {
+        let harness = try await makeNotesHarness()
+        let engine: any SummarizationEngine = harness.engine
+        #expect(!(engine is any NotesEditingEngine))
+    }
+
     @Test func successMapsDriverOutputIntoNotesResult() async throws {
         let harness = try await makeNotesHarness()
         let result = try await harness.engine.generateNotes(makeNotesRequest())
@@ -242,7 +248,7 @@ func makeNotesHarness(
             user: UserIdentity(name: "Dana Marsh", aliases: [], email: "dana@vexatronlabs.example"))
         let result = try await harness.engine.generateDigest(request)
         #expect(result.digest == "## HEADER\nmeeting: Vexatron Labs sync\n")
-        #expect(result.promptVersion == "md-v6")
+        #expect(result.promptVersion == "md-v7")
         #expect(result.usage?.estimatedCostUSD == nil, "the local path spends nothing")
     }
 

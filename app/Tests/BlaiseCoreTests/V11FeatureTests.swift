@@ -118,7 +118,8 @@ import Testing
                 try await NotesRepository(database: harness.database).fetch(meetingID: meeting.id))
             let segments = try await harness.segments(meeting.id)
             let payload = EvidencePayloadBuilder.build(
-                meeting: stored, segments: segments, notes: notes, user: .onboardedUser)
+                meeting: stored, segments: segments, notes: notes, user: .onboardedUser,
+                corrections: [])
             return (payload.bytes, payload.versionHash)
         }
 
@@ -329,7 +330,8 @@ import Testing
         #expect(String(decoding: bytes, as: UTF8.self).contains("Pauta nova"))
         let segments = try await harness.segments(meeting.id)
         let rebuilt = EvidencePayloadBuilder.build(
-            meeting: after, segments: segments, notes: renamedNotes, user: .onboardedUser)
+            meeting: after, segments: segments, notes: renamedNotes, user: .onboardedUser,
+            corrections: [])
         #expect(rebuilt.versionHash == newItem.versionHash)
 
         // D12: delivery of the new payload terminally supersedes the old row.

@@ -103,7 +103,7 @@ private func makeDigestClaudeHarness(responses: [(Int, String)]) async throws ->
             responses: [(200, digestSuccessBody(text: "## HEADER\nmeeting: X\n"))])
         let result = try await harness.engine.generateDigest(fictionalDigestRequest())
         #expect(result.digest == "## HEADER\nmeeting: X\n")
-        #expect(result.promptVersion == "md-v6")
+        #expect(result.promptVersion == "md-v7")
         #expect(result.usage?.inputUnits == 6000)
     }
 
@@ -179,7 +179,7 @@ private func makeDigestClaudeHarness(responses: [(Int, String)]) async throws ->
         // decision + action-item owner are present.
         #expect(body.contains("Enviar cronograma") || body.contains("enviar cronograma"))
         // Version + corrected digest.
-        #expect(result.promptVersion == "md-v6")
+        #expect(result.promptVersion == "md-v7")
         #expect(result.digest.hasPrefix("## HEADER"))
         #expect(result.digest.contains("enviar o cronograma"))
     }

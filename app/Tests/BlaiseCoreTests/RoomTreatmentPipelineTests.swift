@@ -211,7 +211,8 @@ struct RoomTreatmentPipelineTests {
         #expect(record.fallback != nil)
         #expect(
             stored.processingNote
-                == "in-person treatment unavailable: speaker separation failed; fallback: \(EngineFallbackReason.inputTooLong)")
+                == "in-person treatment unavailable: speaker separation failed; notes written by the backup engine: \(EngineFallbackReason.inputTooLong)"
+        )
         #expect(!FileManager.default.fileExists(
             atPath: harness.database.paths.roomTreatmentURL(meeting.id).path))
     }

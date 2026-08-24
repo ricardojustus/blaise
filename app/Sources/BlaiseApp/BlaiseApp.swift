@@ -27,6 +27,11 @@ final class BlaiseAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let environment else { return .terminateNow }
+        // N4: quit outranks a view detach. Set synchronously as the first act,
+        // so the detach handler a closing window fires starts no settle
+        // executor. Nothing is lost either way — every owed bit is durable at
+        // mutation time and the next launch's sweep finishes the chain.
+        environment.pipeline.markTerminating()
         let controller = environment.recordingController
         Task {
             // Ask the CONTROLLER, not the UI mirror: a quit inside the
@@ -98,6 +103,7 @@ struct BlaiseApplication: App {
                     .environment(environment.activity)
                     .environment(environment.handoffStatus)
                     .environment(environment.listenerStatus)
+                    .environment(environment.notesPresentation)
                     .preferredColorScheme(.dark)
                     .tint(Theme.accent)
                     // Design is runtime-switchable (View ▸ Design): re-root
@@ -141,6 +147,9 @@ struct BlaiseApplication: App {
                     Button("Reprocess All Meetings…") {
                         environment.uiState.reprocessAllRequested = true
                     }
+                    RewriteNotesCommandButton()
+                        .environment(environment)
+                        .environment(environment.uiState)
                 }
             }
             CommandGroup(after: .textEditing) {
@@ -149,6 +158,8 @@ struct BlaiseApplication: App {
                         environment.uiState.searchFocusRequest += 1
                     }
                     .keyboardShortcut("f", modifiers: .command)
+                    NotesEditingCommandButtons()
+                        .environment(environment.uiState)
                 }
             }
             // View ▸ Design: the four visual directions, switchable live and
@@ -191,6 +202,7 @@ struct BlaiseApplication: App {
             if let environment {
                 SettingsRootView()
                     .environment(environment)
+                    .environment(environment.notesPresentation)
                     .preferredColorScheme(.dark)
                     .tint(Theme.accent)
                     .id(DesignSelection.shared.direction)  // live design switch
@@ -210,6 +222,115 @@ struct BlaiseApplication: App {
         }
         .defaultSize(width: 480, height: 440)
     }
+}
+
+/// Re-writes the selected meeting's notes from the saved transcript, with
+/// every pending correction injected.
+///
+/// The `uiState` read lives in this child view, not the scene builder: reading
+/// the selection there would register `App.body` as a dependency of the
+/// library selection.
+struct RewriteNotesCommandButton: View {
+    @Environment(AppEnvironment.self) private var appEnv
+    @Environment(AppUIState.self) private var uiState
+
+    var body: some View {
+        Button("Regenerate Notes") {
+            let pipeline = appEnv.pipeline
+            let uiState = uiState
+            let selected = uiState.selectedMeetingID
+            Task {
+                uiState.lastActionError = await rewriteNotesCommandAction(
+                    selectedMeetingID: selected,
+                    rewrite: { try await pipeline.rewriteNotes(meetingID: $0) })
+            }
+        }
+        .disabled(uiState.selectedMeetingID == nil)
+    }
+}
+
+/// The menu command's action seam routes the selected meeting to the pipeline.
+/// A refusal or a park is reported, never swallowed; no selection is a no-op.
+@MainActor
+func rewriteNotesCommandAction(
+    selectedMeetingID: MeetingID?,
+    rewrite: (MeetingID) async throws -> PipelineRunRecord?
+) async -> String? {
+    guard let meetingID = selectedMeetingID else { return nil }
+    do {
+        return rewriteFeedback(try await rewrite(meetingID))
+    } catch {
+        return "Could not re-write the notes: \(error.localizedDescription)"
+    }
+}
+
+/// The keyboard-reachable equivalents of the block actions (HIG: a context-menu
+/// item must also exist in the main interface). Both aim at whatever the notes
+/// surface currently holds — a selection, else the block holding keyboard
+/// focus, else the block the pointer last entered, in that order, so neither
+/// command depends on a pointer having been anywhere. "Correct Selection…"
+/// additionally honors the correction-path gate, because a margin note is not
+/// an instruction and is never run-gated.
+struct NotesEditingCommandButtons: View {
+    @Environment(AppUIState.self) private var uiState
+
+    /// The key equivalents, named once so the menu and the test that asserts
+    /// they exist read the same values.
+    static let correctShortcut = KeyboardShortcut("k", modifiers: [.command, .shift])
+    static let noteShortcut = KeyboardShortcut("k", modifiers: [.command, .option])
+
+    static func title(_ kind: EditingTarget.Kind) -> String {
+        switch kind {
+        case .correct: return "AI Correct Selection…"
+        case .note: return "Add Note…"
+        }
+    }
+
+    var body: some View {
+        Button(Self.title(.correct)) { invoke(.correct) }
+            .keyboardShortcut(Self.correctShortcut)
+            .disabled(!notesEditingCommandEnabled(.correct, context: uiState.notesEditingContext))
+        Button(Self.title(.note)) { invoke(.note) }
+            .keyboardShortcut(Self.noteShortcut)
+            .disabled(!notesEditingCommandEnabled(.note, context: uiState.notesEditingContext))
+    }
+
+    private func invoke(_ kind: EditingTarget.Kind) {
+        let uiState = uiState
+        _ = notesEditingCommandAction(
+            kind, context: uiState.notesEditingContext,
+            token: (uiState.notesEditingRequest?.token ?? 0) + 1,
+            route: { uiState.notesEditingRequest = $0 })
+    }
+}
+
+/// Whether a menu-bar editing command is offered: the surface must be able to
+/// take the instruction and hold a target for it to aim at, and the correction
+/// path additionally consults the run gate and the selected engine.
+@MainActor
+func notesEditingCommandEnabled(
+    _ kind: EditingTarget.Kind, context: AppUIState.NotesEditingContext
+) -> Bool {
+    context.surfaceReady && context.hasTarget
+        && NotesEditingEntry.allowed(
+            kind, correctionEnabled: context.correctionEnabled,
+            engineCanEditNotes: context.engineCanEditNotes)
+}
+
+/// The menu command's action seam: route the invocation to the open notes
+/// surface, which resolves it against the same entry the hover group uses. A
+/// closed gate or an absent surface routes nothing.
+@MainActor
+@discardableResult
+func notesEditingCommandAction(
+    _ kind: EditingTarget.Kind, context: AppUIState.NotesEditingContext, token: Int,
+    route: (AppUIState.NotesEditingRequest) -> Void
+) -> Bool {
+    guard notesEditingCommandEnabled(kind, context: context),
+        let meetingID = context.meetingID
+    else { return false }
+    route(AppUIState.NotesEditingRequest(meetingID: meetingID, kind: kind, token: token))
+    return true
 }
 
 /// F1 Inc2: opens the Processing Queue window from the menu (needs the view

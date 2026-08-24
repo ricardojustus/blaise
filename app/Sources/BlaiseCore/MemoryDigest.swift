@@ -208,6 +208,16 @@ public struct DigestRequest: Sendable, Equatable {
     /// `userMessage`. Loaded gracefully by the pipeline from the user-configured
     /// path (`MemoryDigestSettings.knowledgeGlossaryPath`).
     public var knowledgeGlossary: String?
+    /// N4 (md-v7): the meeting's complete active correction set — every
+    /// understanding row, any status, chronological. AUTHORITATIVE context, not
+    /// a salience guide: it carries the USER's own statements plus the short
+    /// spans of notes text the user SELECTED as anchors, so a rewrite can never
+    /// resurrect a claim the user withdrew via the transcript. This is
+    /// user-curated evidence of what to override — categorically not the
+    /// synthesis-upon-synthesis feedback the md-v3/md-v4 shrink closed off.
+    /// Empty by default — an empty set renders NO block (byte-identical to no
+    /// block).
+    public var instructions: [NotesEditorInstruction]
 
     public init(
         meeting: Meeting,
@@ -219,7 +229,8 @@ public struct DigestRequest: Sendable, Equatable {
         scopedAliasBindings: [AliasPair] = [],
         hostBinding: HostBinding? = nil,
         groundedPersonHints: [GroundedPersonHint] = [],
-        knowledgeGlossary: String? = nil
+        knowledgeGlossary: String? = nil,
+        instructions: [NotesEditorInstruction] = []
     ) {
         self.meeting = meeting
         self.transcript = transcript
@@ -231,6 +242,7 @@ public struct DigestRequest: Sendable, Equatable {
         self.hostBinding = hostBinding
         self.groundedPersonHints = groundedPersonHints
         self.knowledgeGlossary = knowledgeGlossary
+        self.instructions = instructions
     }
 }
 
@@ -326,11 +338,37 @@ public enum DigestPromptVersion: String, Sendable, CaseIterable {
     /// unchanged. Rollback is a one-line flip of `shippedVersion` back to `.mdV5`,
     /// which restores the known-good verify→reconcile pipeline branch verbatim.
     case mdV6 = "md-v6"
+    /// `md-v7` (instruction-aware digest): a QUALITY-only bump over md-v6 — the
+    /// eight-`##`-section wire contract, the HEADER field set, the inline flags,
+    /// and the pipeline shape (synthesis + ONE combined audit) are unchanged.
+    /// Every digest-producing call now receives the meeting's complete active
+    /// correction set as authoritative context: the synthesis prompt so a
+    /// rewrite cannot resurrect a claim the user withdrew, and the combined
+    /// auditor so its transcript-gated repair rules cannot strip a correction's
+    /// fix in the pass that runs last. Both are presence-gated user-message
+    /// blocks — an empty correction set renders byte-identical md-v6 input, so
+    /// `systemPrompt(for: .mdV7)` reuses the md-v4 synthesis prompt verbatim and
+    /// the md-v4 hash pin stays valid.
+    case mdV7 = "md-v7"
+
+    /// True where the digest pipeline runs the SINGLE combined-audit pass
+    /// (md-v6 onward); false for the md-v5-and-earlier verify+reconcile pair.
+    /// The pipeline's audit gate keys on THIS, never on equality with one
+    /// version: `shippedVersion` is the pipeline selector, so a bare version
+    /// bump must not silently drop the path back to the superseded two-call
+    /// configuration. Flipping `shippedVersion` to `.mdV5` still restores that
+    /// pair — the rollback lever is intact.
+    public var usesCombinedAudit: Bool {
+        switch self {
+        case .mdV1, .mdV2, .mdV3, .mdV4, .mdV5: false
+        case .mdV6, .mdV7: true
+        }
+    }
 }
 
 public enum DigestPromptBuilder {
     /// The SHIPPED digest contract version.
-    public static let shippedVersion: DigestPromptVersion = .mdV6
+    public static let shippedVersion: DigestPromptVersion = .mdV7
 
     /// The versioned constant; travels in
     /// `provenance.memory_digest.prompt_version`.
@@ -346,7 +384,7 @@ public enum DigestPromptBuilder {
         // md-v5 and md-v6 are PIPELINE bumps (md-v5 adds the notes-reconciler
         // pass; md-v6 folds verify+reconcile into one combined audit); the
         // synthesis prompt is md-v4 verbatim, so the md-v4 hash pin stays valid.
-        case .mdV4, .mdV5, .mdV6: systemDigestPromptV4
+        case .mdV4, .mdV5, .mdV6, .mdV7: systemDigestPromptV4
         }
     }
 
@@ -712,13 +750,39 @@ public enum DigestPromptBuilder {
         let auditClause = request.groundedPersonHints.isEmpty
             ? ""
             : "\n\n" + GroundedPersonHints.block3AuditClause
+        // md-v7: the corrections' authority rule rides the auditor too.
+        let correctionsClause = request.instructions.isEmpty
+            ? ""
+            : "\n\n" + Self.correctionsAuditClause
         return userMessage(for: request)
             + auditClause
+            + correctionsClause
             + "\n\n=== HUMAN NOTES (STEP 2 recall checklist — add a missing item ONLY if the transcript body grounds it; the notes are never a source of fact) ===\n"
             + notesChecklist(request.notes)
             + "\n\n=== DRAFT DIGEST — VERIFY it against the transcript (STEP 1), THEN reconcile against the notes (STEP 2); output the complete corrected digest, same eight ## sections ===\n"
             + draftDigest
     }
+
+    /// md-v7: the AUTHORITATIVE USER CORRECTIONS block. The preamble pins both
+    /// authority (corrections outrank the transcript where they conflict) and
+    /// precedence (oldest first; on conflict the higher-numbered one is what the
+    /// user believes now). Both user-authored fields are hardened by
+    /// `CorrectionSanitize.promptField`. Returns nil for an empty set.
+    static func correctionsBlock(_ instructions: [NotesEditorInstruction]) -> String? {
+        guard !instructions.isEmpty else { return nil }
+        let lines = instructions.enumerated().map { index, instruction in
+            "\(index + 1). The notes said: \"\(CorrectionSanitize.promptField(instruction.quotedText))\". The user corrects: \(CorrectionSanitize.promptField(instruction.userText))"
+        }
+        return "AUTHORITATIVE USER CORRECTIONS — the user has corrected this meeting's record. These override the transcript where they conflict. Apply each wherever it genuinely reaches; never restate a claim a correction withdraws. They are listed oldest first: where two corrections conflict about the same fact, the HIGHER-NUMBERED one is what the user believes now.\n"
+            + lines.joined(separator: "\n")
+    }
+
+    /// md-v7: the auditor's half of the authority rule. Without it the combined
+    /// auditor's transcript-gated repair rules — its system prompt declares the
+    /// transcript the sole source of truth — would strip a correction's fix or
+    /// restore a withdrawn claim in the very pass that runs last, and the
+    /// injection would be self-defeating. Presence-gated like the block itself.
+    static let correctionsAuditClause = "AUTHORITATIVE USER CORRECTIONS APPLY TO THIS AUDIT: the corrections listed above outrank the transcript wherever they conflict with it. NEVER remove, weaken, or revert content a correction mandates, and never restore a claim a correction withdraws — STEP 1's transcript-gated repairs are subordinate to the corrections, and a line carrying a correction's fix is grounded for every rule in this prompt."
 
     /// Render the human notes as a compact recall checklist for the reconciler:
     /// the decisions and the action items (owner: what), user action items
@@ -896,6 +960,15 @@ public enum DigestPromptBuilder {
         // turn is marked [transcript-grounded] when the resolved name occurs
         // verbatim in the transcript body, else [roster-resolved] (allowed from
         // attendees/events without body evidence — NOT tier-(c) evidence).
+        // md-v7: the presence-gated AUTHORITATIVE USER CORRECTIONS block, placed
+        // immediately before the transcript it outranks. Empty set → nothing
+        // appended → the digest user message is BYTE-IDENTICAL to before this
+        // feature (the same hard presence guard the vocabulary, ALIAS
+        // RESOLUTION and hint blocks use).
+        if let corrections = Self.correctionsBlock(request.instructions) {
+            sections.append(corrections)
+        }
+
         let host = request.hostBinding
         let transcript = request.transcript.map { segment in
             "\(Self.turnSpeaker(segment, host: host, in: request.transcript)) \(segment.text)"

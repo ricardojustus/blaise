@@ -245,6 +245,34 @@ struct SlackSocketClientTests {
         #expect(processed.withLock { $0 }.isEmpty)  // undecodable → not delivered
     }
 
+    /// `sendPing` builds its pong callback in `makePongHandler` and installs
+    /// exactly what that returns, so driving the returned closure drives the
+    /// production guard: `URLSessionWebSocketTask` can call the callback more
+    /// than once for one ping, and the continuation behind it traps if resumed
+    /// twice.
+    @Test("the installed pong handler resumes exactly once, on the first result")
+    func pongHandlerResumesOnce() {
+        /// What the handler reports when the socket delivers `callbacks`.
+        func resumes(for callbacks: [(any Error)?]) -> [String] {
+            let reported = Mutex<[String]>([])
+            let handler = makePongHandler { result in
+                reported.withLock { log in
+                    switch result {
+                    case .success: log.append("success")
+                    case .failure: log.append("failure")
+                    }
+                }
+            }
+            for error in callbacks { handler(error) }
+            return reported.withLock { $0 }
+        }
+        let failure: (any Error)? = SlackClientError.http(status: 500)
+        #expect(resumes(for: [nil, failure]) == ["success"], "a late error resumes nothing")
+        #expect(resumes(for: [failure, nil]) == ["failure"], "a late success resumes nothing")
+        #expect(resumes(for: [nil]) == ["success"])
+        #expect(resumes(for: [failure]) == ["failure"])
+    }
+
     @Test("backoff doubles and caps at 60 s")
     func backoffCap() {
         #expect(SlackSocketClient.nextBackoff(1) == 2)

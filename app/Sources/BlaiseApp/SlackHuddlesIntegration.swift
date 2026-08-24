@@ -1,6 +1,7 @@
 import BlaiseCore
 import Foundation
 import Observation
+import Synchronization
 import os
 
 // C15: the app side of docs/slack_huddles_contract.md — the settings/connect
@@ -666,6 +667,35 @@ actor SlackSocketClient {
     }
 }
 
+/// A one-shot claim for a callback that drives a continuation. A continuation
+/// resumed twice traps, so a handler that may fire more than once asks here
+/// first: the first caller wins and every later one is dropped.
+final class ResumeOnce: Sendable {
+    private let claimed = Mutex(false)
+
+    func claim() -> Bool {
+        claimed.withLock { done in
+            if done { return false }
+            done = true
+            return true
+        }
+    }
+}
+
+/// The pong callback `sendPing` installs. `URLSessionWebSocketTask` can call it
+/// more than once for a single ping, so the returned closure reports whichever
+/// result arrives first and drops every later one — the continuation behind
+/// `resume` must be resumed exactly once.
+func makePongHandler(
+    resume: @escaping @Sendable (Result<Void, any Error>) -> Void
+) -> @Sendable ((any Error)?) -> Void {
+    let once = ResumeOnce()
+    return { error in
+        guard once.claim() else { return }
+        resume(error.map { .failure($0) } ?? .success(()))
+    }
+}
+
 /// Production channel over `URLSessionWebSocketTask`.
 private final class URLSessionSlackChannel: SlackWebSocketChannel, @unchecked Sendable {
     private let task: URLSessionWebSocketTask
@@ -689,13 +719,8 @@ private final class URLSessionSlackChannel: SlackWebSocketChannel, @unchecked Se
 
     func sendPing() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            task.sendPing { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            }
+            task.sendPing(
+                pongReceiveHandler: makePongHandler { continuation.resume(with: $0) })
         }
     }
 

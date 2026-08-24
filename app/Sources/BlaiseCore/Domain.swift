@@ -457,6 +457,21 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
     /// byte-identically). NOT in the payload (the builder reads explicit fields
     /// only — `EvidencePayloadBuilder`), so `versionHash` is unaffected (AC7).
     public var scopedAliasBindings: [AliasPair]
+    /// N4: the stored digest no longer reflects the meeting's instruction set —
+    /// a digest-editor reconcile is owed. Set only when the notes editor applied
+    /// effective operations beside a non-nil digest; cleared by the reconcile,
+    /// by a finalize (which installs a born-reconciled digest), and by the heal.
+    public var digestEditOwed: Bool
+    /// N4: deliverable content changed since the last enqueue. Set by editor
+    /// applies and annotation mutations; cleared by the settle delivery and by
+    /// every path that delivers everything current (finalize, the digest heal).
+    public var deliveryOwed: Bool
+    /// N4: the digest prompt version a payload minted from THIS row is stamped
+    /// with — hash stability for re-mints, NOT a claim about which prompt
+    /// authored the bytes (the authoring version of a legacy digest is
+    /// unknowable). `nil` where no digest exists. A digest-editor edit leaves it
+    /// unchanged: an edit does not re-author the digest.
+    public var digestPromptVersion: String?
 
     public init(
         meetingID: MeetingID,
@@ -466,7 +481,10 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         generatedAt: Date,
         provenance: NotesProvenance,
         memoryDigest: String? = nil,
-        scopedAliasBindings: [AliasPair] = []
+        scopedAliasBindings: [AliasPair] = [],
+        digestEditOwed: Bool = false,
+        deliveryOwed: Bool = false,
+        digestPromptVersion: String? = nil
     ) {
         self.meetingID = meetingID
         self.markdown = markdown
@@ -476,6 +494,9 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         self.provenance = provenance
         self.memoryDigest = memoryDigest
         self.scopedAliasBindings = scopedAliasBindings
+        self.digestEditOwed = digestEditOwed
+        self.deliveryOwed = deliveryOwed
+        self.digestPromptVersion = digestPromptVersion
     }
 
     enum CodingKeys: String, CodingKey {
@@ -484,6 +505,9 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         case generatedAt = "generated_at"
         case memoryDigest = "memory_digest"
         case scopedAliasBindings = "scoped_alias_bindings"
+        case digestEditOwed = "digest_edit_owed"
+        case deliveryOwed = "delivery_owed"
+        case digestPromptVersion = "digest_prompt_version"
     }
 
     public init(from decoder: Decoder) throws {
@@ -498,6 +522,12 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         // A null/absent column (legacy / pre-md-v3 / digest-off row) → empty set.
         self.scopedAliasBindings =
             try container.decodeIfPresent([AliasPair].self, forKey: .scopedAliasBindings) ?? []
+        self.digestEditOwed =
+            try container.decodeIfPresent(Bool.self, forKey: .digestEditOwed) ?? false
+        self.deliveryOwed =
+            try container.decodeIfPresent(Bool.self, forKey: .deliveryOwed) ?? false
+        self.digestPromptVersion =
+            try container.decodeIfPresent(String.self, forKey: .digestPromptVersion)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -525,6 +555,12 @@ public struct MeetingNotes: Codable, Sendable, Equatable {
         try container.encode(
             scopedAliasBindings.isEmpty ? nil : scopedAliasBindings,
             forKey: .scopedAliasBindings)
+        // The owed bits and the stamp column are always encoded: an upsert is
+        // the row's whole state, and a path that re-persists a settled row must
+        // actively CLEAR a bit rather than silently retain it.
+        try container.encode(digestEditOwed, forKey: .digestEditOwed)
+        try container.encode(deliveryOwed, forKey: .deliveryOwed)
+        try container.encode(digestPromptVersion, forKey: .digestPromptVersion)
     }
 }
 

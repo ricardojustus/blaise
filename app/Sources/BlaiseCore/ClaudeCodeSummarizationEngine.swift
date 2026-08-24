@@ -24,7 +24,9 @@ import os
 /// environment — never the inherited GUI login env — so `ANTHROPIC_API_KEY` is
 /// simply ABSENT from the child and the CLI authenticates with the OAuth token
 /// alone. This is the same env-hygiene rule the MLX engine enforces.
-public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
+public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
+    DigestEditingEngine
+{
     public static let engineID = "claude-cli"
     /// The wire model the CLI runs — kept identical to the API engine's model so
     /// the digest quality target (the validated shaping was tuned on Sonnet 4.6)
@@ -385,9 +387,15 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
     /// returns the re-serialized `structured_output` object (NOT `result`). When
     /// nil (the DIGEST path) the behavior is unchanged: `defaultMaxTurns`, no
     /// `--json-schema`, return `result`.
+    ///
+    /// `editorMode` names the editors' one invocation contract: one public
+    /// editor call is exactly ONE subprocess attempt (the activation owns the
+    /// retries, so the internal transient retries are off), and the CLI's prose
+    /// `result` is never accepted in place of a structured body.
     private func invoke(
         system: String, user: String, purpose: CloudSpendPurpose, meetingID: MeetingID?,
-        jsonSchema: String? = nil
+        jsonSchema: String? = nil,
+        editorMode: Bool = false
     ) async throws -> String {
         if Task.isCancelled || CancellationToken.current?.isCancelled == true {
             throw EngineError.cancelled
@@ -439,6 +447,7 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
         let env = childEnvironment(token: token, binary: binary, home: throwawayHome)
         let stdin = Data(user.utf8)
         let expectStructuredOutput = jsonSchema != nil
+        let transientRetryLimit = editorMode ? 0 : Self.maxTransientRetries
 
         var attempt = 0
         while true {
@@ -449,14 +458,15 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
                 return try await runOnce(
                     binary: binary, args: args, env: env, stdin: stdin,
                     purpose: purpose, meetingID: meetingID,
-                    expectStructuredOutput: expectStructuredOutput)
+                    expectStructuredOutput: expectStructuredOutput,
+                    requiresStructuredOutput: editorMode)
             } catch let error as EngineError where Self.isTransient(error) {
                 attempt += 1
-                if attempt > Self.maxTransientRetries { throw error }
+                if attempt > transientRetryLimit { throw error }
                 let backoff = min(
                     UInt64(1) << UInt64(attempt - 1), Self.transientBackoffCapSeconds)
                 logger.warning(
-                    "claude -p transient failure (attempt \(attempt)/\(Self.maxTransientRetries)); backing off \(backoff)s")
+                    "claude -p transient failure (attempt \(attempt)/\(transientRetryLimit)); backing off \(backoff)s")
                 if Task.isCancelled || CancellationToken.current?.isCancelled == true {
                     throw EngineError.cancelled
                 }
@@ -482,7 +492,8 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
     private func runOnce(
         binary: URL, args: [String], env: [String: String], stdin: Data,
         purpose: CloudSpendPurpose, meetingID: MeetingID?,
-        expectStructuredOutput: Bool = false
+        expectStructuredOutput: Bool = false,
+        requiresStructuredOutput: Bool = false
     ) async throws -> String {
         let outcome: SubprocessOutcomeLike
         do {
@@ -506,6 +517,13 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
         // even on an `is_error`, so we decode FIRST and read `is_error`.
         let envelope = try? JSONDecoder().decode(CLIEnvelope.self, from: outcome.stdout)
 
+        // The editor protocol distinguishes an absent response from an arrived
+        // body that cannot be used. Non-empty malformed stdout is the latter;
+        // only an invocation with no envelope bytes remains transient below.
+        if requiresStructuredOutput, envelope == nil, !outcome.stdout.isEmpty {
+            throw EngineError.permanent("claude -p editor response envelope could not be decoded")
+        }
+
         if let envelope, envelope.isError == true {
             throw Self.mapEnvelopeError(envelope, stderr: outcome.stderrTail)
         }
@@ -519,8 +537,16 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
             {
                 return serialized
             }
+            if requiresStructuredOutput { return nil }
             return envelope?.result
         }()
+
+        // Editor work never accepts the CLI's prose `result` fallback. A decoded
+        // envelope arrived, so a missing/unserializable structured object is a
+        // permanent unusable-body failure at the NotesEditingEngine boundary.
+        if requiresStructuredOutput, envelope != nil, payload == nil {
+            throw EngineError.permanent("claude -p editor response carried no usable structured_output")
+        }
 
         // No parseable envelope OR a non-zero exit with no usable payload →
         // transient (a crashed/truncated CLI run; retrying may help). For a schema
@@ -608,6 +634,87 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
 
     public func generateNotes(_ request: NotesRequest, purpose: CloudSpendPurpose) async throws -> NotesResult {
         try await chain.run { try await self.generateNotesBody(request, purpose: purpose) }
+    }
+
+    public func editNotes(
+        _ request: NotesEditorRequest, purpose: CloudSpendPurpose
+    ) async throws -> NotesEditorResult {
+        try await chain.run { try await self.editNotesBody(request, purpose: purpose) }
+    }
+
+    private func editNotesBody(
+        _ request: NotesEditorRequest, purpose: CloudSpendPurpose
+    ) async throws -> NotesEditorResult {
+        NotesEditorResult(
+            operations: try await editBody(
+                system: NotesEditorWireContract.systemPrompt,
+                user: { try NotesEditorWireContract.userMessage(for: request) },
+                schema: NotesEditorWireContract.schemaJSON,
+                label: "notes-editor",
+                meetingID: request.meetingID,
+                purpose: purpose,
+                decode: NotesEditorWireContract.decodeOperations(from:)),
+            usage: EngineUsage(inputUnits: nil, outputUnits: nil, estimatedCostUSD: 0.0))
+    }
+
+    /// The two editors' shared body over the account CLI. Only the wire
+    /// contract differs; each editor keeps its own.
+    private func editBody<T>(
+        system: String, user: () throws -> String, schema: String, label: String,
+        meetingID: MeetingID, purpose: CloudSpendPurpose,
+        decode: (Data) throws -> [T]
+    ) async throws -> [T] {
+        if Task.isCancelled || CancellationToken.current?.isCancelled == true {
+            throw EngineError.cancelled
+        }
+
+        let message: String
+        do {
+            message = try user()
+        } catch {
+            throw EngineError.permanent("could not encode \(label) request: \(error)")
+        }
+
+        let raw = try await invoke(
+            system: system,
+            user: message,
+            purpose: purpose,
+            meetingID: meetingID,
+            jsonSchema: schema,
+            editorMode: true)
+
+        do {
+            return try decode(Data(raw.utf8))
+        } catch let error as EngineError {
+            throw error
+        } catch {
+            throw EngineError.permanent(
+                "claude -p \(label) structured_output was not schema-shaped JSON: \(error)")
+        }
+    }
+
+    /// N4: one public digest-editor invocation is exactly one subprocess
+    /// attempt — the activation owns the retries, so the generic account
+    /// helper's internal transient retries are disabled here.
+    public func editDigest(
+        _ request: DigestEditorRequest, purpose: CloudSpendPurpose
+    ) async throws -> DigestEditorResult {
+        try await chain.run { try await self.editDigestBody(request, purpose: purpose) }
+    }
+
+    private func editDigestBody(
+        _ request: DigestEditorRequest, purpose: CloudSpendPurpose
+    ) async throws -> DigestEditorResult {
+        DigestEditorResult(
+            operations: try await editBody(
+                system: DigestEditorWireContract.systemPrompt,
+                user: { DigestEditorWireContract.userMessage(for: request) },
+                schema: DigestEditorWireContract.schemaJSON,
+                label: "digest-editor",
+                meetingID: request.meetingID,
+                purpose: purpose,
+                decode: DigestEditorWireContract.decodeOperations(from:)),
+            usage: EngineUsage(inputUnits: nil, outputUnits: nil, estimatedCostUSD: 0.0))
     }
 
     private func generateNotesBody(_ request: NotesRequest, purpose: CloudSpendPurpose) async throws -> NotesResult {
@@ -725,11 +832,12 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine {
         """
 
     /// Coerce a `-p` notes JSON object to the schema's expected field TYPES before
-    /// decoding. The CLI has NO server-side json_schema enforcement, so the model can
-    /// emit a String field as an array (observed: `detailed_notes`), a scalar where an
-    /// array is expected, loose action-item shapes, or an out-of-range enum. Rather
-    /// than fail the entire notes on a type mismatch, normalize each known field.
-    /// No-op when the JSON is already schema-shaped (the API/MLX path never hits this).
+    /// decoding. The notes call rides `--json-schema`, so its `structured_output` is
+    /// already schema-shaped and this is a no-op; it guards the fallback path, where a
+    /// call whose answer came back in `result` can carry a String field as an array
+    /// (observed: `detailed_notes`), a scalar where an array is expected, loose
+    /// action-item shapes, or an out-of-range enum. Rather than fail the entire notes
+    /// on a type mismatch, normalize each known field. (The API/MLX path never hits this.)
     static func coerceNotesJSON(_ json: String) -> String {
         guard let data = json.data(using: .utf8),
             var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]

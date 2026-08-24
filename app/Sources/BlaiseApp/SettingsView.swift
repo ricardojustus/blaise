@@ -24,6 +24,9 @@ struct SettingsRootView: View {
             AutomationTab()
                 .tabItem { Label("Automation", systemImage: "bell.badge") }
                 .tag(1)
+            NotesSettingsTab()
+                .tabItem { Label("Notes", systemImage: "note.text") }
+                .tag(5)
             GlossaryTab()
                 .tabItem { Label("Glossary", systemImage: "character.book.closed") }
                 .tag(2)
@@ -35,6 +38,45 @@ struct SettingsRootView: View {
                 .tag(4)
         }
         .frame(width: 620, height: 600)
+    }
+}
+
+// MARK: - Notes tab
+
+/// Where margin notes appear in a meeting's notes. The choice is global and
+/// takes effect immediately in any open notes pane.
+struct NotesSettingsTab: View {
+    @Environment(AppEnvironment.self) private var appEnv
+    @Environment(NotesPresentationHolder.self) private var presentation
+
+    var body: some View {
+        Form {
+            Section("Margin notes") {
+                Picker(
+                    "Where your notes appear",
+                    selection: Binding(
+                        get: { presentation.marginNotesPlacement },
+                        set: { value in
+                            Task { await appEnv.notesPresentation.setPlacement(value, in: appEnv.settings) }
+                        })
+                ) {
+                    ForEach(MarginNotesPlacement.allCases, id: \.self) { placement in
+                        Text(placement.displayName).tag(placement)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                Text(presentation.marginNotesPlacement.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(
+                    "Corrections always appear under the block you corrected, whichever option you pick."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(.vertical, 8)
     }
 }
 
@@ -528,6 +570,7 @@ struct EnginesSettingsTab: View {
 }
 
 private struct EngineSlotSection: View {
+    @Environment(AppEnvironment.self) private var appEnv
     @Bindable var model: EngineSettingsModel
     let slot: EngineSlot
     let title: String
@@ -541,7 +584,19 @@ private struct EngineSlotSection: View {
                 selection: Binding(
                     get: { model.selectedID(slot) },
                     set: { newValue in
-                        Task { await model.select(newValue, slot: slot) }
+                        Task {
+                            await model.select(newValue, slot: slot)
+                            // Corrections left pending under an engine that
+                            // could not edit them have no timer waiting; the
+                            // new selection is what makes them live again.
+                            if slot == .summarization {
+                                await appEnv.pipeline
+                                    .rearmPendingNotesEditorActivationsIfEngineCanEdit()
+                                // Same for a digest debt parked under an engine
+                                // that could not edit digests.
+                                await appEnv.pipeline.resumeOwedSettles()
+                            }
+                        }
                     })
             ) {
                 ForEach(rows) { row in
@@ -693,6 +748,7 @@ private struct EngineConfigField: View {
                 // G14 H1: the same key-save also self-heals digest-pending
                 // meetings (re-fires generateDigest, never generateNotes).
                 await appEnv.pipeline.resumePendingDigests()
+                await appEnv.pipeline.resumeOwedSettles()
             }
         }
     }
@@ -861,6 +917,7 @@ private struct IdentitySection: View {
 
 private struct HandoffSection: View {
     @Bindable var model: HandoffSettingsModel
+    @Environment(AppEnvironment.self) private var appEnv
 
     var body: some View {
         Section("Evidence Store") {
@@ -972,7 +1029,14 @@ private struct HandoffSection: View {
             HStack {
                 Spacer()
                 Button("Save Handoff Settings") {
-                    Task { await model.save() }  // valid → automatic worker kick
+                    Task {
+                        await model.save()  // valid → automatic worker kick
+                        // A digest debt parked while the toggle was OFF is not
+                        // actionable; turning the toggle ON is what makes it so.
+                        if model.includeMemoryDigest {
+                            await appEnv.pipeline.resumeOwedSettles()
+                        }
+                    }
                 }
             }
         }

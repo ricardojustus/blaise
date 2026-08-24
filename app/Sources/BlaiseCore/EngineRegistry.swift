@@ -99,6 +99,20 @@ public struct EngineResolver: Sendable {
     public func resolveSummarization() async throws -> ResolvedEngine<any SummarizationEngine> {
         let effectiveID = try await settings.get(Self.summarizationSettingsKey, as: String.self)
             ?? EngineDefaults.summarizationEngineID
+        guard let resolved = Self.resolveSummarization(id: effectiveID, registry: registry) else {
+            throw EngineError.noEnginesRegistered(slot: "summarization")
+        }
+        return resolved
+    }
+
+    /// The registry half of summarization resolution: precedence rules 1 and 2
+    /// applied to an already-effective id, with no settings read. `nil` is the
+    /// empty slot. Anything that needs to know WHICH engine a selection
+    /// actually resolves to — a run, or a surface asking what that engine can
+    /// do — asks through here, so the answers cannot diverge.
+    public static func resolveSummarization(
+        id effectiveID: String, registry: EngineRegistry
+    ) -> ResolvedEngine<any SummarizationEngine>? {
         if let engine = registry.summarizationEngine(id: effectiveID) {
             return ResolvedEngine(engine: engine, usedFallback: false)
         }
@@ -112,6 +126,6 @@ public struct EngineResolver: Sendable {
         }) ?? registry.summarizationEngines.first {
             return ResolvedEngine(engine: substitute, usedFallback: true)
         }
-        throw EngineError.noEnginesRegistered(slot: "summarization")
+        return nil
     }
 }

@@ -167,8 +167,10 @@ import Testing
         // (F1: processing_queue substrate) + v16 (F2: notes_fts) + v17 (T3.1:
         // scoped_alias_bindings column) + v18 (C15: meeting source CHECK
         // rebuild for slack) + v19 (G5 v1.5:
-        // handoff_queue.delivered_endpoint delivery provenance) = 19.
-        #expect(health.schemaVersion == 19)
+        // handoff_queue.delivered_endpoint delivery provenance) + v20
+        // (meeting_correction table + its meeting index) + v21 (N2:
+        // cloud_spend_receipt purpose-CHECK rebuild) = 21.
+        #expect(health.schemaVersion == 22)
         #expect(health.journalMode == "wal")
     }
 }

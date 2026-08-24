@@ -584,6 +584,135 @@ public final class BlaiseDatabase: Sendable {
                 t.add(column: "delivered_endpoint", .text) // nullable; destination identity
             }
         }
+        // Additive: span-anchored user corrections and margin notes on a
+        // finished meeting. Durable rows survive every re-run (synthesis
+        // re-reads them); anchoring is quote + section + occurrence. No
+        // payload input, so re-materialization byte-equality is untouched.
+        migrator.registerMigration("v20") { db in
+            try db.create(table: "meeting_correction") { t in
+                t.primaryKey("id", .text) // ULID
+                t.column("meeting_id", .text).notNull()
+                    .references("meeting", onDelete: .cascade)
+                t.column("kind", .text).notNull() // 'understanding' | 'annotation'
+                t.column("section", .text).notNull()
+                t.column("quoted_text", .text).notNull()
+                t.column("occurrence", .integer).notNull().defaults(to: 0)
+                t.column("user_text", .text).notNull()
+                t.column("status", .text).notNull().defaults(to: "pending")
+                t.column("created_at", .datetime).notNull()
+                t.column("applied_at", .datetime)
+            }
+            // Every read is "this meeting's rows, in creation order" (the
+            // store's only query shape, run on every synthesis, every re-mint
+            // and every notes-pane load), and the FK cascade deletes by
+            // meeting_id too. Without this SQLite scans the whole table.
+            try db.create(
+                index: "idx_meeting_correction_meeting",
+                on: "meeting_correction", columns: ["meeting_id", "created_at", "id"])
+        }
+        // N2: widen only the frozen receipt-purpose CHECK for `notes-editor`.
+        // The temporary table is deliberately UNINDEXED. v14's `.indexed()`
+        // shorthand left its derived temporary index name attached after the
+        // table rename; declaring another index before dropping the old table
+        // would collide on every already-migrated database. Dropping the old
+        // table removes that stale index, after which the canonical index is
+        // recreated explicitly.
+        migrator.registerMigration("v21") { db in
+            try db.create(table: "cloud_spend_receipt_v21") { t in
+                t.primaryKey("id", .text)
+                t.column("timestamp", .datetime).notNull()
+                t.column("month_key", .text).notNull()
+                t.column("engine_id", .text).notNull()
+                t.column("model", .text).notNull()
+                t.column("purpose", .text).notNull()
+                    .check { CloudSpendPurpose.allCases.map(\.rawValue).contains($0) }
+                t.column("meeting_id", .text)
+                    .references("meeting", onDelete: .setNull)
+                t.column("input_tokens", .integer).notNull()
+                t.column("output_tokens", .integer).notNull()
+                t.column("cost_usd", .double).notNull()
+                t.column("note", .text)
+            }
+            try db.execute(sql: """
+                INSERT INTO cloud_spend_receipt_v21
+                  (id, timestamp, month_key, engine_id, model, purpose, meeting_id,
+                   input_tokens, output_tokens, cost_usd, note)
+                SELECT
+                  id, timestamp, month_key, engine_id, model, purpose, meeting_id,
+                  input_tokens, output_tokens, cost_usd, note
+                FROM cloud_spend_receipt
+                """)
+            try db.drop(table: "cloud_spend_receipt")
+            try db.rename(table: "cloud_spend_receipt_v21", to: "cloud_spend_receipt")
+            try db.execute(sql: """
+                CREATE INDEX "index_cloud_spend_receipt_on_month_key"
+                ON "cloud_spend_receipt"("month_key")
+                """)
+        }
+        // N4: the two owed-work bits, the provenance-stamp column, and the
+        // receipt-purpose CHECK widening for `digest-editor`.
+        //
+        // `digest_edit_owed` / `delivery_owed` are ordinary row state carrying
+        // durable settlement intent: a mutation records what the settle chain
+        // still owes IN THE SAME TRANSACTION, so quit never waits and a crash
+        // never loses the debt (the launch sweep reconstructs intent from the
+        // bits alone).
+        //
+        // `digest_prompt_version` is the version a payload minted from this row
+        // is STAMPED with — hash stability for re-mints — never a claim about
+        // which prompt authored the bytes (the authoring version of a legacy
+        // digest is unknowable). The backfill writes `md-v6` into every
+        // digest-bearing row: that is the value every re-mint stamps today, so
+        // no queued payload's bytes change across the upgrade. NULL means "no
+        // digest". `EvidencePayloadBuilder`'s explicit `digestPromptVersion:`
+        // parameter keeps OVERRIDING the column — that parameter is
+        // `HandoffWorker.rematerialize`'s recovery axis, and a pre-md-v6-stamped
+        // queued payload must stay recoverable after this migration.
+        //
+        // The receipts rebuild follows v21's pattern verbatim (un-indexed temp
+        // table, INSERT…SELECT, drop, rename, explicit index).
+        migrator.registerMigration("v22") { db in
+            try db.alter(table: "meeting_notes") { t in
+                t.add(column: "digest_edit_owed", .integer).notNull().defaults(to: 0)
+                t.add(column: "delivery_owed", .integer).notNull().defaults(to: 0)
+                t.add(column: "digest_prompt_version", .text)
+            }
+            try db.execute(sql: """
+                UPDATE meeting_notes SET digest_prompt_version = 'md-v6'
+                WHERE memory_digest IS NOT NULL
+                """)
+
+            try db.create(table: "cloud_spend_receipt_v22") { t in
+                t.primaryKey("id", .text)
+                t.column("timestamp", .datetime).notNull()
+                t.column("month_key", .text).notNull()
+                t.column("engine_id", .text).notNull()
+                t.column("model", .text).notNull()
+                t.column("purpose", .text).notNull()
+                    .check { CloudSpendPurpose.allCases.map(\.rawValue).contains($0) }
+                t.column("meeting_id", .text)
+                    .references("meeting", onDelete: .setNull)
+                t.column("input_tokens", .integer).notNull()
+                t.column("output_tokens", .integer).notNull()
+                t.column("cost_usd", .double).notNull()
+                t.column("note", .text)
+            }
+            try db.execute(sql: """
+                INSERT INTO cloud_spend_receipt_v22
+                  (id, timestamp, month_key, engine_id, model, purpose, meeting_id,
+                   input_tokens, output_tokens, cost_usd, note)
+                SELECT
+                  id, timestamp, month_key, engine_id, model, purpose, meeting_id,
+                  input_tokens, output_tokens, cost_usd, note
+                FROM cloud_spend_receipt
+                """)
+            try db.drop(table: "cloud_spend_receipt")
+            try db.rename(table: "cloud_spend_receipt_v22", to: "cloud_spend_receipt")
+            try db.execute(sql: """
+                CREATE INDEX "index_cloud_spend_receipt_on_month_key"
+                ON "cloud_spend_receipt"("month_key")
+                """)
+        }
         return migrator
     }
 
@@ -653,18 +782,27 @@ public final class BlaiseDatabase: Sendable {
     /// in ONE database transaction — no crash point can produce a `ready`
     /// meeting without a queued/delivered handoff row. The payload file must
     /// already exist at `payloadPath` (relative to the data root).
+    ///
+    /// `pendingMarker`: a caller that still has durable work to do AFTER this
+    /// commit (the notes-only paths promote `notes.md` from the row this
+    /// transaction installs) passes its `last_processing_error` marker, which
+    /// commits WITH the row instead of the usual clear. Process death then
+    /// leaves the marker behind and the existing self-heal converges the file
+    /// to the row; the caller clears the marker once its work is done.
     @discardableResult
     public func finalizeMeetingProcessing(
         meetingID: MeetingID,
         versionHash: String,
         payloadPath: String,
-        notes: MeetingNotes
+        notes: MeetingNotes,
+        pendingMarker: String? = nil
     ) async throws -> HandoffItem {
         try await finalizeMeetingProcessing(
             meetingID: meetingID,
             versionHash: versionHash,
             payloadPath: payloadPath,
             notes: notes,
+            pendingMarker: pendingMarker,
             midTransactionHook: nil
         )
     }
@@ -676,6 +814,7 @@ public final class BlaiseDatabase: Sendable {
         versionHash: String,
         payloadPath: String,
         notes: MeetingNotes,
+        pendingMarker: String? = nil,
         midTransactionHook: (@Sendable () throws -> Void)?
     ) async throws -> HandoffItem {
         try requirePayloadFile(at: payloadPath)
@@ -685,7 +824,7 @@ public final class BlaiseDatabase: Sendable {
                 throw BlaiseDatabaseError.meetingNotFound(meetingID)
             }
             meeting.status = .ready
-            meeting.lastProcessingError = nil
+            meeting.lastProcessingError = pendingMarker
             // Deliberately NO updatedAt bump: the payload was built from the
             // pre-finalize row and embeds its `updated_at_ms`; mutating a
             // builder input AFTER the payload is minted would make C8's
