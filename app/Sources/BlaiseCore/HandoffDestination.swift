@@ -60,9 +60,11 @@ public enum HandoffDestination: Sendable, Equatable {
         public static let removeSupersededPayloads = "handoff.removeSupersededPayloads"
         /// Audio delivery (G5 v1.3); destination-independent. Absent ⇒ OFF (the
         /// privacy default). `true` copies the meeting's retained `audio*.m4a`
-        /// set into the destination meeting dir after the sidecar — a syncing
-        /// destination (iCloud/network) then means audio leaves the machine. The
-        /// payload bytes are unchanged (no audio field).
+        /// set into the destination meeting dir after the sidecar. Whether that
+        /// takes audio OFF the machine is decided by the destination, not by this
+        /// key: `.localFolder` lands a copy on this Mac (off-device only if that
+        /// folder syncs — iCloud/network), `.ssh` uploads it to the remote host.
+        /// The payload bytes are unchanged (no audio field).
         public static let deliverAudio = "handoff.deliverAudio"
         /// Transcript Markdown sidecar; absent ⇒ OFF. Applies to BOTH
         /// destinations: writes `<slug>-transcript.md` next to the notes

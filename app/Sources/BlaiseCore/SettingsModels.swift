@@ -222,8 +222,11 @@ public final class HandoffSettingsModel {
     /// evidence is unrecoverable, an untidy folder is not.
     public var removeSupersededPayloads = false
     /// G5 v1.3: deliver the meeting's retained audio to the destination. Default
-    /// OFF (the privacy default). ON copies `audio*.m4a` — a syncing destination
-    /// then means audio leaves the machine. Destination-independent.
+    /// OFF (the privacy default). ON copies `audio*.m4a` to whichever destination
+    /// is active: `.localFolder` writes them into a folder on THIS Mac (they
+    /// leave only if that folder itself syncs), `.ssh` uploads them to the remote
+    /// host. The KEY is destination-independent; the consequence is not, which is
+    /// why the Settings caption is written per destination.
     public var deliverAudio = false
     /// G14: "Include memory digest" — the second machine-facing render that
     /// the knowledge graph's graph extractor reads. Default ON. OFF ⇒ no second synthesis

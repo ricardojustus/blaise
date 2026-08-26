@@ -995,9 +995,11 @@ private struct HandoffSection: View {
 
             // G5 v1.3: audio delivery. Default OFF (the privacy default) — the
             // headline is stated plainly here and in the README/contract doc.
+            // The toggle is destination-INDEPENDENT but its consequence is not,
+            // so the caption follows the picker above (see audioDeliveryCaption).
             Toggle("Include audio recordings", isOn: $model.deliverAudio)
                 .accessibilityLabel("Include audio recordings in the destination")
-            Text("Off by default. On copies each meeting's recordings to the destination; a destination that syncs (iCloud/network) means audio leaves this machine. Applies to each meeting's NEXT delivery — there is no retroactive sweep.")
+            Text(audioDeliveryCaption)
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -1039,6 +1041,23 @@ private struct HandoffSection: View {
                     }
                 }
             }
+        }
+    }
+
+    /// The privacy answer for audio delivery IS the destination, so the caption
+    /// says what actually happens to the bytes for the destination selected
+    /// above. The single sentence this replaces ("a destination that syncs
+    /// (iCloud/network) means audio leaves this machine") was wrong in both
+    /// directions: it read as "audio is shipped off the Mac" to Local Folder
+    /// users — where the recordings are copied into a folder that stays here —
+    /// and it never named the SSH upload, the one case where audio leaves
+    /// unconditionally.
+    private var audioDeliveryCaption: String {
+        switch model.destinationKind {
+        case .localFolder:
+            return "Off by default. On copies each meeting's recordings into the folder above, on this Mac — they leave this machine only if that folder itself syncs (iCloud, Dropbox, a network share). Applies to each meeting's NEXT delivery — there is no retroactive sweep."
+        case .ssh:
+            return "Off by default. On uploads each meeting's recordings to the Evidence Store host above, so the audio does leave this Mac. Applies to each meeting's NEXT delivery — there is no retroactive sweep."
         }
     }
 

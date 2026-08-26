@@ -1058,4 +1058,23 @@ private func audioNames(_ dir: URL) -> [String] {
             }
         }
     }
+
+    /// The audio caption named only the syncing-destination vector ("a
+    /// destination that syncs (iCloud/network) means audio leaves this
+    /// machine"), which was wrong in both directions: it read as "audio is
+    /// shipped off the Mac" to Local Folder users, whose recordings are copied
+    /// into a folder that stays here, and it never named the SSH upload — the
+    /// one destination where audio leaves unconditionally. Wherever the toggle
+    /// is documented, BOTH destinations must be spelled out.
+    @Test func audioDeliveryDocsNameBothDestinations() throws {
+        for rel in ["README.md", "docs/handoff.md"] {
+            let text = flat(try read(rel))
+            #expect(
+                text.contains("Local Folder"),
+                "\(rel): the audio-delivery copy must say what a Local Folder destination does")
+            #expect(
+                text.contains("Evidence Store (SSH)"),
+                "\(rel): the audio-delivery copy must say that an SSH destination uploads audio")
+        }
+    }
 }
