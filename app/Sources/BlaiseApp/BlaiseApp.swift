@@ -150,6 +150,8 @@ struct BlaiseApplication: App {
                     RewriteNotesCommandButton()
                         .environment(environment)
                         .environment(environment.uiState)
+                    ExportPDFCommandButton()
+                        .environment(environment.uiState)
                 }
             }
             CommandGroup(after: .textEditing) {
@@ -245,6 +247,23 @@ struct RewriteNotesCommandButton: View {
                     rewrite: { try await pipeline.rewriteNotes(meetingID: $0) })
             }
         }
+        .disabled(uiState.selectedMeetingID == nil)
+    }
+}
+
+/// Asks the detail view showing the selected meeting to open its export sheet.
+///
+/// The `uiState` read lives in this child view for the same reason as its
+/// neighbour above: reading the selection in the scene builder would make the
+/// whole scene depend on it.
+struct ExportPDFCommandButton: View {
+    @Environment(AppUIState.self) private var uiState
+
+    var body: some View {
+        Button("Export as PDF…") {
+            uiState.pdfExportRequest = uiState.selectedMeetingID
+        }
+        .keyboardShortcut("e", modifiers: [.command, .shift])
         .disabled(uiState.selectedMeetingID == nil)
     }
 }

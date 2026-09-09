@@ -22,6 +22,10 @@ let package = Package(
         // generates its Bundle.module — the sparkle burst is hand-rolled in
         // FluidoKit instead.)
         .package(url: "https://github.com/EmergeTools/Pow", exact: "1.0.6"),
+        // PDF export: Apple's CommonMark/GFM parser. The stored notes markdown
+        // is an open subset (engine-authored), so the HTML derivation reads a
+        // real parse tree instead of a hand converter. Resolves swift-cmark too.
+        .package(url: "https://github.com/swiftlang/swift-markdown.git", exact: "0.8.0"),
     ],
     targets: [
         .target(
@@ -29,6 +33,7 @@ let package = Package(
             dependencies: [
                 .product(name: "GRDB", package: "GRDB.swift"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                .product(name: "Markdown", package: "swift-markdown"),
             ],
             resources: [
                 // .copy keeps the python drivers byte-exact (no processing).
@@ -46,6 +51,9 @@ let package = Package(
                 .copy("Resources/stoplist_user.txt"),
                 .copy("Resources/stoplist_exclusions.txt"),
                 .copy("Resources/br_common_names.txt"),
+                // PDF export: the HTML skeleton and one CSS file per style.
+                // .copy keeps the directory, so the bundle path is pdf/<name>.
+                .copy("Resources/pdf"),
             ]
         ),
         .executableTarget(
@@ -67,12 +75,13 @@ let package = Package(
             name: "BlaiseCoreTests",
             dependencies: ["BlaiseCore"]
         ),
-        // BlaiseApp unit tests: headless (no scene/window). Used to pin the
-        // Settings-scene observation invariant (field bug 12/06) — that a
-        // recording-timer state tick does not invalidate the surfaces the
-        // Settings scene depends on. Depends on the executable target so the
-        // @MainActor @Observable holders (CaptureStatusHolder) are reachable
-        // via @testable import.
+        // BlaiseApp unit tests: headless (no scene/window) with ONE exception —
+        // the PDF-export pagination test prints through a hidden borderless
+        // window. Used to pin the Settings-scene observation invariant (field
+        // bug 12/06) — that a recording-timer state tick does not invalidate
+        // the surfaces the Settings scene depends on. Depends on the
+        // executable target so the @MainActor @Observable holders
+        // (CaptureStatusHolder) are reachable via @testable import.
         .testTarget(
             name: "BlaiseAppTests",
             dependencies: ["BlaiseApp", "BlaiseCore"]

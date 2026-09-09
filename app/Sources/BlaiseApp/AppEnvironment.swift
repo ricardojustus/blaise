@@ -56,6 +56,9 @@ final class AppUIState {
     /// Set by "Correct Selection…" / "Add Note…"; the notes pane consumes it
     /// against whatever the user has selected, or the block they last aimed at.
     var notesEditingRequest: NotesEditingRequest?
+    /// Set by File ▸ Export as PDF…; the detail view that owns the meeting
+    /// consumes it (back to nil) and opens the export sheet.
+    var pdfExportRequest: MeetingID?
 
     /// What the open notes surface can currently accept.
     struct NotesEditingContext: Equatable {
@@ -204,6 +207,10 @@ final class AppEnvironment {
     let activity: PipelineActivityHolder
     let engineSettings: EngineSettingsModel
     let notesPresentation = NotesPresentationHolder()
+    /// The ONE exporter of the app: `NSPrintOperation.current` is a per-thread
+    /// singleton, so attempts from every window serialise through this
+    /// instance's gate.
+    let pdfExporter = PDFExporter()
     let uiState = AppUIState()
     // C11: live capture.
     let recordingController: RecordingController

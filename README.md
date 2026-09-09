@@ -72,6 +72,8 @@ off by default.
   leaving exactly one current file per meeting.
 - **Search and library.** Full-text search across every transcript and note, with
   accent-insensitive matching.
+- **Export notes as a PDF.** Three styles (Atlas, Ledger, Clean), A4 or Letter, Save…
+  or Share; rendered offline from the stored notes with no external resources.
 
 ## Privacy model
 
@@ -281,6 +283,8 @@ for the attribution that must be preserved on redistribution.
 - [FluidAudio](https://github.com/FluidInference/FluidAudio) (Apache-2.0) —
   Parakeet TDT v3 CoreML ASR runtime.
 - [GRDB.swift](https://github.com/groue/GRDB.swift) (MIT) — SQLite persistence.
+- [swift-markdown](https://github.com/swiftlang/swift-markdown) (Apache-2.0) — Markdown
+  parsing for the PDF export.
 - [Pow](https://github.com/EmergeTools/Pow) (MIT) — UI micro-interactions.
 - [uv](https://github.com/astral-sh/uv) (MIT/Apache-2.0) — vendored binary that
   provisions the app-managed Python environment for the Whisper engine

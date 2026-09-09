@@ -2,6 +2,25 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [1.7.0] — 09/09/2026
+
+Meeting notes export to PDF.
+
+### Added
+- **Export PDF.** From a finished meeting's toolbar (or ⇧⌘E), export the notes as a
+  PDF in one of three styles — Atlas, Ledger, Clean — with a filename you can edit,
+  then Save… or Share (AirDrop, Mail, Messages…). Two toggles on the sheet: include
+  your own action items; include margin notes (shown in flow). The export is rendered
+  from the stored notes exactly as you see them, with a page stamp on every page.
+- **Settings → PDF:** paper size (A4 or Letter). The Save panel remembers the last
+  folder.
+
+### Under the hood
+- Rendering goes through WebKit's print path with a strict no-network policy (no
+  external resources, no scripts); one export runs at a time app-wide, and a
+  failed export cleans up after itself and shows one alert.
+- New dependency: swift-markdown 0.8.0 (Apple), used only for the export's HTML.
+
 ## [1.6.0] — 24/08/2026
 
 The biggest release since 1.0: meeting notes are now correctable — select a passage,

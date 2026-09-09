@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<title>Kickoff Quoll Harbor</title>
+<style>
+*{box-sizing:border-box}
+:root{--inset:38mm;--ink:#1a1916;--accent:#2f3f6e;--rule:#c9c5bb;--soft:#6c675d;--label:#8a8477}
+@page{size:A4;margin:22mm 18mm 22mm 18mm}
+body{margin:0;font-family:ui-serif,Georgia,serif;font-size:10pt;line-height:1.48;color:var(--ink)}
+main{padding-left:var(--inset)}
+.front{margin:0 0 9mm calc(-1*var(--inset))}
+.kicker{font-family:-apple-system,system-ui,sans-serif;font-size:8pt;letter-spacing:.16em;text-transform:uppercase;color:var(--label);margin-bottom:4mm}
+h1{font-weight:600;font-size:26pt;line-height:1.12;margin:0 0 5mm;letter-spacing:-.005em;text-wrap:balance}
+.meta{display:grid;grid-template-columns:var(--inset) 1fr;row-gap:1.2mm;font-size:9.5pt;border-top:1px solid var(--ink);border-bottom:1px solid var(--rule);padding:3mm 0}
+.meta dt{font-family:-apple-system,system-ui,sans-serif;font-size:7.5pt;letter-spacing:.12em;text-transform:uppercase;color:var(--label);padding-top:1pt}
+.meta dd{margin:0}
+h2{font-family:-apple-system,system-ui,sans-serif;font-size:8pt;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);margin:7mm 0 2.5mm calc(-1*var(--inset));padding-bottom:1.2mm;border-bottom:1px solid var(--rule)}
+h2:first-of-type{margin-top:0}
+h3{font-weight:600;font-size:12pt;margin:4mm 0 1.5mm}
+h4{font-weight:600;font-size:10.5pt;margin:3mm 0 1.5mm}
+p{margin:0 0 2.5mm}
+ul,ol{margin:0 0 2.5mm;padding-left:5mm}
+li{margin-bottom:1.2mm}
+.lede{font-size:12pt;line-height:1.45;font-style:italic}
+.aside{margin:2mm 0 3mm;padding:2.5mm 4mm;border-left:1.5px solid var(--accent);font-family:-apple-system,system-ui,sans-serif;font-size:7.8pt;line-height:1.4;color:var(--soft)}
+.aside strong{display:block;font-size:6.8pt;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:.8mm;font-weight:600}
+ol.dec{list-style:none;padding:0;counter-reset:d}
+ol.dec li{counter-increment:d;display:grid;grid-template-columns:8mm 1fr;gap:0 2mm;margin-bottom:2mm}
+ol.dec li::before{content:counter(d,decimal-leading-zero);font-size:13pt;color:var(--accent);line-height:1.1}
+.items{list-style:none;padding:0}
+.items li{display:grid;grid-template-columns:1fr 26mm;gap:4mm;padding:1.6mm 0;border-bottom:1px dotted var(--rule)}
+.box{display:none}
+.items .who{font-family:-apple-system,system-ui,sans-serif;font-size:8pt;color:var(--soft);text-align:right;padding-top:.6mm}
+.mine{background:#f6f4ee;margin-left:calc(-1*var(--inset));padding:4mm 5mm 3mm;border-left:2px solid var(--accent)}
+.mine h2{margin:0 0 2mm;border:0;padding:0}
+.mine .items li{border-bottom-color:#d6d1c4}
+code{font-family:ui-monospace,Menlo,monospace;font-size:9pt;background:#f1efe9;padding:0 .3em;border-radius:2px}
+pre{font-family:ui-monospace,Menlo,monospace;font-size:9pt;background:#f1efe9;padding:2mm 3mm;white-space:pre-wrap}
+table{border-collapse:collapse;font-size:9pt;margin:0 0 2.5mm}
+th,td{border-bottom:1px solid var(--rule);padding:1.2mm 3mm 1.2mm 0;text-align:left;vertical-align:top}
+hr{border:0;border-top:1px solid var(--rule);margin:4mm 0}
+.colophon{margin:9mm 0 0 calc(-1*var(--inset));font-family:-apple-system,system-ui,sans-serif;font-size:7.5pt;letter-spacing:.1em;text-transform:uppercase;color:var(--label);display:flex;align-items:center;gap:2.5mm}
+.colophon b{font-weight:600;color:var(--accent)}
+.mark{width:5mm;border-top:1px solid var(--rule)}
+
+</style>
+</head>
+<body>
+<main>
+<header class="front">
+<div class="kicker">Meeting notes</div>
+<h1>Kickoff Quoll Harbor</h1>
+<dl class="meta">
+<dt>Date</dt><dd>21/08/2026</dd>
+<dt>Time</dt><dd>14:00–15:10</dd>
+<dt>Attendees</dt><dd>Marina Solano, Dev Okafor, Tomás Ferreira</dd>
+</dl>
+</header>
+<h2>Summary</h2>
+<p class="lede">The team moved the Quoll Harbor launch window to November.</p>
+<aside class="aside"><strong>Your note:</strong> Confirm with the partner first</aside>
+<aside class="aside"><strong>Your note:</strong> And tell the design team</aside>
+<h2>Detailed notes</h2>
+<h4>Launch window</h4>
+<p>The closed beta opens on 20/10/2026. See <span class="link">the plan</span> (https://vexatron.test/plan) and the <span class="link">board</span> (https://vexatron.test/board).</p>
+<ul>
+<li class="task done">☑ Draft the rollout note</li>
+<li class="task todo">☐ Book the load test</li>
+</ul>
+<h3>Team shape</h3>
+<p>Offline sync stays the central risk.</p>
+<h2>Decisions</h2>
+<ol class="dec">
+<li>Closed beta starts on 20/10/2026</li>
+<li>Budget approved without contingency</li>
+</ol>
+<aside class="aside"><strong>Your note</strong> (on “Closed beta starts on 20/10/2026”): Check the freeze calendar</aside>
+<h2>Action items</h2>
+<ul class="items">
+<li><span class="box"></span><span class="text">Prototype the conflict merge</span><span class="who">Dev Okafor</span></li>
+<li><span class="box"></span><span class="text">Publish the revised schedule</span></li>
+</ul>
+<h2>Your notes</h2>
+<ul>
+<li>Keep this one loose <em>(on “a quote that no longer matches”)</em></li>
+</ul>
+<div class="colophon"><span class="mark"></span>Made with <b>Blaise</b></div>
+</main>
+</body>
+</html>

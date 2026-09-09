@@ -30,6 +30,10 @@ struct MeetingDetailView: View {
     @State private var regenerating = false
     /// G10: the two-step delete confirmation (the user directive).
     @State private var showDeleteConfirm = false
+    /// The export sheet's snapshot, read once when the sheet opens.
+    @State private var pdfExportInput: PDFExportInput?
+    /// A capture is in flight: a second press must not open a second sheet.
+    @State private var pdfExportOpening = false
     /// Fluido: the header's one-shot settle entrance — armed per selection
     /// (this view is recreated via `.id(id)`), disarmed after the first
     /// landing so tab flips never replay it.
@@ -95,6 +99,17 @@ struct MeetingDetailView: View {
                     .disabled(regenerating)
                     .help("Re-run transcription and notes from the retained audio")
                 }
+            }
+            // Export is a primary user action, so it stands on its own rather
+            // than joining the maintenance menu below.
+            ToolbarItem(placement: .secondaryAction) {
+                Button {
+                    openPDFExport()
+                } label: {
+                    Label("Export PDF", systemImage: "arrow.down.doc")
+                }
+                .disabled(model?.notes == nil)
+                .help("Export these notes as a PDF")
             }
             // Keep the toolbar's hierarchy calm: the current view and any
             // active Cancel/Process action stay direct; maintenance, info, and
@@ -172,10 +187,34 @@ struct MeetingDetailView: View {
             let id = meetingID
             Task { await pipeline.settleViewDetached(id) }
         }
+        .sheet(item: $pdfExportInput) { input in
+            PDFExportSheet(
+                input: input, exporter: appEnv.pdfExporter, settings: appEnv.settings)
+        }
+        .onChange(of: uiState.pdfExportRequest) {
+            guard
+                consumePDFExportRequest(
+                    uiState: uiState, meetingID: meetingID, hasNotes: model?.notes != nil,
+                    sheetPresented: pdfExportInput != nil || pdfExportOpening)
+            else { return }
+            openPDFExport()
+        }
         .onChange(of: uiState.detailRequest) {
             applyDetailRequest()
         }
         .onAppear { applyDetailRequest() }
+    }
+
+    /// The export works from ONE read of the stores, taken here.
+    private func openPDFExport() {
+        guard pdfExportInput == nil, !pdfExportOpening else { return }
+        pdfExportOpening = true
+        let database = appEnv.database
+        let id = meetingID
+        Task {
+            pdfExportInput = try? await PDFExportInput.capture(database: database, meetingID: id)
+            pdfExportOpening = false
+        }
     }
 
     private func applyDetailRequest() {

@@ -48,6 +48,9 @@ struct SettingsRootView: View {
 struct NotesSettingsTab: View {
     @Environment(AppEnvironment.self) private var appEnv
     @Environment(NotesPresentationHolder.self) private var presentation
+    @State private var style = PDFExportSettings.defaultStyle
+    @State private var paper = PDFExportSettings.defaultPaper
+    @State private var colophon = PDFExportSettings.defaultColophon
 
     var body: some View {
         Form {
@@ -74,9 +77,64 @@ struct NotesSettingsTab: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
+
+            Section("PDF export") {
+                Picker(
+                    "Style",
+                    selection: Binding(
+                        get: { style },
+                        set: { value in
+                            style = value
+                            Task { try? await PDFExportSettings.setStyle(value, in: appEnv.settings) }
+                        })
+                ) {
+                    ForEach(PDFStyle.allCases, id: \.self) { style in
+                        Text(style.displayName).tag(style)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                Text(style.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker(
+                    "Paper",
+                    selection: Binding(
+                        get: { paper },
+                        set: { value in
+                            paper = value
+                            Task { try? await PDFExportSettings.setPaper(value, in: appEnv.settings) }
+                        })
+                ) {
+                    ForEach(PDFPaper.allCases, id: \.self) { paper in
+                        Text(paper.displayName).tag(paper)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+
+                Toggle(
+                    "Add the “made with Blaise” line at the end",
+                    isOn: Binding(
+                        get: { colophon },
+                        set: { value in
+                            colophon = value
+                            Task {
+                                try? await PDFExportSettings.setColophon(value, in: appEnv.settings)
+                            }
+                        }))
+
+                Text("These are the starting choices; every export can change its style.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .padding(.vertical, 8)
+        .task {
+            style = await PDFExportSettings.style(from: appEnv.settings)
+            paper = await PDFExportSettings.paper(from: appEnv.settings)
+            colophon = await PDFExportSettings.colophon(from: appEnv.settings)
+        }
     }
 }
 
