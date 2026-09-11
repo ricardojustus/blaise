@@ -4,8 +4,8 @@ Local-first macOS meeting transcription and notes. Blaise records your system
 audio and microphone, transcribes the conversation on-device (Portuguese/English
 code-switching is a first-class case, not an afterthought), and writes structured
 notes with your action items pulled out and made impossible to miss. Audio never
-leaves the app unless you explicitly enable the opt-in audio handoff, which is
-off by default.
+leaves the app unless you explicitly enable audio delivery to a destination you
+choose, which is off by default.
 
 ![Blaise — the Estúdio library view: the meeting list with a selected meeting's notes (demo data)](assets/screenshot-estudio.png)
 
@@ -80,13 +80,16 @@ off by default.
 Blaise is local-first by design, and the privacy boundary is stated honestly:
 
 - **Audio never leaves the app by default** — it stays on this machine unless you
-  explicitly enable the opt-in audio handoff. Recording, retention, and
+  explicitly enable audio delivery to a destination. Recording, retention, and
   transcription are all on-device: there is
   no upload path for audio unless you explicitly enable audio delivery to a destination.
-  The toggle ("Include audio recordings",
-  Settings → Evidence Store) is off by default; turning it on copies a meeting's
-  recordings to your delivery destination, and if that destination syncs (iCloud
-  or a network folder) the audio then leaves this machine. That is the whole
+  The toggle ("Include audio recordings", Settings → Identity & Handoff →
+  Evidence Store) is off by default, and what turning it on means depends on the
+  destination you picked right above it. With a **Local Folder** destination the
+  recordings are copied into that folder on this Mac and stay here — they leave
+  only if the folder itself syncs (iCloud, Dropbox, a network share). With an
+  **Evidence Store (SSH)** destination they are uploaded to the remote host you
+  configured, which does take them off this machine. That is the whole
   exception, stated plainly so you can decide it deliberately.
 - **Voice identification is local and deletable.** Blaise builds a small voice
   print of you — numeric voice embeddings drawn from a few of your own meetings —

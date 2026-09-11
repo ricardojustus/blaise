@@ -5,12 +5,14 @@ off to a destination you choose** — a local folder (for example an Obsidian
 vault) or a remote host over SSH. This is the "bring your own tools" seam: your
 notes and transcript land somewhere your other software can pick them up. By
 default only the generated notes/transcript/metadata are delivered; your audio
-never leaves your Mac unless you explicitly enable audio delivery to a destination
-(see "Audio delivery" below).
+never leaves the app unless you explicitly enable audio delivery, and where it
+then lands is decided by the destination — a local folder receives a copy that
+stays on this Mac, a remote host does not (see "Audio delivery" below).
 
-You pick the destination in **Settings → Handoff**. One destination is active at
-a time. Delivery is automatic, queued, and retried — if the destination is
-offline, the meeting waits and is delivered when it comes back.
+You pick the destination in **Settings → Identity & Handoff → Evidence Store**.
+One destination is active at a time. Delivery is automatic, queued, and retried
+— if the destination is offline, the meeting waits and is delivered when it
+comes back.
 
 ## What gets delivered
 
@@ -76,11 +78,14 @@ Per meeting, into a per-meeting directory:
   (Settings → Evidence Store) turned on, Blaise delivers a meeting's retained
   `audio*.m4a` set (system + mic + part files) into the destination meeting dir
   under their canonical names, after the sidecar. This is the ONLY path by which
-  audio leaves the machine; a destination that syncs (iCloud/network) then carries
-  the recordings off-device. Delivery is failure-isolated from the JSON, idempotent
-  by byte length (an already-delivered file of matching size is skipped), and there
-  is no retroactive sweep — flipping the toggle on back-delivers on each meeting's
-  NEXT delivery only. The payload JSON is unchanged (no audio field), so payload
+  a recording leaves the app, and where it lands depends on the destination: a
+  **Local Folder** receives a copy that stays on this Mac — it goes off-device
+  only if that folder itself syncs (iCloud, Dropbox, a network share) — while an
+  **Evidence Store (SSH)** destination uploads the bytes to the remote host,
+  which does take them off this machine. Delivery is failure-isolated from the
+  JSON, idempotent by byte length (an already-delivered file of matching size is
+  skipped), and there is no retroactive sweep — flipping the toggle on
+  back-delivers on each meeting's NEXT delivery only. The payload JSON is unchanged (no audio field), so payload
   bytes and hashes are stable across the toggle.
 - **Deletion never reaches into the destination.** Deleting a meeting in Blaise
   removes its local data (including any retained audio); it does NOT delete the
