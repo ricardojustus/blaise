@@ -1,7 +1,7 @@
 import BlaiseCore
 import SwiftUI
 
-// Settings scene: Engines / Automation / Glossary / Identity & Handoff / Usage.
+// Settings scene: Engines / Automation / Notes / Glossary / Identity & Handoff / Storage / Usage.
 
 struct SettingsRootView: View {
     // Screenshot scaffolding: BLAISE_DEMO_SCENE=cloud-spend opens the Usage
@@ -33,6 +33,9 @@ struct SettingsRootView: View {
             IdentityHandoffTab()
                 .tabItem { Label("Identity & Handoff", systemImage: "person.crop.circle.badge.checkmark") }
                 .tag(3)
+            StorageSettingsTab()
+                .tabItem { Label("Storage", systemImage: "internaldrive") }
+                .tag(6)
             UsageTab()
                 .tabItem { Label("Usage", systemImage: "chart.bar") }
                 .tag(4)
