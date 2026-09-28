@@ -6,12 +6,14 @@ import SwiftUI
 struct SettingsRootView: View {
     // Screenshot scaffolding: BLAISE_DEMO_SCENE=cloud-spend opens the Usage
     // tab directly (the G7 receipts panel evidence); settings-handoff opens the
-    // Identity & Handoff tab (the G5 destination-picker evidence). Normal
+    // Identity & Handoff tab (the G5 destination-picker evidence);
+    // settings-storage opens the Storage tab (G16). Normal
     // launches default to Engines.
     @State private var selection: Int = {
         switch ProcessInfo.processInfo.environment["BLAISE_DEMO_SCENE"] {
         case "cloud-spend": return 4
         case "settings-handoff": return 3
+        case "settings-storage": return 6
         default: return 0
         }
     }()
