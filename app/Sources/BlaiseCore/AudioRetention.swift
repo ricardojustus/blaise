@@ -103,6 +103,26 @@ public struct AudioUsage: Sendable, Equatable {
     }
 }
 
+/// What a cap sweep would delete (§4). Pure output of `AudioRetention.capPlan`.
+public struct AudioCapPlan: Sendable, Equatable {
+    /// Meetings whose audio to delete, oldest first by `startedAt`.
+    public let meetingIDs: [MeetingID]
+    /// Bytes those deletions free.
+    public let bytesFreed: Int64
+    /// Bytes still over the cap after the plan (> 0 only when the remaining
+    /// audio over the cap is all ineligible; the sweep never forces).
+    public let remainingOverCap: Int64
+
+    public init(meetingIDs: [MeetingID], bytesFreed: Int64, remainingOverCap: Int64) {
+        self.meetingIDs = meetingIDs
+        self.bytesFreed = bytesFreed
+        self.remainingOverCap = remainingOverCap
+    }
+
+    public static let empty = AudioCapPlan(meetingIDs: [], bytesFreed: 0, remainingOverCap: 0)
+    public var isEmpty: Bool { meetingIDs.isEmpty }
+}
+
 public enum AudioRetention {
     private static let logger = Logger(subsystem: BlaiseBundle.identifier, category: "audio.retention")
 
@@ -392,5 +412,34 @@ public enum AudioRetention {
     private static func allocatedSize(of url: URL) -> Int64 {
         let values = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey])
         return Int64(values?.totalFileAllocatedSize ?? values?.fileSize ?? 0)
+    }
+
+    // MARK: - Cap plan (§4)
+
+    /// The §4 cap plan: cap-eligible meetings (which already excludes the
+    /// most recent meeting, failed / cancelled, pending audio delivery, queued
+    /// or in-flight ones and marked rows) oldest-first by `startedAt`, until
+    /// total usage ≤ cap. Pure; `.unlimited` plans nothing.
+    public static func capPlan(usage: AudioUsage, cap: AudioRetentionCap) -> AudioCapPlan {
+        capPlan(usage: usage, capBytes: cap.bytes)
+    }
+
+    /// `capPlan` on a raw byte limit (nil = unlimited); tests use sub-GB caps.
+    static func capPlan(usage: AudioUsage, capBytes: Int64?) -> AudioCapPlan {
+        guard let limit = capBytes else { return .empty }
+        var total = usage.totalBytes
+        guard total > limit else { return .empty }
+        let candidates = usage.entries
+            .filter { $0.capEligible && $0.bytes > 0 }
+            .sorted { ($0.startedAt, $0.meetingID) < ($1.startedAt, $1.meetingID) }
+        var ids: [MeetingID] = []
+        var freed: Int64 = 0
+        for entry in candidates {
+            guard total > limit else { break }
+            ids.append(entry.meetingID)
+            freed += entry.bytes
+            total -= entry.bytes
+        }
+        return AudioCapPlan(meetingIDs: ids, bytesFreed: freed, remainingOverCap: max(0, total - limit))
     }
 }
