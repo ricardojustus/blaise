@@ -107,6 +107,19 @@ public enum PipelineDispatchError: Error, CustomStringConvertible {
     }
 }
 
+/// G16 §2: Delete Audio refusals. `deleteAudio` re-checks eligibility inside
+/// its chain slot; a refused verdict surfaces the §2 reason unchanged.
+public enum PipelineAudioDeleteError: Error, Equatable, CustomStringConvertible {
+    case refused(AudioDeletionRefusal)
+
+    public var description: String {
+        switch self {
+        case .refused(let reason):
+            return "audio deletion refused: \(reason.rawValue)"
+        }
+    }
+}
+
 /// G10 §2: delete refusals. Delete joins the single-flight chain (serializing
 /// against in-flight runs), so the only state it must refuse outright is
 /// `recording` (the live writer holds the dir).
@@ -784,6 +797,51 @@ public actor ProcessingPipeline {
             // Steps 2+3: remove the dir, clear the tombstone. A crash here
             // leaves the tombstone for the launch sweep (residue, never loss).
             await MeetingDeletion.removeDirAndClear(database: self.database, tombstone: tombstone)
+        }
+    }
+
+    // MARK: - Delete Audio (G16 §1/§2, owner-intent audio retention)
+
+    /// Delete a meeting's retained audio while keeping its row, transcript,
+    /// notes and handoff files. JOINS THE SINGLE-FLIGHT CHAIN, so no in-chain
+    /// run for the meeting is in flight when the slot runs — but a queued run
+    /// (status `processing`, or a pending/running `processing_queue` job) is
+    /// refused, never raced. Inside the slot, in the §1 crash-safe order:
+    /// (1) re-check §2 eligibility (throws `PipelineAudioDeleteError.refused`),
+    /// (2) commit the owner-intent mark (never bumps `updated_at`),
+    /// (3) remove the files via `AudioRetention.removeAudioFiles`. An already
+    /// marked meeting is a no-op that only finishes any residue removal.
+    /// `midDeleteHook` is the AC2 crash-test seam (between the mark commit
+    /// and the removal). Returns the §2 warnings of a manual deletion (for the
+    /// caller's record; the confirmation dialog reads them beforehand from
+    /// `AudioRetention.eligibility`).
+    @discardableResult
+    public func deleteAudio(
+        meetingID: MeetingID,
+        origin: AudioDeletionOrigin,
+        midDeleteHook: (@Sendable () throws -> Void)? = nil
+    ) async throws -> [AudioDeletionWarning] {
+        try await chain.run {
+            let verdict = try await AudioRetention.eligibility(
+                database: self.database, meetingID: meetingID, origin: origin)
+            let warnings: [AudioDeletionWarning]
+            switch verdict {
+            case .refused(.alreadyDeleted):
+                await AudioRetention.removeAudioFiles(database: self.database, meetingID: meetingID)
+                return []
+            case .refused(let reason):
+                throw PipelineAudioDeleteError.refused(reason)
+            case .eligible(let found):
+                warnings = found
+            }
+            try await AudioRetention.markDeleted(
+                database: self.database, meetingID: meetingID, reason: origin.reason,
+                now: self.now())
+            // A crash here leaves the mark for the launch `sweepMarked`
+            // (residue, never loss; never re-encoded — recovery skips marks).
+            try midDeleteHook?()
+            await AudioRetention.removeAudioFiles(database: self.database, meetingID: meetingID)
+            return warnings
         }
     }
 

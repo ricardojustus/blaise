@@ -270,14 +270,23 @@ public enum CaptureRecovery {
             let hasOrphan = !CaptureParts.diskCAFPartIndices(paths: paths, meetingID: meetingID)
                 .isEmpty
             guard hasOrphan else { continue }
-            let status =
+            let row =
                 (try? await database.pool.read { db in
-                    try String.fetchOne(
-                        db, sql: "SELECT status FROM meeting WHERE id = ?",
+                    try Row.fetchOne(
+                        db,
+                        sql: "SELECT status, audio_deleted_at IS NOT NULL AS marked FROM meeting WHERE id = ?",
                         arguments: [meetingID])
                 }) ?? nil
-            guard let status else {
+            guard let row, let status = row["status"] as String? else {
                 logger.error("orphan capture CAFs for unknown meeting \(meetingID); files left in place")
+                continue
+            }
+            // G16 §1: a meeting carrying the owner-intent audio-deletion mark
+            // is NEVER re-encoded — its leftover CAFs are residue owed to
+            // `AudioRetention.sweepMarked` (which runs before this sweep), not
+            // retention-class capture to finalize into fresh audio. No kick.
+            guard row["marked"] != true else {
+                logger.notice("capture sweep: meeting \(meetingID) has its audio deleted (G16 mark) — skipped")
                 continue
             }
             guard status != MeetingStatus.recording.rawValue else {
@@ -412,7 +421,12 @@ public enum CaptureRecovery {
             (try? await database.pool.read { db in
                 try String.fetchAll(
                     db,
-                    sql: "SELECT id FROM meeting WHERE status = ? AND last_processing_error = 'interrupted' ORDER BY id",
+                    // G16 §1: a meeting whose audio was deleted under the
+                    // owner-intent mark is never re-dispatched.
+                    sql: """
+                        SELECT id FROM meeting WHERE status = ? AND last_processing_error = 'interrupted'
+                        AND audio_deleted_at IS NULL ORDER BY id
+                        """,
                     arguments: [MeetingStatus.failed.rawValue])
             }) ?? []
         var kicked: [MeetingID] = []
