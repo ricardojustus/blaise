@@ -713,6 +713,17 @@ public final class BlaiseDatabase: Sendable {
                 ON "cloud_spend_receipt"("month_key")
                 """)
         }
+        // G16 (specs/g16_audio_retention.md, additive): audio-deletion
+        // provenance. Both columns are nullable, so every existing row reads
+        // NULL = "audio retained" with no backfill. `audio_deleted_at` is set
+        // when the meeting's audio files are removed; `audio_deleted_reason`
+        // records why (`manual` / `cap`). Metadata only, never content.
+        migrator.registerMigration("v23") { db in
+            try db.alter(table: "meeting") { t in
+                t.add(column: "audio_deleted_at", .datetime)
+                t.add(column: "audio_deleted_reason", .text)
+            }
+        }
         return migrator
     }
 
