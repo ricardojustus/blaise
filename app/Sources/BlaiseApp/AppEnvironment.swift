@@ -191,6 +191,9 @@ final class AppEnvironment {
     /// toggle flip.
     let voiceProfileStore: VoiceProfileStore
     let pipeline: ProcessingPipeline
+    /// G16: the owner-set size-cap sweeper (coalescing; triggered at launch,
+    /// daily, on run completion, and when the cap changes).
+    let audioRetentionSweeper: AudioRetentionSweeper
     let worker: HandoffWorker
     let handoffStatus: HandoffStatusHolder
     /// F1 Inc2: the durable processing-queue worker — the single admission path
@@ -317,6 +320,8 @@ final class AppEnvironment {
             handoffKicker: worker,
             meetEventsSweeper: ingestor,
             voiceProfileStore: voiceProfileStore)
+        self.audioRetentionSweeper = AudioRetentionSweeper(
+            database: database, pipeline: self.pipeline, settings: settings)
         // F1 Inc2: the durable processing queue is the single admission path for
         // full-pipeline work. runJob = the unchanged executor; the job's origin
         // sets refuseCancelled (auto/recovery must not resurrect a user-cancelled
@@ -753,6 +758,10 @@ final class AppEnvironment {
             // the orphan-CAF sweep, before the kicks so a tombstoned dir is
             // never re-encoded.
             await MeetingDeletion.sweepTombstones(database: database)
+            // Order is load-bearing (G16 §1): sweepMarked must run before
+            // sweepOrphanCAFs so it never sees leftover CAFs of a meeting whose
+            // audio was deleted.
+            _ = await AudioRetention.sweepMarked(database: database)
             let swept = await CaptureRecovery.sweepOrphanCAFs(database: database, kick: kick)
             await CaptureRecovery.redispatchInterrupted(
                 database: database, excluding: Set(swept.map(\.meetingID)), kick: kick)
@@ -774,6 +783,8 @@ final class AppEnvironment {
             // under the live writer. Set on the main actor (the holder is
             // @MainActor @Observable).
             await MainActor.run { captureStatus.launchSweepComplete = true }
+            // G16: first size-cap pass once launch recovery is done.
+            await audioRetentionSweeper.requestSweep()
         }
         refreshLastMeeting()
 
@@ -820,9 +831,12 @@ final class AppEnvironment {
         // Pipeline progress stream → activity holder + ready pulse +
         // indicator processing→idle hand-back.
         let events = await pipeline.events()
+        let retentionSweeper = audioRetentionSweeper
         eventTask = Task { [weak self] in
             for await event in events {
                 guard let self else { return }
+                // G16: a finished run may have made older audio cap-eligible.
+                if case .runCompleted = event { await retentionSweeper.requestSweep() }
                 if let readyID = self.activity.apply(event) {
                     self.library.markReady(readyID)
                 }
@@ -859,9 +873,10 @@ final class AppEnvironment {
         }
 
         // Pending-batch purge: startup + a daily timer (contract).
-        purgeTask = Task { [ingestor] in
+        purgeTask = Task { [ingestor, audioRetentionSweeper] in
             while !Task.isCancelled {
                 _ = try? await ingestor.purgeStalePending()
+                await audioRetentionSweeper.requestSweep()
                 try? await Task.sleep(for: .seconds(24 * 3600))
             }
         }
@@ -1169,6 +1184,74 @@ final class AppEnvironment {
             uiState.selectedMeetingID = nil
         }
         uiState.lastActionError = nil
+    }
+
+    /// G16: manual "Delete Audio" — keeps the notes, marks the meeting, removes
+    /// the audio files. The library/detail views observe the DB (GRDB), so the
+    /// mark propagates without an explicit refresh signal.
+    func deleteAudio(meetingID: MeetingID) async {
+        do {
+            _ = try await pipeline.deleteAudio(meetingID: meetingID, origin: .manual)
+        } catch {
+            logger.error("delete audio failed: \(error)")
+            let message: String
+            if case PipelineAudioDeleteError.refused(let reason) = error {
+                message = Self.audioRefusalMessage(reason)
+            } else {
+                message = "\(error)"
+            }
+            uiState.lastActionError = "Could not delete the audio: \(message)"
+            return
+        }
+        uiState.lastActionError = nil
+    }
+
+    private static func audioRefusalMessage(_ reason: AudioDeletionRefusal) -> String {
+        switch reason {
+        case .recording: return "the meeting is still recording"
+        case .paused: return "the meeting is paused"
+        case .processing, .processingQueued: return "the meeting is still processing"
+        case .alreadyDeleted: return "the audio was already deleted"
+        case .notEligibleForCap: return "the meeting is not eligible"
+        case .notFound: return "the meeting no longer exists"
+        }
+    }
+
+    /// G16: "Delete All Audio" — every manually-eligible meeting that still has
+    /// audio. Refusals (raced state changes) are counted as skipped.
+    func deleteAllAudio() async -> (deleted: Int, skipped: Int, bytesFreed: Int64) {
+        guard let usage = await audioUsage() else { return (0, 0, 0) }
+        var deleted = 0
+        var skipped = 0
+        var freed: Int64 = 0
+        for entry in usage.entries where entry.manualEligible && entry.audioDeletedAt == nil && entry.bytes > 0 {
+            do {
+                _ = try await pipeline.deleteAudio(meetingID: entry.meetingID, origin: .manual)
+                deleted += 1
+                freed += entry.bytes
+            } catch {
+                skipped += 1
+            }
+        }
+        return (deleted, skipped, freed)
+    }
+
+    func audioUsage() async -> AudioUsage? {
+        try? await AudioRetention.usage(database: database)
+    }
+
+    func audioEligibility(meetingID: MeetingID) async -> AudioEligibility? {
+        try? await AudioRetention.eligibility(database: database, meetingID: meetingID, origin: .manual)
+    }
+
+    func audioCapPreview(for cap: AudioRetentionCap) async -> AudioCapPlan? {
+        guard let usage = await audioUsage() else { return nil }
+        return AudioRetention.capPlan(usage: usage, cap: cap)
+    }
+
+    func setAudioCap(_ cap: AudioRetentionCap) async {
+        try? await settings.set(AudioRetentionSettings.capKey, to: cap)
+        await audioRetentionSweeper.requestSweep()
     }
 
     /// G10 §2: "Cancel & Delete" — set the cancel token FIRST (class-aware,

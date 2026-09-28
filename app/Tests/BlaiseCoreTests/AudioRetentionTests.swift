@@ -403,6 +403,10 @@ private func insertMeeting(
         var unmarked = marked
         unmarked.audioDeletedAt = nil
         unmarked.audioDeletedReason = nil
-        #expect(try JSONEncoder().encode(unmarked) == JSONEncoder().encode(marked))
+        // Sorted keys: nested dictionaries (asr provenance) encode in hash
+        // order, which differs between encodes without it.
+        let sorted = JSONEncoder()
+        sorted.outputFormatting = .sortedKeys
+        #expect(try sorted.encode(unmarked) == sorted.encode(marked))
     }
 }
