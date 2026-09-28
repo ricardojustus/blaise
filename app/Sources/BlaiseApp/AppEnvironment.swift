@@ -334,8 +334,12 @@ final class AppEnvironment {
                     ?? false
             },
             runJob: { meetingID, origin in
+                // G16 §3: automatic origins leave a processingNote when the
+                // meeting's audio was deleted (the refusal still throws; the
+                // worker completes the job).
                 _ = try await pipeline.dispatchProcessing(
-                    meetingID: meetingID, refuseCancelled: origin != .user)
+                    meetingID: meetingID, refuseCancelled: origin != .user,
+                    noteIfAudioDeleted: origin == .auto)
             })
         self.processingQueue = processingQueue
         // C3: the Meet-listener post-ready re-mint routes through the queue too

@@ -39,6 +39,10 @@ struct ReprocessAllSheet: View {
                     Text("Regenerates notes for each meeting from its retained audio, queued one at a time.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if plan.skippedAudioDeletedCount > 0 {
+                    Text(Self.skippedCaption(plan.skippedAudioDeletedCount))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             } else {
                 ProgressView().controlSize(.small)
             }
@@ -68,6 +72,13 @@ struct ReprocessAllSheet: View {
             await appEnv.processingQueue.enqueue(meetingID, origin: .reprocessAll)
         }
         onClose()
+    }
+
+    /// G16 §3: the Reprocess All exclusion caption.
+    static func skippedCaption(_ count: Int) -> String {
+        count == 1
+            ? "1 meeting skipped because its audio was deleted."
+            : "\(count) meetings skipped because their audio was deleted."
     }
 
     private func row(_ label: String, _ value: String) -> some View {

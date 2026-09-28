@@ -91,11 +91,16 @@ public struct PipelineError: Error, Sendable, CustomStringConvertible {
 /// whose refusal set now includes `paused` (defense in depth behind the
 /// orphan-sweep kick gate) — no path may process a meeting held in `paused`
 /// until End flips it to `processing`.
-public enum PipelineDispatchError: Error, CustomStringConvertible {
+public enum PipelineDispatchError: Error, Equatable, CustomStringConvertible {
     case meetingPaused(MeetingID)
     /// G10 §1: an AUTO-kick refused a user-cancelled meeting. The user's own
     /// Process / Regenerate are exempt (they pass `refuseCancelled: false`).
     case meetingCancelled(MeetingID)
+    /// G16 §3: the meeting's audio was deleted, so a full reprocess (which
+    /// re-runs ASR from audio) is refused for EVERY origin — never silently
+    /// downgraded to a notes rewrite. The queue worker completes (not fails)
+    /// a job that hits this, so there is no misleading Retry.
+    case audioDeleted(MeetingID)
 
     public var description: String {
         switch self {
@@ -103,6 +108,8 @@ public enum PipelineDispatchError: Error, CustomStringConvertible {
             return "meeting \(id) is paused — End & process it first (no path may process a paused meeting)"
         case .meetingCancelled(let id):
             return "meeting \(id) was cancelled — only the user's Process re-runs it (no auto-kick)"
+        case .audioDeleted(let id):
+            return "meeting \(id) has no audio (deleted) — it can no longer be reprocessed"
         }
     }
 }
@@ -650,9 +657,18 @@ public actor ProcessingPipeline {
     /// Process action and explicit Regenerate pass the default `false` — they
     /// ARE the sanctioned exits from `cancelled` (no deadlock). The check is
     /// INSIDE the chain so it sees the committed status.
+    ///
+    /// G16 §3: a meeting whose audio was deleted (`audioDeletedAt != nil`) is
+    /// refused with `PipelineDispatchError.audioDeleted` for every origin —
+    /// never downgraded to a notes rewrite (a Meet-event re-mint needs speaker
+    /// resolution from audio). `noteIfAudioDeleted` is set by AUTOMATIC origins
+    /// (Meet-event re-mint, meeting-code sweep): the refusal also leaves the
+    /// `AudioDeletedReprocessNote` `processingNote`; `status` and
+    /// `lastProcessingError` are never touched. Checked INSIDE the chain so a
+    /// kick racing a `deleteAudio` sees the committed mark.
     @discardableResult
     public func dispatchProcessing(
-        meetingID: MeetingID, refuseCancelled: Bool = false
+        meetingID: MeetingID, refuseCancelled: Bool = false, noteIfAudioDeleted: Bool = false
     ) async throws -> PipelineRunRecord {
         try await chain.run {
             guard
@@ -665,6 +681,14 @@ public actor ProcessingPipeline {
             }
             if refuseCancelled, meeting.status == .cancelled {
                 throw PipelineDispatchError.meetingCancelled(meetingID)
+            }
+            if meeting.audioDeletedAt != nil {
+                if noteIfAudioDeleted {
+                    try? await self.database.pool.write { db in
+                        try AudioDeletedReprocessNote.write(db, meetingID: meetingID)
+                    }
+                }
+                throw PipelineDispatchError.audioDeleted(meetingID)
             }
             var captured = meeting.captured
             if !captured { captured = await self.hasMicTrack(meetingID) }

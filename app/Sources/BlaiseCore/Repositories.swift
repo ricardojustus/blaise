@@ -624,6 +624,25 @@ public struct SettingsStore: Sendable {
 
 // MARK: - F1 processing queue repository
 
+/// G16 §3: the notice an AUTOMATIC reprocess origin leaves when it is refused
+/// because the meeting's audio was deleted. Targeted write of
+/// `processing_note` only: never bumps `updated_at` (no content changed) and
+/// never touches `status` / `last_processing_error`. A capture-recovery note
+/// outranks every other notice class and is kept.
+public enum AudioDeletedReprocessNote {
+    public static let text =
+        "New meeting data arrived after the audio was deleted; notes were not regenerated."
+
+    static func write(_ db: Database, meetingID: MeetingID) throws {
+        let current = try String.fetchOne(
+            db, sql: "SELECT processing_note FROM meeting WHERE id = ?", arguments: [meetingID])
+        guard current?.hasPrefix(CaptureRecovery.notePrefix) != true else { return }
+        try db.execute(
+            sql: "UPDATE meeting SET processing_note = ? WHERE id = ?",
+            arguments: [text, meetingID])
+    }
+}
+
 /// Durable processing-queue (F1). Mirrors `HandoffRepository`. The worker drains
 /// it by calling the unchanged `ProcessingPipeline.dispatchProcessing`; this
 /// repository owns enqueue/claim/complete + the startup sweep. `complete`/`fail`
@@ -642,13 +661,33 @@ public struct ProcessingQueueRepository: Sendable {
     /// belt-and-suspenders backstop against logic bugs.
     @discardableResult
     public func enqueue(meetingID: MeetingID, origin: ProcessingJobOrigin) async throws -> ProcessingJob {
-        try await database.pool.write { db in
+        let job: ProcessingJob? = try await database.pool.write { db in
             try Self.enqueue(db, meetingID: meetingID, origin: origin)
         }
+        // Thrown OUTSIDE the transaction so the automatic-origin note commits.
+        guard let job else { throw PipelineDispatchError.audioDeleted(meetingID) }
+        return job
     }
 
     /// Transaction-scoped enqueue (FIFO `created_seq` assigned monotonically).
-    static func enqueue(_ db: Database, meetingID: MeetingID, origin: ProcessingJobOrigin) throws -> ProcessingJob {
+    ///
+    /// G16 §3 pre-check: a meeting whose audio was deleted is never admitted —
+    /// returns nil (the public `enqueue` throws `PipelineDispatchError.audioDeleted`
+    /// after the commit; the worker's `enqueue` drops it). An AUTOMATIC origin (Meet-event re-mint, meeting-code sweep)
+    /// leaves the `AudioDeletedReprocessNote` instead; status and
+    /// `last_processing_error` are untouched. `dispatchProcessing` re-checks
+    /// inside the chain for a mark committed after admission.
+    static func enqueue(_ db: Database, meetingID: MeetingID, origin: ProcessingJobOrigin) throws -> ProcessingJob? {
+        let marked =
+            try Bool.fetchOne(
+                db, sql: "SELECT audio_deleted_at IS NOT NULL FROM meeting WHERE id = ?",
+                arguments: [meetingID]) ?? false
+        if marked {
+            if origin == .auto {
+                try AudioDeletedReprocessNote.write(db, meetingID: meetingID)
+            }
+            return nil
+        }
         if let existing = try ProcessingJob
             .filter(Column("meeting_id") == meetingID)
             .filter(sql: "state IN ('pending','running')")

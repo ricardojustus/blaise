@@ -6,8 +6,12 @@ import Foundation
 /// ceiling — C6; this is a courtesy pre-filter so a near-ceiling reprocess can't
 /// queue work that will only stall).
 public struct ReprocessAllPlan: Sendable, Equatable {
-    /// All `ready` meetings (reprocess regenerates their notes from retained audio).
+    /// All `ready` meetings that still have their audio (reprocess regenerates
+    /// their notes from retained audio).
     public var eligibleMeetingIDs: [MeetingID]
+    /// G16 §3: `ready` meetings left out because their audio was deleted (a
+    /// full reprocess re-runs ASR from audio, so they can never be reprocessed).
+    public var skippedAudioDeletedCount: Int
     public var perMeetingUSD: Double
     public var spentThisMonthUSD: Double
     public var ceilingUSD: Double
@@ -15,9 +19,10 @@ public struct ReprocessAllPlan: Sendable, Equatable {
 
     public init(
         eligibleMeetingIDs: [MeetingID], perMeetingUSD: Double, spentThisMonthUSD: Double,
-        ceilingUSD: Double, monthKey: String
+        ceilingUSD: Double, monthKey: String, skippedAudioDeletedCount: Int = 0
     ) {
         self.eligibleMeetingIDs = eligibleMeetingIDs
+        self.skippedAudioDeletedCount = skippedAudioDeletedCount
         self.perMeetingUSD = perMeetingUSD
         self.spentThisMonthUSD = spentThisMonthUSD
         self.ceilingUSD = ceilingUSD
@@ -43,18 +48,22 @@ public enum ReprocessAllPlanner {
     /// `ClaudeSummarizationEngine.costDescriptor.estimatedPerMeetingUSD`).
     public static let defaultPerMeetingUSD = 0.074
 
-    /// Build the plan from the catalog (`ready` meetings) + the ledger.
+    /// Build the plan from the catalog (`ready` meetings) + the ledger. G16 §3:
+    /// meetings whose audio was deleted are excluded and counted.
     public static func plan(
         database: BlaiseDatabase, ledger: CloudSpendLedger, perMeetingUSD: Double
     ) async -> ReprocessAllPlan {
         let meetings = (try? await MeetingRepository(database: database).listByRecency()) ?? []
-        let eligible = meetings.filter { $0.status == .ready }.map(\.id)
+        let ready = meetings.filter { $0.status == .ready }
+        let eligible = ready.filter { $0.audioDeletedAt == nil }.map(\.id)
+        let skipped = ready.count - eligible.count
         let spent = (try? await ledger.accumulatedThisMonth()) ?? 0
         let ceiling = await ledger.ceilingUSD()
         let monthKey = await ledger.currentMonthKey()
         return ReprocessAllPlan(
             eligibleMeetingIDs: eligible, perMeetingUSD: perMeetingUSD,
-            spentThisMonthUSD: spent, ceilingUSD: ceiling, monthKey: monthKey)
+            spentThisMonthUSD: spent, ceilingUSD: ceiling, monthKey: monthKey,
+            skippedAudioDeletedCount: skipped)
     }
 }
 
