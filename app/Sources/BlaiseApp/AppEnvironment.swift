@@ -1251,9 +1251,10 @@ final class AppEnvironment {
 
     func setAudioCap(_ cap: AudioRetentionCap) async {
         try? await settings.set(AudioRetentionSettings.capKey, to: cap)
-        // Awaited (not requestSweep) so the Storage tab's refreshed usage
-        // reflects the deletions the user just confirmed.
-        await audioRetentionSweeper.sweepNow()
+        // Fire-and-forget: each deletion joins the single-flight chain, so an
+        // in-flight run would otherwise block the caller for minutes. The
+        // Storage tab re-polls usage instead.
+        await audioRetentionSweeper.requestSweep()
     }
 
     /// G10 §2: "Cancel & Delete" — set the cancel token FIRST (class-aware,

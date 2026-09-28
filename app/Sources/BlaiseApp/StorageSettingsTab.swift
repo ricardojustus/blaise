@@ -261,6 +261,15 @@ struct StorageSettingsTab: View {
         persistedCap = newCap
         usage = await appEnv.audioUsage()
         working = false
+        // The sweep runs in the background (it queues behind any in-flight
+        // processing run); re-poll briefly so the summary catches up.
+        for _ in 0..<10 {
+            try? await Task.sleep(for: .seconds(1))
+            guard persistedCap == newCap else { return }
+            let latest = await appEnv.audioUsage()
+            usage = latest
+            if let limit = newCap.bytes, let total = latest?.totalBytes, total <= limit { return }
+        }
     }
 
     private func revertSlider() {
