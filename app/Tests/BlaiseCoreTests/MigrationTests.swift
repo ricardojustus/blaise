@@ -34,7 +34,7 @@ private struct MigrationSchemaSQL: Equatable {
         let database = try makeDatabase()
         try database.pool.read { db in
             let applied = try BlaiseDatabase.migrator.appliedMigrations(db)
-            #expect(applied == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22"])
+            #expect(applied == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23"])
 
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)")
             let structured = columns.first { $0["name"] == "structured" }
@@ -157,7 +157,7 @@ private struct MigrationSchemaSQL: Equatable {
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22"])
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23"])
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)").map { $0["name"] as String }
             #expect(columns.contains("structured"))
             #expect(columns.contains("memory_digest"), "v14 adds the nullable memory_digest column")
@@ -195,7 +195,7 @@ private struct MigrationSchemaSQL: Equatable {
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22"])
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db) == ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23"])
             let note = try Row.fetchOne(db, sql: "SELECT processing_note, title, captured, title_source FROM meeting")
             #expect(note?["processing_note"] == nil)
             #expect(note?["title"] == "v2 meeting")
@@ -594,18 +594,19 @@ private struct MigrationSchemaSQL: Equatable {
             #expect(correctionColumns == before.2)
             // `meeting_notes` is excluded: v22 adds the two owed-work columns
             // and the digest stamp to it. Every OTHER table shape must still be
-            // untouched by the receipt rebuilds.
+            // untouched by the receipt rebuilds. `meeting` is excluded too:
+            // v23 (G16) adds the audio-deletion columns to it.
             let otherTables = try Row.fetchAll(
                 db,
                 sql: """
                     SELECT name, sql FROM sqlite_master
-                    WHERE type = 'table' AND name NOT IN ('cloud_spend_receipt', 'meeting_notes')
+                    WHERE type = 'table' AND name NOT IN ('cloud_spend_receipt', 'meeting_notes', 'meeting')
                     ORDER BY name
                     """).map(MigrationSchemaSQL.init)
             #expect(
-                otherTables == before.3.filter { $0.name != "meeting_notes" },
+                otherTables == before.3.filter { $0.name != "meeting_notes" && $0.name != "meeting" },
                 "the receipt rebuilds must not change another table shape")
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db).last == "v22")
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db).last == "v23")
         }
 
         try queue.write { db in

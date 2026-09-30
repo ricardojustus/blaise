@@ -13,7 +13,9 @@ import Foundation
 ///       handoff/<version_hash>.json  immutable content-addressed payload snapshots
 ///
 /// Retention guarantee: `MeetingPaths` provides no removal helper, and no
-/// BlaiseCore API deletes or overwrites `audio*.m4a`. During capture the
+/// BlaiseCore API deletes or overwrites `audio*.m4a` — except
+/// `AudioRetention.removeAudioFiles` (G16), which acts only on a meeting
+/// carrying the durable owner-intent `audio_deleted_at` mark. During capture the
 /// `capture_*.caf` files are retention-class artifacts: their deletion
 /// happens ONLY through the single audited verified-encode function
 /// (`CaptureRecovery.encodeVerifiedAndRelease`) after the encoded m4a passes

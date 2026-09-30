@@ -170,7 +170,7 @@ import Testing
         // handoff_queue.delivered_endpoint delivery provenance) + v20
         // (meeting_correction table + its meeting index) + v21 (N2:
         // cloud_spend_receipt purpose-CHECK rebuild) = 21.
-        #expect(health.schemaVersion == 22)
+        #expect(health.schemaVersion == 23)
         #expect(health.journalMode == "wal")
     }
 }

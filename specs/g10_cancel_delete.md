@@ -2,7 +2,7 @@
 
 **Goal (the user, 12/06/2026):** cancel processing mid-flight; delete meetings, with a confirm dialog.
 
-**Floor 2 as refined by D23:** the SYSTEM never deletes autonomously. File deletion happens ONLY under a durable owner-intent record (the tombstone, §2) — row-absence proves nothing (a recreated blaise.sqlite makes every dir row-less; that scenario must preserve everything).
+**Floor 2 as refined by D23:** the SYSTEM never deletes autonomously. File deletion happens ONLY under a durable owner-intent record (the tombstone, §2; since G16 also a per-meeting `audio_deleted_at` mark written by a manual Delete Audio or by the owner-set, non-Unlimited audio size cap — see specs/g16_audio_retention.md) — row-absence proves nothing (a recreated blaise.sqlite makes every dir row-less; that scenario must preserve everything).
 
 ## 1. Cancel processing
 
@@ -20,7 +20,7 @@
   1. In the chain slot, ONE DB transaction: DELETE all handoff_queue rows for the meeting (ALL states INCLUDING delivered — children first, satisfying ON DELETE RESTRICT; remote inbox files are untouched immutable history; local payload files live inside the meeting dir and go with it); DELETE segments (FTS cascade verified), parts, speaker events/renames, name-correction source links, notes, action-item state, the meeting row; INSERT `meeting_tombstone(id, audio_dir_path, deleted_at)`.
   2. Remove the audio directory.
   3. Delete the tombstone row (small follow-up transaction).
-- **Crash windows:** kill before (1) commits → nothing happened. Kill between (1) and (2) → relaunch: the tombstone sweep removes EXACTLY the tombstoned dirs (owner intent, durable, path-specific) and then their tombstones. Kill between (2) and (3) → stale tombstone with no dir → swept harmlessly. DB loss/recreation → no tombstones → NO file is ever deleted (floor 2 holds by construction). The tombstone sweep LIVES in launch recovery beside the CAF sweep (CaptureRecovery) and is the only file-deletion site besides verified-encode's originals, step 2 itself, the existing bounded temp-file cleanups, the handoff worker's verified payload remove-and-rewrite (HandoffWorker.swift:587), and the sidecar replacement (MarkdownSidecar.swift:156-164) — the full inventory, stated precisely. POWER-LOSS (not kill) note: a torn filesystem can in principle resurrect directory entries after step 2 on non-journaled volumes — fail-safe direction (residue, never loss), documented.
+- **Crash windows:** kill before (1) commits → nothing happened. Kill between (1) and (2) → relaunch: the tombstone sweep removes EXACTLY the tombstoned dirs (owner intent, durable, path-specific) and then their tombstones. Kill between (2) and (3) → stale tombstone with no dir → swept harmlessly. DB loss/recreation → no tombstones → NO file is ever deleted (floor 2 holds by construction). The tombstone sweep LIVES in launch recovery beside the CAF sweep (CaptureRecovery) and is the only file-deletion site besides verified-encode's originals, G16's `AudioRetention.removeAudioFiles` (audio only, marked rows only), step 2 itself, the existing bounded temp-file cleanups, the handoff worker's verified payload remove-and-rewrite (HandoffWorker.swift:587), and the sidecar replacement (MarkdownSidecar.swift:156-164) — the full inventory, stated precisely. POWER-LOSS (not kill) note: a torn filesystem can in principle resurrect directory entries after step 2 on non-journaled volumes — fail-safe direction (residue, never loss), documented.
 - **In-flight delivery race:** the worker re-reads its queue row at claim/completion; a row deleted mid-delivery makes markDelivered a logged no-op (the remote file, if it landed, is immutable history — consistent with "delivered copies unaffected").
 - **Residue accepted (documented):** `meet_seen_event_id` dedup entries (no FK, no content), receipts (meeting_id SET NULL by design). The detail view dismisses if its meeting is deleted; calendar suggestions may re-offer the time window (a suggestion is not the meeting).
 
@@ -42,7 +42,7 @@ G9 has landed (durable `paused` status, the holder mirror `pausedMeetingID` + th
 
 ## 4. Out of scope
 
-Bulk delete; trash/undo (BACKLOG: restore-from-trash if field regret appears); per-part deletion; remote deletion; retention policies; artifact-resume for cancelled runs.
+Bulk delete; trash/undo (BACKLOG: restore-from-trash if field regret appears); per-part deletion; remote deletion; audio retention (moved to G16); artifact-resume for cancelled runs.
 
 ## CHANGELOG
 - v5.1 (12/06/2026): verification one-liners — Cancel & Delete status write class-aware; the writes-nothing claim scoped to STATUS (persisted stage artifacts remain, crash-resume-consistent); cancelled notes-resume CONSCIOUSLY auto-retries at the next self-heal trigger (pending state = incomplete by definition); inventory residue to BACKLOG. SPEC CYCLE CLOSED: fit for implementation (an internal audit record).

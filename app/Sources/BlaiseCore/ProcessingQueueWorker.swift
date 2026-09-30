@@ -57,8 +57,21 @@ public actor ProcessingQueueWorker {
     /// job (idempotent — a live job for the meeting collapses) then wake the
     /// drain. Producers call this instead of `dispatchProcessing` directly.
     @discardableResult
+    ///
+    /// G16 §3: a meeting whose audio was deleted is dropped here (the
+    /// repository's pre-check; an automatic origin leaves a `processingNote`)
+    /// and nil is returned.
     public func enqueue(_ meetingID: MeetingID, origin: ProcessingJobOrigin) async -> ProcessingJob? {
-        let job = try? await repository.enqueue(meetingID: meetingID, origin: origin)
+        let job: ProcessingJob?
+        do {
+            job = try await repository.enqueue(meetingID: meetingID, origin: origin)
+        } catch PipelineDispatchError.audioDeleted {
+            logger.notice(
+                "processing enqueue dropped for \(meetingID, privacy: .public): audio deleted")
+            return nil
+        } catch {
+            job = nil
+        }
         await kick()
         return job
     }
@@ -143,6 +156,13 @@ public actor ProcessingQueueWorker {
                 // The worker's own Task was cancelled (shutdown) — leave the row
                 // `running`; the launch resume sweep reclaims it. Not a job failure.
                 try? await repository.resetStaleRunning()
+            } catch PipelineDispatchError.audioDeleted {
+                // G16 §3: the meeting's audio was deleted after admission. The
+                // refusal is terminal and expected — complete the job (NOT
+                // `failed`, which would offer a Retry that can never succeed).
+                logger.notice(
+                    "processing job \(job.id, privacy: .public) skipped: audio deleted")
+                try? await repository.complete(job.id)
             } catch let error as EngineError where Self.isCancelled(error) {
                 // C1/D2: the user cancelled this running job (pipeline.cancel →
                 // typed EngineError.cancelled). Terminal `cancelled`, NOT `failed`

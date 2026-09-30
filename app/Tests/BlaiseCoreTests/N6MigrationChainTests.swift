@@ -227,11 +227,16 @@ private struct PreservationSnapshot: Equatable {
     var receipts: [CloudSpendReceipt]
     var handoff: [Row]
 
+    /// The meeting columns as of v19; v23 (G16) adds two audio-deletion
+    /// columns that the row-by-row comparison must not see.
+    static let meetingColumns =
+        "id, title, started_at, ended_at, source, status, attendees, dominant_language, asr_provenance, last_processing_error, created_at, updated_at, processing_note, meeting_code, captured, calendar_event_id, scheduled_end_ms, grace_until_ms, title_source"
+
     static let notesColumns =
         "meeting_id, markdown, language, generated_at, provenance, structured, memory_digest, scoped_alias_bindings"
 
     init(_ db: Database) throws {
-        meetings = try Row.fetchAll(db, sql: "SELECT * FROM meeting ORDER BY id")
+        meetings = try Row.fetchAll(db, sql: "SELECT \(Self.meetingColumns) FROM meeting ORDER BY id")
         segments = try Row.fetchAll(
             db, sql: "SELECT * FROM transcript_segment ORDER BY meeting_id, ord")
         notes = try Row.fetchAll(
@@ -281,7 +286,7 @@ private func applyTheRecordedProductionResidue(at url: URL) throws {
 
 private let fullMigrationSequence = [
     "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
-    "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22",
+    "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
 ]
 
 // MARK: - The shared end-state battery
@@ -425,7 +430,7 @@ private func assertUpgradedEndState(at url: URL, before: PreservationSnapshot) t
 /// never read as migration corruption.
 private func assertTheAppOpensTheMigratedFile(root: URL) async throws {
     let database = try BlaiseDatabase(rootURL: root)
-    #expect(try await HealthCheck.run(database).schemaVersion == 22)
+    #expect(try await HealthCheck.run(database).schemaVersion == 23)
     let notes = try #require(
         try await NotesRepository(database: database).fetch(meetingID: digestBearingMeeting))
     #expect(notes.memoryDigest == fixtureDigest)

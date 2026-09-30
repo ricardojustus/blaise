@@ -49,6 +49,11 @@ public enum MeetingStatus: String, Codable, Sendable, CaseIterable {
     case recording, processing, ready, failed, paused, cancelled
 }
 
+/// G16: why a meeting's audio was deleted (nil on the meeting = retained).
+public enum AudioDeletionReason: String, Codable, Sendable {
+    case manual, cap
+}
+
 public enum AttendeeSource: String, Codable, Sendable, CaseIterable {
     case meetExtension, calendar, manual
 }
@@ -212,6 +217,11 @@ public struct Meeting: Codable, Sendable, Equatable {
     /// exemption keeps it from being flipped and launch recovery re-enters
     /// grace or processes by its deadline.
     public var graceUntilMs: Int64?
+    /// G16 (migration v23): when the audio was deleted. nil = audio retained.
+    /// Metadata, not content — never touches `updatedAt`.
+    public var audioDeletedAt: Date?
+    /// G16 (migration v23): why the audio was deleted. nil = retained.
+    public var audioDeletedReason: AudioDeletionReason?
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -233,6 +243,8 @@ public struct Meeting: Codable, Sendable, Equatable {
         calendarEventID: String? = nil,
         scheduledEndMs: Int64? = nil,
         graceUntilMs: Int64? = nil,
+        audioDeletedAt: Date? = nil,
+        audioDeletedReason: AudioDeletionReason? = nil,
         createdAt: Date,
         updatedAt: Date
     ) {
@@ -253,6 +265,8 @@ public struct Meeting: Codable, Sendable, Equatable {
         self.calendarEventID = calendarEventID
         self.scheduledEndMs = scheduledEndMs
         self.graceUntilMs = graceUntilMs
+        self.audioDeletedAt = audioDeletedAt
+        self.audioDeletedReason = audioDeletedReason
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -270,6 +284,8 @@ public struct Meeting: Codable, Sendable, Equatable {
         case calendarEventID = "calendar_event_id"
         case scheduledEndMs = "scheduled_end_ms"
         case graceUntilMs = "grace_until_ms"
+        case audioDeletedAt = "audio_deleted_at"
+        case audioDeletedReason = "audio_deleted_reason"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }
@@ -296,8 +312,52 @@ public struct Meeting: Codable, Sendable, Equatable {
         self.calendarEventID = try container.decodeIfPresent(String.self, forKey: .calendarEventID)
         self.scheduledEndMs = try container.decodeIfPresent(Int64.self, forKey: .scheduledEndMs)
         self.graceUntilMs = try container.decodeIfPresent(Int64.self, forKey: .graceUntilMs)
+        // Tolerant defaults: rows/fixtures predating migration v23.
+        self.audioDeletedAt = try container.decodeIfPresent(Date.self, forKey: .audioDeletedAt)
+        self.audioDeletedReason = try container.decodeIfPresent(AudioDeletionReason.self, forKey: .audioDeletedReason)
         self.createdAt = try container.decode(Date.self, forKey: .createdAt)
         self.updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+    }
+
+    /// Hand-written to OMIT `audio_deleted_at` / `audio_deleted_reason`
+    /// (G16 §1). Every other key mirrors the synthesized encoder exactly
+    /// (`encodeIfPresent` for optionals, declaration order), so the bytes of
+    /// every existing encoding are unchanged.
+    ///
+    /// Why: GRDB's `insert` / `update` / `save` persist exactly the keys this
+    /// encoder emits, and GRDB persists a nil `encodeIfPresent` as an explicit
+    /// NULL. With the audio keys encoded, ANY full-record `Meeting.update(db)`
+    /// from a struct fetched before the mark was written (the pipeline and
+    /// repositories do this in many places) would silently clear the mark —
+    /// and a cleared mark lets launch recovery re-encode leftover CAFs into
+    /// fresh audio. Omitting the keys makes the mark writable ONLY by the
+    /// targeted SQL in `AudioRetention.markDeleted`; full-record writes never
+    /// touch the columns. It also keeps the columns out of the engine input
+    /// (`SummarizationInput` encodes the whole `Meeting`). The handoff
+    /// payload is built field-by-field (`EvidencePayloadBuilder`) and never
+    /// sees them either. Decoding still reads both columns.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(titleSource, forKey: .titleSource)
+        try container.encode(startedAt, forKey: .startedAt)
+        try container.encodeIfPresent(endedAt, forKey: .endedAt)
+        try container.encode(source, forKey: .source)
+        try container.encode(status, forKey: .status)
+        try container.encode(attendees, forKey: .attendees)
+        try container.encodeIfPresent(meetingCode, forKey: .meetingCode)
+        try container.encodeIfPresent(dominantLanguage, forKey: .dominantLanguage)
+        try container.encodeIfPresent(asrProvenance, forKey: .asrProvenance)
+        try container.encodeIfPresent(lastProcessingError, forKey: .lastProcessingError)
+        try container.encodeIfPresent(processingNote, forKey: .processingNote)
+        try container.encode(captured, forKey: .captured)
+        try container.encodeIfPresent(calendarEventID, forKey: .calendarEventID)
+        try container.encodeIfPresent(scheduledEndMs, forKey: .scheduledEndMs)
+        try container.encodeIfPresent(graceUntilMs, forKey: .graceUntilMs)
+        // audioDeletedAt / audioDeletedReason: deliberately NOT encoded (above).
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
     }
 }
 

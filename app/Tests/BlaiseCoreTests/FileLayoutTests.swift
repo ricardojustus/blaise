@@ -73,7 +73,11 @@ import Testing
 
     /// AC6 audio-retention guard: plant audio.m4a, exercise every mutating
     /// C1 API around it, assert the file is untouched. (No BlaiseCore API
-    /// deletes or overwrites audio*.m4a; MeetingPaths has no removal helper.)
+    /// deletes or overwrites audio*.m4a; MeetingPaths has no removal helper —
+    /// the ONE audited exception is G16's `AudioRetention.removeAudioFiles`,
+    /// which acts only on a row carrying the durable owner-intent
+    /// `audio_deleted_at` mark and is pinned by `AudioRetentionTests`. None of
+    /// the C1 mutations below writes that mark.)
     @Test func retainedAudioSurvivesAllC1Mutations() async throws {
         let database = try makeDatabase()
         let meeting = makeMeeting()

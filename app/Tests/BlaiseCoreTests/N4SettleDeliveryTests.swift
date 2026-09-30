@@ -1311,7 +1311,7 @@ func setDeliveryOwed(_ harness: SettleHarness, _ meetingID: MeetingID) async thr
         try BlaiseDatabase.migrator.migrate(queue)
 
         try queue.read { db in
-            #expect(try BlaiseDatabase.migrator.appliedMigrations(db).last == "v22")
+            #expect(try BlaiseDatabase.migrator.appliedMigrations(db).last == "v23")
             let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(meeting_notes)")
                 .map { $0["name"] as String }
             #expect(columns.contains("digest_edit_owed"))

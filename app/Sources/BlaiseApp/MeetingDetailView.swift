@@ -30,6 +30,10 @@ struct MeetingDetailView: View {
     @State private var regenerating = false
     /// G10: the two-step delete confirmation (the user directive).
     @State private var showDeleteConfirm = false
+    /// G16: the Delete Audio confirmation — its facts (size, warnings) are
+    /// read when the menu item is chosen, before the dialog opens.
+    @State private var audioDeletePrompt: AudioDeletePrompt?
+    @State private var showAudioDeleteConfirm = false
     /// The export sheet's snapshot, read once when the sheet opens.
     @State private var pdfExportInput: PDFExportInput?
     /// A capture is in flight: a second press must not open a second sheet.
@@ -96,8 +100,11 @@ struct MeetingDetailView: View {
                     } label: {
                         Label("Process", systemImage: "play.circle")
                     }
-                    .disabled(regenerating)
-                    .help("Re-run transcription and notes from the retained audio")
+                    .disabled(regenerating || audioDeleted)
+                    .help(
+                        audioDeleted
+                            ? Self.audioDeletedReprocessHelp
+                            : "Re-run transcription and notes from the retained audio")
                 }
             }
             // Export is a primary user action, so it stands on its own rather
@@ -122,7 +129,9 @@ struct MeetingDetailView: View {
                     } label: {
                         Label("Regenerate", systemImage: "arrow.clockwise")
                     }
-                    .disabled(regenerating || activity.activeRuns[meetingID] != nil)
+                    .disabled(
+                        regenerating || activity.activeRuns[meetingID] != nil || audioDeleted)
+                    .help(audioDeleted ? Self.audioDeletedReprocessHelp : "")
 
                     Button {
                         showInspector.toggle()
@@ -135,6 +144,18 @@ struct MeetingDetailView: View {
                     // Cancel & Delete in the dialog.
                     if model?.meeting?.status != .recording {
                         Divider()
+                        // G16: Delete Audio keeps the transcript and notes.
+                        // Offered only once capture is over and while the
+                        // audio is still retained.
+                        if let meeting = model?.meeting, meeting.status != .paused,
+                            meeting.audioDeletedAt == nil
+                        {
+                            Button(role: .destructive) {
+                                requestAudioDelete()
+                            } label: {
+                                Label("Delete Audio…", systemImage: "waveform.slash")
+                            }
+                        }
                         Button(role: .destructive) {
                             showDeleteConfirm = true
                         } label: {
@@ -144,7 +165,7 @@ struct MeetingDetailView: View {
                 } label: {
                     Label("Meeting Actions", systemImage: "ellipsis.circle")
                 }
-                .help("Regenerate, view meeting info, or delete")
+                .help("Regenerate, view meeting info, delete audio, or delete")
             }
         }
         .confirmationDialog(
@@ -163,6 +184,17 @@ struct MeetingDetailView: View {
             Text(
                 "This permanently deletes the recording, transcript, and notes from this Mac. Copies already delivered to your Evidence Store are not affected."
             )
+        }
+        .confirmationDialog(
+            audioDeleteDialogTitle,
+            isPresented: $showAudioDeleteConfirm,
+            titleVisibility: .visible,
+            presenting: audioDeletePrompt
+        ) { _ in
+            Button("Delete Audio", role: .destructive) { deleteAudio() }
+            Button("Cancel", role: .cancel) {}
+        } message: { prompt in
+            Text(prompt.message)
         }
         .popover(isPresented: $showInspector) {
             if let model {
@@ -255,6 +287,50 @@ struct MeetingDetailView: View {
         return "Delete “\(meeting.title)” (\(date))?"
     }
 
+    /// The meeting's audio is gone: nothing can be re-transcribed.
+    private var audioDeleted: Bool { model?.meeting?.audioDeletedAt != nil }
+
+    static let audioDeletedReprocessHelp =
+        "The audio was deleted, so this meeting can't be re-transcribed. Re-write the notes still works."
+
+    // G16: the Delete Audio dialog title names the meeting exactly as the
+    // Delete Meeting dialog does.
+    private var audioDeleteDialogTitle: String {
+        guard let meeting = model?.meeting else { return "Delete the audio for this meeting?" }
+        let date = meeting.startedAt.formatted(date: .abbreviated, time: .omitted)
+        return "Delete audio for “\(meeting.title)” (\(date))?"
+    }
+
+    /// Reads the §2 verdict and this meeting's audio size, then opens the
+    /// confirmation. A refusal skips the dialog: `deleteAudio` re-checks and
+    /// reports it through the usual action-error banner.
+    private func requestAudioDelete() {
+        let env = appEnv
+        let id = meetingID
+        Task {
+            async let eligibilityResult = env.audioEligibility(meetingID: id)
+            async let usageResult = env.audioUsage()
+            let (eligibility, usage) = await (eligibilityResult, usageResult)
+            switch eligibility {
+            case .eligible(let warnings):
+                let bytes = usage?.entries.first { $0.meetingID == id }?.bytes ?? 0
+                audioDeletePrompt = AudioDeletePrompt(bytes: bytes, warnings: warnings)
+                showAudioDeleteConfirm = true
+            case .refused, nil:
+                await env.deleteAudio(meetingID: id)
+            }
+        }
+    }
+
+    /// The meeting row's mark flips via the pipeline's targeted UPDATE; the
+    /// model's ValueObservation re-delivers the meeting, so the header,
+    /// menu, and inspector refresh without an explicit reload.
+    private func deleteAudio() {
+        let env = appEnv
+        let id = meetingID
+        Task { await env.deleteAudio(meetingID: id) }
+    }
+
     private func cancelProcessing() {
         let env = appEnv
         let id = meetingID
@@ -272,6 +348,33 @@ struct MeetingDetailView: View {
         let id = meetingID
         Task { await env.cancelAndDelete(meetingID: id) }
     }
+}
+
+/// The facts the Delete Audio confirmation states.
+private struct AudioDeletePrompt {
+    let bytes: Int64
+    let warnings: [AudioDeletionWarning]
+
+    var message: String {
+        let size = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        var text =
+            "This frees \(size) on this Mac. The transcript and notes are kept, but the meeting can no longer be regenerated or played back. Copies already delivered to your Evidence Store are not affected."
+        if warnings.contains(.cannotRetry) { text += " It can no longer be retried." }
+        if warnings.contains(.pendingAudioDelivery) {
+            text += " Its pending delivery will be sent without audio."
+        }
+        return text
+    }
+}
+
+/// G16: the "audio deleted" caption shared by the header and the inspector.
+func audioDeletedDescription(_ meeting: Meeting) -> String? {
+    guard let deletedAt = meeting.audioDeletedAt else { return nil }
+    let date = deletedAt.formatted(date: .abbreviated, time: .omitted)
+    if meeting.audioDeletedReason == .cap {
+        return "Audio deleted automatically on \(date) to stay under the storage limit — transcript and notes kept"
+    }
+    return "Audio deleted on \(date) — transcript and notes kept"
 }
 
 // MARK: - Content
@@ -1281,12 +1384,20 @@ private struct NotesPane: View {
                     .help(AttendeeDisplay.tooltip(attendees))
             }
             provenanceLine
-            AudioPlayerView(
-                audioURL: appEnv.database.paths.audioURL(meeting.id),
-                database: appEnv.database, meetingID: meeting.id, tint: pageTint,
-                seed: meeting.id
-            )
-            .padding(.top, 6)
+            if let deletedCaption = audioDeletedDescription(meeting) {
+                Label(deletedCaption, systemImage: "waveform.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 6)
+            } else {
+                AudioPlayerView(
+                    audioURL: appEnv.database.paths.audioURL(meeting.id),
+                    database: appEnv.database, meetingID: meeting.id, tint: pageTint,
+                    seed: meeting.id
+                )
+                .id(meeting.audioDeletedAt)
+                .padding(.top, 6)
+            }
         }
     }
 
@@ -3233,6 +3344,8 @@ private struct MeetingInspector: View {
     @Environment(AppEnvironment.self) private var appEnv
     @State private var code = ""
     @State private var loaded = false
+    /// G16: this meeting's retained audio bytes (nil until read).
+    @State private var audioBytes: Int64?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -3240,6 +3353,9 @@ private struct MeetingInspector: View {
                 .font(.headline)
             LabeledContent("Source") {
                 Text(model.meeting?.source.rawValue ?? "—")
+            }
+            LabeledContent("Audio") {
+                Text(audioSummary)
             }
             TextField("Meet code (abc-defg-hij)", text: $code)
                 .textFieldStyle(.roundedBorder)
@@ -3259,6 +3375,21 @@ private struct MeetingInspector: View {
                 loaded = true
             }
         }
+        .task(id: model.meeting?.audioDeletedAt) {
+            guard let id = model.meeting?.id, model.meeting?.audioDeletedAt == nil else { return }
+            audioBytes = await appEnv.audioUsage()?.entries.first { $0.meetingID == id }?.bytes
+        }
+    }
+
+    private var audioSummary: String {
+        guard let meeting = model.meeting else { return "—" }
+        if let deletedAt = meeting.audioDeletedAt {
+            let date = deletedAt.formatted(date: .abbreviated, time: .omitted)
+            return meeting.audioDeletedReason == .cap
+                ? "Deleted automatically \(date)" : "Deleted \(date)"
+        }
+        guard let audioBytes else { return "—" }
+        return ByteCountFormatter.string(fromByteCount: audioBytes, countStyle: .file)
     }
 
     private func save() {

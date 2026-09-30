@@ -411,7 +411,7 @@ struct MainWindow: View {
                         NSApp.activate(ignoringOtherApps: true)
                         window.makeKeyAndOrderFront(nil)
                     }
-                    if ["settings", "cloud-spend", "settings-handoff"].contains(
+                    if ["settings", "cloud-spend", "settings-handoff", "settings-storage"].contains(
                         ProcessInfo.processInfo.environment["BLAISE_DEMO_SCENE"] ?? "")
                     {
                         try? await Task.sleep(for: .seconds(1))

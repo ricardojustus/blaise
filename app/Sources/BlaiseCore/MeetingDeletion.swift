@@ -110,18 +110,8 @@ public enum MeetingDeletion {
         // `"meetings/<ULID>"`, so a traversal path (`../victim`, an absolute
         // path) is only reachable from a corrupted/tampered `blaise.sqlite` —
         // but floor 2 is a hard floor, so the tombstone is QUARANTINED (kept,
-        // loudly logged, NEVER acted on) rather than blindly obeyed. Symlinks
-        // are resolved before the containment check so a symlinked component
-        // cannot smuggle the target outside the tree.
-        let meetingsRoot = database.rootURL.appendingPathComponent("meetings")
-        let resolvedDir = dir.standardizedFileURL.resolvingSymlinksInPath()
-        let resolvedRoot = meetingsRoot.standardizedFileURL.resolvingSymlinksInPath()
-        let rootComponents = resolvedRoot.pathComponents
-        let dirComponents = resolvedDir.pathComponents
-        let containedAndDeeper =
-            dirComponents.count > rootComponents.count
-            && Array(dirComponents.prefix(rootComponents.count)) == rootComponents
-        guard containedAndDeeper else {
+        // loudly logged, NEVER acted on) rather than blindly obeyed.
+        guard resolvedWithinMeetingsRoot(dir, database: database) != nil else {
             logger.error(
                 "tombstone for \(tombstone.id, privacy: .public) resolves OUTSIDE the meetings directory (\(tombstone.audioDirPath, privacy: .public)) — QUARANTINED, not deleted; data root may be corrupted")
             return
@@ -140,6 +130,25 @@ public enum MeetingDeletion {
         try? await database.pool.write { db in
             _ = try MeetingTombstone.deleteOne(db, key: tombstone.id)
         }
+    }
+
+    /// G10 §2 (H-4) floor-2 containment check, shared with G16's
+    /// `AudioRetention.removeAudioFiles`: resolves `url` (standardized, symlinks
+    /// resolved — so a symlinked component cannot smuggle the target outside the
+    /// tree) and returns the resolved URL ONLY when it lies strictly INSIDE
+    /// `<root>/meetings/` (deeper than the meetings directory itself). Returns
+    /// nil for a traversal / absolute / escaping path, or the meetings directory
+    /// itself. Callers refuse (and log) on nil; they never delete-as-pointed.
+    static func resolvedWithinMeetingsRoot(_ url: URL, database: BlaiseDatabase) -> URL? {
+        let meetingsRoot = database.rootURL.appendingPathComponent("meetings")
+        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedRoot = meetingsRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let rootComponents = resolvedRoot.pathComponents
+        let components = resolved.pathComponents
+        let containedAndDeeper =
+            components.count > rootComponents.count
+            && Array(components.prefix(rootComponents.count)) == rootComponents
+        return containedAndDeeper ? resolved : nil
     }
 
     /// Launch tombstone sweep (CaptureRecovery's launch recovery, beside the
