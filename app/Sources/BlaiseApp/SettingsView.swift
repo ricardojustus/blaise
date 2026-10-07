@@ -728,7 +728,7 @@ private struct EngineSlotSection: View {
                 !selected.configDescriptors.isEmpty
             {
                 ForEach(selected.configDescriptors, id: \.key) { descriptor in
-                    EngineConfigField(engineID: selected.id, descriptor: descriptor)
+                    EngineConfigField(engineID: selected.configurationID, descriptor: descriptor)
                 }
             }
         }

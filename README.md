@@ -110,6 +110,12 @@ Blaise is local-first by design, and the privacy boundary is stated honestly:
   transcript, same destination — only the billing and the credential differ, and
   no API key is exposed to it), or a **local engine** that runs on-device and
   makes no network call at all.
+  **Settings → Engines → Notes (Summarization)** offers Sonnet 5.5, Opus 5.5,
+  Haiku 4.5, and the existing Sonnet 4.6 through the API; the subscription
+  choices are Sonnet 5.5 and Opus 5.5. API choices share your saved Anthropic key;
+  subscription choices share your OAuth token and CLI path. Existing selections
+  stay selected. The chosen model also handles the memory digest and AI edits;
+  the optional Haiku digest-audit setting still applies.
 - **Spend tracking and a ceiling are built in.** Blaise tracks what the notes step
   costs and enforces a configurable monthly ceiling, so the cloud step can never
   run away.

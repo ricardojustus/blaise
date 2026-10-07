@@ -1804,21 +1804,23 @@ final class AppEnvironment {
             uvBinary: uvBinary,
             driverScript: notesDriverScript,
             requirementsFile: requirementsFile)
-        let claude = ClaudeSummarizationEngine(
-            configuration: configuration(
-                for: ClaudeSummarizationEngine.engineID, descriptors: ClaudeSummarizationEngine.descriptors),
-            ledger: ledger)
+        let apiConfiguration = configuration(
+            for: ClaudeSummarizationEngine.engineID, descriptors: ClaudeSummarizationEngine.descriptors)
+        let claudeModels = ClaudeNotesModel.apiModels.map { model in
+            ClaudeSummarizationEngine(configuration: apiConfiguration, ledger: ledger, model: model)
+        }
         // The "Account engine" — the user's Claude subscription via the `claude -p`
         // CLI (~$0). Registered alongside the API engine so the existing engine
         // picker surfaces it; it is NEVER the default (`EngineDefaults.summarization`
         // stays the API engine) and runs only when the user selects it AND it is
         // available (the `claude` binary resolves AND the OAuth token is set).
-        let claudeCode = ClaudeCodeSummarizationEngine(
-            configuration: configuration(
-                for: ClaudeCodeSummarizationEngine.engineID,
-                descriptors: ClaudeCodeSummarizationEngine.descriptors),
-            ledger: ledger)
-        // `try!` is safe: the ids are distinct constants. Summarization
+        let cliConfiguration = configuration(
+            for: ClaudeCodeSummarizationEngine.engineID,
+            descriptors: ClaudeCodeSummarizationEngine.descriptors)
+        let claudeCodeModels = ClaudeNotesModel.cliModels.map { model in
+            ClaudeCodeSummarizationEngine(configuration: cliConfiguration, ledger: ledger, model: model)
+        }
+        // `try!` is safe: the catalog has distinct ids. Summarization
         // order is load-bearing (D17): the lightweight API engine is
         // registered FIRST so that any first-registered substitution path
         // can never land on the 18 GB-peak local engine (the resolver also
@@ -1829,6 +1831,8 @@ final class AppEnvironment {
         // is preferred, then the local MLX engine, and the account engine runs
         // ONLY when the user explicitly selects it.
         return try! EngineRegistry(
-            asr: [whisper, parakeet], summarization: [claude, gemma, claudeCode])
+            asr: [whisper, parakeet],
+            summarization: claudeModels.map { $0 as any SummarizationEngine }
+                + [gemma] + claudeCodeModels.map { $0 as any SummarizationEngine })
     }
 }

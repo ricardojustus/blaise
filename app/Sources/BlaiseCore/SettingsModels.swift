@@ -27,6 +27,7 @@ public final class EngineSettingsModel {
         public var kind: EngineKind
         public var costSummary: String?
         public var configDescriptors: [EngineConfigDescriptor]
+        public var configurationID: String
         /// nil = available.
         public var availabilityReason: String?
     }
@@ -77,7 +78,7 @@ public final class EngineSettingsModel {
             summarization.append(await row(
                 id: engine.id, name: engine.displayName, kind: engine.kind,
                 cost: engine.costDescriptor, descriptors: engine.configDescriptors,
-                availability: engine.availability()))
+                availability: engine.availability(), configurationID: engine.configurationID))
         }
         asrRows = asr
         summarizationRows = summarization
@@ -85,13 +86,14 @@ public final class EngineSettingsModel {
 
     private func row(
         id: String, name: String, kind: EngineKind, cost: EngineCostDescriptor?,
-        descriptors: [EngineConfigDescriptor], availability: EngineAvailability
+        descriptors: [EngineConfigDescriptor], availability: EngineAvailability,
+        configurationID: String? = nil
     ) -> EngineRow {
         var reason: String?
         if case .unavailable(let value) = availability { reason = value }
         return EngineRow(
             id: id, displayName: name, kind: kind, costSummary: cost?.pricingSummary,
-            configDescriptors: descriptors, availabilityReason: reason)
+            configDescriptors: descriptors, configurationID: configurationID ?? id, availabilityReason: reason)
     }
 
     public func selectedID(_ slot: EngineSlot) -> String {

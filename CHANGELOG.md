@@ -2,6 +2,13 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [Unreleased]
+
+### Added
+- **More Claude models for notes.** Sonnet 5.5, Opus 5.5 and Haiku 4.5 API choices,
+  alongside Sonnet 4.6; Sonnet 5.5 and Opus 5.5 subscription choices. Saved selections
+  and credentials are retained, and API spend uses the selected model's rates.
+
 ## [1.10.1] — 04/10/2026
 
 Fixes: playback after the Mac sleeps mid-recording, and the Reprocess All cost.

@@ -157,14 +157,21 @@ private final class ScriptedNotesEditorEngine:
 
     let id: String
     let displayName = "Scripted notes editor"
+    let configurationID: String
+    let suppressesAutoFallback: Bool
     let kind: EngineKind = .cloud
     let loadProfile: EngineLoadProfile = .lightweight
     let costDescriptor: EngineCostDescriptor? = nil
     let configDescriptors: [EngineConfigDescriptor] = []
     let state = Mutex(State())
 
-    init(id: String = "scripted-notes-editor") {
+    init(
+        id: String = "scripted-notes-editor", configurationID: String? = nil,
+        suppressesAutoFallback: Bool = false
+    ) {
         self.id = id
+        self.configurationID = configurationID ?? id
+        self.suppressesAutoFallback = suppressesAutoFallback
     }
 
     func availability() async -> EngineAvailability {
@@ -1705,6 +1712,43 @@ INSTRUCTIONS:
         await Task.yield()
         #expect(primary.callCount == 1)
         #expect(clock.activeSleeperCount == 0)
+    }
+
+    @Test func editorFallbackSkipsModelsSharingFailedCredentials() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try BlaiseDatabase(rootURL: root)
+        let clock = EditorManualClock()
+        let primary = ScriptedNotesEditorEngine(id: "primary-model", configurationID: "shared-api")
+        primary.setOutcomes([.error(.configurationMissing(key: "apiKey"))])
+        let sibling = ScriptedNotesEditorEngine(id: "sibling-model", configurationID: "shared-api")
+        sibling.setOutcomes([.result([])])
+        let subscription = ScriptedNotesEditorEngine(
+            id: "subscription-editor", suppressesAutoFallback: true)
+        subscription.setOutcomes([.result([])])
+        let fallback = ScriptedNotesEditorEngine(id: "independent-editor")
+        fallback.setOutcomes([.result([])])
+        let registry = try EngineRegistry(
+            asr: [], summarization: [primary, sibling, subscription, fallback])
+        let settings = SettingsStore(database: database)
+        try await settings.set(EngineResolver.summarizationSettingsKey, to: primary.id)
+        try await settings.set(UserIdentity.settingsKey, to: UserIdentity.onboardedUser)
+        let pipeline = ProcessingPipeline(
+            database: database, registry: registry, diarizer: PipelineMockDiarizer(),
+            vocabulary: try VocabFixtures.pipelineVocabulary(), now: clock.now,
+            notesEditorSleep: clock.sleep,
+            settleSleep: { _ in throw CancellationError() })
+        let harness = EditorHarness(
+            root: root, database: database, pipeline: pipeline, engine: primary, clock: clock)
+        let (meeting, _) = try await seedEditorMeeting(harness)
+        _ = try await insertCorrection(database, meetingID: meeting.id, createdAt: clock.now())
+
+        try await pipeline.sendPendingNotesToEditor(meetingID: meeting.id)
+
+        #expect(primary.callCount == 1)
+        #expect(sibling.callCount == 0)
+        #expect(subscription.callCount == 0)
+        #expect(fallback.callCount == 1)
     }
 
     enum ReadFault: String, CaseIterable, Sendable {

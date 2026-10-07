@@ -560,6 +560,8 @@ extension ASREngine {
 }
 
 public protocol SummarizationEngine: Sendable {
+    /// Configuration storage namespace, shared by model variants of a runtime.
+    var configurationID: String { get }
     var id: String { get }
     var displayName: String { get }
     var kind: EngineKind { get }
@@ -569,7 +571,8 @@ public protocol SummarizationEngine: Sendable {
     /// When the user has SELECTED this engine and it fails (after its own bounded
     /// retries) with a fallback-trigger error, the pipeline must NOT silently fall
     /// back to a metered/other engine — it leaves the meeting's notes PENDING with
-    /// a user-visible warning so it can be retried on the chosen engine. Default
+    /// a user-visible warning so it can be retried on the chosen engine. Such
+    /// engines are also excluded as automatic fallback destinations. Default
     /// `false` (the protocol extension below) → the cloud/local engines fall back
     /// as before; ONLY the subscription `claude -p` Account engine overrides it to
     /// `true` (staying free is a user choice that must not be silently spent past).
@@ -596,6 +599,7 @@ public protocol SummarizationEngine: Sendable {
 }
 
 extension SummarizationEngine {
+    public var configurationID: String { id }
     public func prepare() async throws {}
 
     /// Default: engines DO participate in the runtime auto-fallback. Only the

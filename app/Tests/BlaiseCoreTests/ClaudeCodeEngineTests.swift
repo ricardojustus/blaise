@@ -126,7 +126,8 @@ private struct CPHarness {
 private func makeCPHarness(
     responses: [CPResponse],
     token: String? = "oauth-test-token-not-real",
-    binaryInstalled: Bool = true
+    binaryInstalled: Bool = true,
+    model: ClaudeNotesModel = .sonnet55
 ) async throws -> CPHarness {
     let database = try makeDatabase()
     let settings = SettingsStore(database: database)
@@ -173,7 +174,7 @@ private func makeCPHarness(
         descriptors: ClaudeCodeSummarizationEngine.descriptors,
         settings: settings, secrets: secrets)
     let engine = ClaudeCodeSummarizationEngine(
-        configuration: configuration, ledger: ledger,
+        configuration: configuration, ledger: ledger, model: model,
         homeDirectory: URL(fileURLWithPath: "/Users/fictional-tester"),
         runner: runner)
     return CPHarness(
@@ -514,6 +515,36 @@ private func makeCPHarness(
             try String.fetchAll(db, sql: "SELECT model FROM cloud_spend_receipt")
         }
         #expect(models == ["claude-sonnet-5-5"])
+    }
+
+    @Test func opusSelectionStaysConsistentAcrossNotesAndDigest() async throws {
+        let harness = try await makeCPHarness(responses: [
+            cpStructuredSuccess(structuredOutputJSON: cpNotesJSON),
+            cpSuccess(result: cpDigestText),
+        ], model: .opus55)
+        defer { try? FileManager.default.removeItem(at: harness.binaryURL) }
+        let notes = try await harness.engine.generateNotes(makeNotesRequest())
+        let digest = try await harness.engine.generateDigest(cpDigestRequest())
+
+        #expect(harness.engine.id == "claude-opus-5-5-cli")
+        #expect(harness.engine.configurationID == "claude-cli")
+        #expect(harness.engine.suppressesAutoFallback)
+        #expect(notes.provenance.engine == harness.engine.id)
+        #expect(notes.provenance.model == "claude-opus-5-5")
+        #expect(digest.usage?.estimatedCostUSD == 0)
+        #expect(harness.invocations.values.count == 3) // notes, digest synthesis, combined audit
+        for invocation in harness.invocations.values {
+            let index = try #require(invocation.args.firstIndex(of: "--model"))
+            #expect(invocation.args[index + 1] == "claude-opus-5-5")
+            let effortIndex = try #require(invocation.args.firstIndex(of: "--effort"))
+            #expect(invocation.args[effortIndex + 1] == "medium")
+            #expect(invocation.env["ANTHROPIC_API_KEY"] == nil)
+        }
+        let receipts = try await harness.database.pool.read { db in
+            try CloudSpendReceipt.fetchAll(db)
+        }
+        #expect(receipts.count == 3)
+        #expect(receipts.allSatisfy { $0.engineID == harness.engine.id && $0.model == "claude-opus-5-5" && $0.costUSD == 0 })
     }
 
     /// The schema-validated `structured_output` object is read (mapped to a

@@ -28,10 +28,7 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEng
     DigestEditingEngine, TimecodeAnchoringEngine
 {
     public static let engineID = "claude-cli"
-    /// The wire model the CLI runs. Deliberately NOT the API engine's model:
-    /// this engine runs Sonnet 5.5, while the API engine stays on Sonnet 4.6
-    /// because it sends `temperature`, which Sonnet 5.5 rejects. The receipt
-    /// model field carries this string.
+    /// The default CLI model; explicit model choices retain their own identity.
     public static let model = "claude-sonnet-5-5"
     /// OAuth token for the user's Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`),
     /// stored as a `.secret`.
@@ -50,8 +47,10 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEng
         "/usr/local/bin/claude",
     ]
 
-    public nonisolated let id: String = ClaudeCodeSummarizationEngine.engineID
-    public nonisolated let displayName = "Claude account (subscription)"
+    public nonisolated let selectedModel: ClaudeNotesModel
+    public nonisolated var id: String { selectedModel.cliEngineID }
+    public nonisolated var displayName: String { selectedModel.displayName + " (subscription)" }
+    public nonisolated let configurationID = ClaudeCodeSummarizationEngine.engineID
     public nonisolated let kind: EngineKind = .cloud
     /// Lightweight (D17): a subprocess CLI call, no local weights. (It is a cloud
     /// call under the hood; nothing here loads model weights.)
@@ -136,9 +135,12 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEng
 
     /// Services are constructor-injected at the composition root (C2). The real
     /// runner wraps `SubprocessRunner.run` with `Self.callTimeout`.
-    public init(configuration: EngineConfiguration, ledger: CloudSpendLedger) {
+    public init(
+        configuration: EngineConfiguration, ledger: CloudSpendLedger,
+        model: ClaudeNotesModel = .sonnet55
+    ) {
         self.init(
-            configuration: configuration, ledger: ledger,
+            configuration: configuration, ledger: ledger, model: model,
             homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
             runner: Self.realRunner)
     }
@@ -146,10 +148,12 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEng
     init(
         configuration: EngineConfiguration,
         ledger: CloudSpendLedger,
+        model: ClaudeNotesModel = .sonnet55,
         homeDirectory: URL,
         runner: @escaping CommandRunner
     ) {
         self.configuration = configuration
+        self.selectedModel = model
         self.ledger = ledger
         self.homeDirectory = homeDirectory
         self.runner = runner
@@ -252,12 +256,13 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEng
     /// an extra tool-use turn). When nil (the digest path), behaves exactly as
     /// before: `defaultMaxTurns`, no `--json-schema`, model answer in `result`.
     static func baseArguments(
-        systemPromptFile: String, jsonSchema: String? = nil, maxTurns: Int = defaultMaxTurns
+        systemPromptFile: String, jsonSchema: String? = nil, maxTurns: Int = defaultMaxTurns,
+        model: String = ClaudeCodeSummarizationEngine.model
     ) -> [String] {
         var args: [String] = [
             "-p",
             "--model", model,
-            "--effort", "high",
+            "--effort", model == ClaudeNotesModel.opus55.rawValue ? "medium" : "high",
             "--max-turns", String(maxTurns),
             "--system-prompt-file", systemPromptFile,
             "--setting-sources", "project",
@@ -444,7 +449,8 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEng
 
         let maxTurns = jsonSchema == nil ? Self.defaultMaxTurns : Self.schemaMaxTurns
         let args = Self.baseArguments(
-            systemPromptFile: systemPromptFile.path, jsonSchema: jsonSchema, maxTurns: maxTurns)
+            systemPromptFile: systemPromptFile.path, jsonSchema: jsonSchema, maxTurns: maxTurns,
+            model: selectedModel.rawValue)
         let env = childEnvironment(token: token, binary: binary, home: throwawayHome)
         let stdin = Data(user.utf8)
         let expectStructuredOutput = jsonSchema != nil
@@ -572,12 +578,13 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEng
         // untouched.
         let ledger = self.ledger
         let id = self.id
+        let model = selectedModel.rawValue
         await Task.detached {
             try? await ledger.add(
                 0.0,
                 receipt: CloudSpendLedger.ReceiptDraft(
                     engineID: id,
-                    model: ClaudeCodeSummarizationEngine.model,
+                    model: model,
                     purpose: purpose,
                     meetingID: meetingID,
                     inputTokens: 0,
@@ -773,7 +780,7 @@ public actor ClaudeCodeSummarizationEngine: SummarizationEngine, NotesEditingEng
                     usage: EngineUsage(inputUnits: nil, outputUnits: nil, estimatedCostUSD: 0.0),
                     provenance: NotesProvenance(
                         engine: id,
-                        model: Self.model,
+                        model: selectedModel.rawValue,
                         pipelineVersion: "",
                         runtime: "claude-cli/-p/subprocess",
                         promptVersion: promptVersion.rawValue),

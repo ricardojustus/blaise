@@ -1842,6 +1842,8 @@ public actor ProcessingPipeline {
             !engine.suppressesAutoFallback,
             let fallback = registry.summarizationEngines.first(where: { candidate in
                 candidate.id != engine.id
+                    && candidate.configurationID != engine.configurationID
+                    && !candidate.suppressesAutoFallback
                     && candidate.loadProfile == .lightweight
                     && candidate is any NotesEditingEngine
             }),
@@ -4290,7 +4292,10 @@ public actor ProcessingPipeline {
                     reason: "\(primary.displayName): \(Self.humanReason(primaryError))")
             }
             guard
-                let fallback = registry.summarizationEngines.first(where: { $0.id != primary.id })
+                let fallback = registry.summarizationEngines.first(where: {
+                    $0.id != primary.id && $0.configurationID != primary.configurationID
+                        && !$0.suppressesAutoFallback
+                })
             else {
                 // A stage failure's message is what the meeting's error banner
                 // shows a person, so it names engines the way they are named on
@@ -4742,8 +4747,8 @@ public actor ProcessingPipeline {
                 // #102: the cost toggle — does the COMBINED AUDIT run on Haiku?
                 // Hoisted out of the `||` (the right operand is a non-awaiting
                 // autoclosure). Settings OR the dev env override, default OFF →
-                // Sonnet. This is the ONLY call site that may pick Haiku; notes,
-                // synthesis, and the md-v5 verify/reconcile passes never read it.
+                // the selected model. Only the combined audit reads this override;
+                // notes, synthesis, and the md-v5 verify/reconcile passes don't.
                 let haikuOn = await MemoryDigestSettings.isHaikuAuditEnabled(in: settings)
                     || ProcessInfo.processInfo.environment["BLAISE_HAIKU_AUDIT"] == "1"
                 if auditRequested, let claudeEngine = engine as? ClaudeSummarizationEngine {
@@ -4754,7 +4759,7 @@ public actor ProcessingPipeline {
                             // `ClaudeSummarizationEngine.haikuModel` (here `Self` is
                             // ProcessingPipeline — `Self.haikuModel` would not
                             // compile); when OFF omit the arg so the engine's
-                            // `= Self.model` default keeps it byte-identical Sonnet.
+                            // default keeps it on the selected API model.
                             if haikuOn {
                                 return try await claudeEngine.combinedAuditDigest(
                                     request, draftDigest: clean, purpose: purpose,
