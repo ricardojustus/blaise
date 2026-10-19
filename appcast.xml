@@ -3,6 +3,51 @@
     <channel>
         <title>Blaise</title>
         <item>
+            <title>1.10.2</title>
+            <pubDate>Mon, 19 Oct 2026 10:55:08 -0300</pubDate>
+            <link>https://github.com/ricardojustus/blaise/releases/tag/v1.10.2</link>
+            <sparkle:version>644</sparkle:version>
+            <sparkle:shortVersionString>1.10.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.6.1</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[# Blaise 1.10.2: current Claude models, and a separate model for the memory digest
+
+Your meetings, transcripts, notes and settings carry over untouched, and nothing needs reprocessing.
+
+## What's new
+
+- **More Claude models for notes.** Settings → Engines → Notes now offers Sonnet 5.5, Opus 5.5 and Haiku 4.5 through
+  the API, beside Sonnet 4.6, and Opus 5.5 beside Sonnet 5.5 on the Claude subscription. Your saved choice and
+  credentials carry over, and API spend is priced at the chosen model's rates. Sonnet 5.5 and Opus 5.5 think before
+  writing, on both the API and the subscription. Contributed by Arthur Soares (@arthursoares), #17.
+- **A separate model for the memory digest.** Settings → Engines → Memory digest. It defaults to "Same as notes"; pick
+  another model and only the digest uses it. If that model can't run, the digest waits and retries on its own, and your
+  notes are not affected. For a fully offline setup, keep the digest on "Same as notes" or on the local engine too.
+
+## Changed
+
+- The default engines are renamed in the picker: "Claude Sonnet 4.6 (API)" and "Claude Sonnet 5.5 (subscription)".
+- An AI edit whose API call fails no longer falls back to the Claude subscription; it waits for the engine you chose.
+
+## Fixed
+
+- **Long digests.** The API digest has room for a long meeting, and a digest that still runs out is retried later
+  instead of being saved cut off.
+- **Recording.** Pressing start or resume twice no longer crashes; a failed pause no longer blocks the next recording;
+  the timer keeps counting after a resume; the quit dialog says processing happens at the next launch.
+- **Notes.** AI Correct and Add Note aimed at a whole table land under that table; the selection bar stays inside a
+  narrow notes pane; the notes engine reports its real error on its last attempt.
+- **Calendar.** A calendar added or removed shows up in an open Settings picker.
+- **Upgrading from 1.10.1:** delivered in place by the updater.
+
+## Assets
+
+- `Blaise-1.10.2.zip`: the notarised, stapled app (macOS 15.6.1+, Apple Silicon)
+- `blaise-meet-extension.zip`: the Chrome extension for Google Meet participant/speaker signals (unchanged)
+]]></description>
+            <enclosure url="https://github.com/ricardojustus/blaise/releases/download/v1.10.2/Blaise-1.10.2.zip" length="34747138" type="application/octet-stream" sparkle:edSignature="i9Idm0HNtiHWTWJBEw5OzYry+91kwDhB/SGLSEGo3J6E1NVfDCFOwq0aQPk9ujOuv8dSDoSQadNxP9Q/z9OWAQ=="/>
+        </item>
+        <item>
             <title>1.10.1</title>
             <pubDate>Sun, 04 Oct 2026 02:01:58 -0300</pubDate>
             <link>https://github.com/ricardojustus/blaise/releases/tag/v1.10.1</link>
@@ -72,42 +117,6 @@ one new table for the timecode links on first launch.
 - `blaise-meet-extension.zip`: the Chrome extension for Google Meet participant/speaker signals (unchanged)
 ]]></description>
             <enclosure url="https://github.com/ricardojustus/blaise/releases/download/v1.10.0/Blaise-1.10.0.zip" length="34824383" type="application/octet-stream" sparkle:edSignature="xjrrDl8A+/sIYRywVPli4vRdlavbojtYGJoTe8eeC0iU3ow6YUZesr7PYiypnJjikQhoshYXMyRDwXQAuZDqCQ=="/>
-        </item>
-        <item>
-            <title>1.9.2</title>
-            <pubDate>Tue, 29 Sep 2026 22:51:37 -0300</pubDate>
-            <link>https://github.com/ricardojustus/blaise/releases/tag/v1.9.2</link>
-            <sparkle:version>477</sparkle:version>
-            <sparkle:shortVersionString>1.9.2</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>15.6.1</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description sparkle:format="markdown"><![CDATA[# Blaise 1.9.2: a faster notes pane, and corrections across paragraphs
-
-The notes pane is rebuilt as a single text view. Long notes open and scroll much faster, and AI Correct and Add Note
-now work on a selection that spans several paragraphs.
-
-## What changed
-
-- **Faster notes.** On a large test note (about 20,000 characters), opening goes from about 2 s to 0.65 s, a click
-  answers in about 5 ms instead of 200 ms, and scrolling runs at 120 fps without stutter. Very long notes that used to
-  hang now open in a fraction of a second.
-- **AI Correct and Add Note across paragraphs.** Drag across bullets, paragraphs or sections and correct or annotate
-  the whole passage. The composer opens under the last paragraph you selected, and every selected piece is
-  highlighted.
-- **Selection and pointer behave like any Mac text app.** The selection follows your drag, the text cursor shows over
-  words and the normal pointer everywhere else.
-- **Checklist clicks tick, they don't aim.** Clicking an item in your action items no longer brings up the AI bar;
-  select words or right-click to correct one.
-- **All four looks** (Aquarela, Estúdio, Caderno, Fluido) keep their typography, section chrome and motion.
-- **Fixed:** the end of a paragraph could be hidden under a note card or pending correction.
-- **Upgrading from 1.9.1:** delivered in place by the updater. Meetings, transcripts, notes and settings untouched.
-
-## Assets
-
-- `Blaise-1.9.2.zip`: the notarised, stapled app (macOS 15.6.1+, Apple Silicon)
-- `blaise-meet-extension.zip`: the Chrome extension for Google Meet participant/speaker signals (unchanged)
-]]></description>
-            <enclosure url="https://github.com/ricardojustus/blaise/releases/download/v1.9.2/Blaise-1.9.2.zip" length="32672094" type="application/octet-stream" sparkle:edSignature="/FXSsZgL7mnmiKe4Ta6gp0S993R/kSy4V3hKTtI4/9HjXNZ9SQnRCwq1p4F2YfDhzgwqbpQ0Rp9+q9s8SHUyAw=="/>
         </item>
     </channel>
 </rss>
