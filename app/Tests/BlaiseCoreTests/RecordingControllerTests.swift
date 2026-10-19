@@ -724,7 +724,9 @@ struct RecordingControllerTests {
             harness.engine.emit(.systemAudioUnavailable(active: true))
             harness.engine.emit(.writeFailure("disk full"))
         }
-        // The engine stop is initiated while the writer is still held.
+        // The engine stop is initiated while the writer is still held. The 2 s budget starts
+        // once the writer is held, so it never includes the fixture's own setup.
+        #expect(await waitUntil(timeout: .seconds(30)) { !gate.values.isEmpty })
         #expect(await waitUntil(timeout: .seconds(2)) { harness.engine.state.withLock { $0.stopCalls } == 1 })
         gate.values.forEach { $0.signal() }
         let meeting = try await starter.value

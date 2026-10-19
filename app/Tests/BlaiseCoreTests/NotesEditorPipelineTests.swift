@@ -404,15 +404,20 @@ private func expectTranscriptColumnsByteEqual(
     }
 }
 
+/// Polls `condition`, yielding between checks, until it holds or `timeout` of wall time lapses.
+/// The bound is time, not a count: a slow host runs through thousands of yields in tens of
+/// milliseconds, while a heavily parallel run can take seconds to reach the condition. The bound
+/// only ends a failing wait.
 func eventually(
-    _ condition: @escaping @Sendable () async -> Bool,
-    iterations: Int = 10_000
+    timeout: Duration = .seconds(30),
+    _ condition: @escaping @Sendable () async -> Bool
 ) async -> Bool {
-    for _ in 0 ..< iterations {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
         if await condition() { return true }
         await Task.yield()
     }
-    return false
+    return await condition()
 }
 
 private enum EditorTestTimeout: Error { case elapsed }

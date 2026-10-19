@@ -476,7 +476,9 @@ final class NotesDocController: NSObject, NSTextViewDelegate {
     private let spring = Spring(duration: 0.32, bounce: 0.14)
     static let inset = NSSize(width: 36, height: 28)
     /// Reduce Motion, read in one place: the slides become a crossfade.
-    var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+    /// `nil` follows the system preference; a test pins it.
+    var reduceMotionOverride: Bool?
+    var reduceMotion: Bool { reduceMotionOverride ?? NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
     static let crossfade: TimeInterval = 0.16
 
     struct ResolvedMark: Equatable {

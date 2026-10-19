@@ -33,6 +33,8 @@ private final class Hosted {
             contentRect: NSRect(x: 0, y: 0, width: width, height: 1000), styleMask: [.titled],
             backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        // These tests assert the motion itself, whatever the host's Reduce Motion setting.
+        controller.reduceMotionOverride = false
         window.contentView = controller.scrollView
         controller.scrollView.frame = NSRect(x: 0, y: 0, width: width, height: 1000)
         controller.scrollView.tile()
@@ -620,9 +622,11 @@ private func document(summary: String = "The kelp survey moved to Thursday.", de
                 onPath(cardFrames, cardStart, card.frame.maxY),
                 "\(shape), box bottom: before \(cardStart) frames \(cardFrames) settled \(card.frame.maxY)")
             // The done row itself fades out over its held space (today's default `.opacity`).
+            // The settle spring overshoots: the fade clamps at 0, then rebounds, staying under the
+            // spring's settling epsilon (0.001), before it lands.
             if doneRow != nil {
                 #expect(
-                    rowPicture != nil && zip(rowAlphas, rowAlphas.dropFirst()).allSatisfy { $1 <= $0 }
+                    rowPicture != nil && zip(rowAlphas, rowAlphas.dropFirst()).allSatisfy { $1 <= $0 || $1 <= 0.001 }
                         && rowAlphas.last! < rowAlphas[0],
                     "\(shape), done row: pictured \(rowPicture != nil), alphas \(rowAlphas)")
             }
@@ -926,9 +930,21 @@ private func document(summary: String = "The kelp survey moved to Thursday.", de
         link.invalidate()
         tops.append(try lines(hosted, open, next.paragraph).top)
         // Never above where the rail held it; moving down only as the
-        // composer grows past the rail; settled under the composer.
+        // composer grows past the rail; settled under the composer. The
+        // slide's spring (0.32 s, bounce 0.14) carries the composer past its
+        // height and back, and the text under it with it: once the text has
+        // passed where it settles, a step up by that bounce back to where it
+        // settles is the spring landing, not a pull.
+        let slide = Spring(duration: 0.32, bounce: 0.14)
+        let bounce = (0...1000).map { slide.value(target: 160.0, initialVelocity: 0, time: Double($0) / 1000) }.max()! - 160
+        let settled = tops.last!
         #expect(tops.allSatisfy { $0 >= before - 0.5 })
-        #expect(zip(tops, tops.dropFirst()).allSatisfy { $1 >= $0 - 0.5 })
+        #expect(
+            tops.indices.dropLast().allSatisfy {
+                let landing = tops[$0] > settled && tops[$0] <= settled + bounce + 0.5 && tops[$0 + 1] >= settled - 0.5
+                return tops[$0 + 1] >= tops[$0] - 0.5 - (landing ? bounce : 0)
+            },
+            "tops \(tops), bounce \(bounce)")
         #expect(tops.last! > before + 60)
     }
 }

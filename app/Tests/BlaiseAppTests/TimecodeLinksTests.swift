@@ -22,6 +22,8 @@ private final class MarkHost {
             contentRect: NSRect(x: 0, y: 0, width: 818, height: height), styleMask: [.titled],
             backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        // The hover tests follow text the motion moves, whatever the host's Reduce Motion setting.
+        controller.reduceMotionOverride = false
         window.contentView = controller.scrollView
         controller.scrollView.frame = NSRect(x: 0, y: 0, width: 818, height: height)
         controller.scrollView.tile()

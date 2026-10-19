@@ -250,7 +250,10 @@ private func storedNotes(
         harness.clock.advance(by: .seconds(600))
         await harness.pipeline.resumeOwedSettles()
         await harness.pipeline.settleViewDetached(meeting.id)
-        _ = await eventually { harness.engine.digestCallCount > 1 }
+        // A window for a call that must not come: 10,000 yields and at least 100 ms.
+        let window = ContinuousClock.now + .milliseconds(100)
+        for _ in 0..<10_000 { await Task.yield() }
+        _ = await eventually(timeout: window - .now) { harness.engine.digestCallCount > 1 }
         #expect(harness.engine.digestCallCount == 1, "no settle follows a clean rewrite")
         #expect(try await harness.queueRows(meeting.id) == 2)
 
@@ -464,7 +467,10 @@ private func storedNotes(
         harness.settleClock.advance(by: .seconds(600))
         harness.clock.advance(by: .seconds(600))
         await harness.pipeline.resumeOwedSettles()
-        _ = await eventually { harness.engine.totalModelCallCount > 2 }
+        // A window for a call that must not come: 10,000 yields and at least 100 ms.
+        let window = ContinuousClock.now + .milliseconds(100)
+        for _ in 0..<10_000 { await Task.yield() }
+        _ = await eventually(timeout: window - .now) { harness.engine.totalModelCallCount > 2 }
 
         #expect(harness.engine.notesCallCount == 0, "no notes-editor call")
         #expect(harness.engine.digestCallCount == 0, "no digest-editor call")

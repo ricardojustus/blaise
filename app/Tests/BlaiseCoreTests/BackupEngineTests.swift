@@ -1371,27 +1371,24 @@ func maxHeartbeatGap(_ beats: [Date]) -> TimeInterval {
     zip(beats, beats.dropFirst()).map { $1.timeIntervalSince($0) }.max() ?? 0
 }
 
-/// Runs `work` under a main-actor heartbeat every 16 ms, started before `work` begins; returns
-/// its result, the heartbeat count and the longest gap.
+/// Runs `work` under a main-queue heartbeat every 16 ms, started before `work` begins; returns
+/// its result, the heartbeat count and the longest gap. The timer is strict with no leeway: under
+/// a background process policy an ordinary sleep's wakeups coalesce past 100 ms on an idle main
+/// actor, which would read as a stall.
 @MainActor
 func withMainActorHeartbeat<T>(_ work: @MainActor () async throws -> T) async rethrows
     -> (result: T, beats: Int, maxGap: TimeInterval)
 {
-    let stop = Locked(false)
-    let beats = Locked<[Date]>([])
-    let heartbeat = Task { @MainActor in
-        beats.m.withLock { $0.append(Date()) }
-        while !stop.m.withLock({ $0 }) {
-            try? await Task.sleep(for: .milliseconds(16))
-            beats.m.withLock { $0.append(Date()) }
-        }
-    }
-    defer { stop.m.withLock { $0 = true } }
     // The first heartbeat is on record before the work starts, so a stall at its start is a gap.
-    while beats.m.withLock({ $0.isEmpty }) { await Task.yield() }
+    let beats = Locked<[Date]>([Date()])
+    let timer = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+    timer.schedule(deadline: .now() + .milliseconds(16), repeating: .milliseconds(16), leeway: .nanoseconds(0))
+    timer.setEventHandler { beats.m.withLock { $0.append(Date()) } }
+    timer.resume()
+    defer { timer.cancel() }
     let result = try await work()
-    stop.m.withLock { $0 = true }
-    await heartbeat.value
+    // The last heartbeat follows the work, so a stall at its end is a gap too.
+    beats.m.withLock { $0.append(Date()) }
     let all = beats.m.withLock { $0 }
     return (result, all.count, maxHeartbeatGap(all))
 }

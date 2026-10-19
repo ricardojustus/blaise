@@ -332,6 +332,9 @@ private func anchorID(
         var farCounts: Set<Int> = []
         var repeatedCounts: Set<Int> = []
         var farFromSummary = true
+        // The bound is this thread's CPU time: the walk is synchronous on one thread, and wall
+        // time also counts the time other suites running in parallel take the CPU from it.
+        let cpuStart = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
         let elapsed = ContinuousClock().measure {
             for _ in 0 ..< 50 {
                 let far = CorrectionAnchoring.passageInstances(
@@ -347,8 +350,9 @@ private func anchorID(
         #expect(farCounts == [625])
         #expect(farFromSummary)
         #expect(repeatedCounts == [0])
-        print("H-1 scaling: 50 rows of each shape in \(elapsed)")
-        #expect(elapsed < .seconds(10), "50 rows of each shape took \(elapsed)")
+        let cpu = Duration.nanoseconds(Int64(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - cpuStart))
+        print("H-1 scaling: 50 rows of each shape in \(cpu) of CPU time, \(elapsed) wall")
+        #expect(cpu < .seconds(10), "50 rows of each shape took \(cpu) of CPU time")
     }
 
     @Test("AC-3: after reanchor, every fixture's stored occurrence still names the same instance")

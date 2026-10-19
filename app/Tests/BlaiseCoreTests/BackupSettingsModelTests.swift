@@ -83,7 +83,11 @@ private func eventually(_ seconds: Double = 30, _ condition: () -> Bool) async -
     return true
 }
 
+/// Serialized: several tests block a cooperative-pool thread inside the engine (`SyncHold`) or
+/// spin the main actor until a run starts. Run side by side on a host with few cores, they take
+/// every pool thread and wait on each other until the 30 s holds time out.
 @MainActor
+@Suite(.serialized)
 struct BackupSettingsModelTests {
 
     // MARK: Status line
