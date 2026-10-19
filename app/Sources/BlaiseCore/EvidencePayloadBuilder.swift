@@ -187,9 +187,9 @@ public enum EvidencePayloadBuilder {
         // alongside `asr`/`notes`. Emitted ONLY when a digest is stored
         // (`notes.memoryDigest != nil`); a toggle-off / legacy / digest-failed
         // meeting omits it entirely, so the payload re-materializes
-        // byte-identically to today's. Carries the `md-v1` prompt version (the
-        // engine/model mirror the notes call's — the digest rides the same
-        // engine the user selected for notes).
+        // byte-identically to today's. Carries the `md-v1` prompt version and
+        // the engine/model that synthesized the digest; a digest stored without
+        // its own provenance names the notes engine/model.
         var provenanceFields: [(String, CanonicalJSONValue)] = [
             ("asr", .object(provenanceASR)),
             ("notes", .object(notesProvenanceFields)),
@@ -197,8 +197,8 @@ public enum EvidencePayloadBuilder {
         ]
         if digest != nil {
             // #102 (F9): `memory_digest.model` denotes the SYNTHESIS engine — the
-            // model that PRODUCED the digest draft (always Sonnet = the engine the
-            // user selected for notes), NOT the per-call combined-audit model. The
+            // model that PRODUCED the digest draft (the memory-digest engine
+            // selection), NOT the per-call combined-audit model. The
             // audit model (which may be the cheaper Haiku when the toggle is ON)
             // lives in the cloud-spend RECEIPT, where the ledger truth is keyed.
             // This provenance field intentionally stays the synthesis model.
@@ -206,8 +206,12 @@ public enum EvidencePayloadBuilder {
                 "memory_digest",
                 .object([
                     ("prompt_version", .string(stampVersion.rawValue)),
-                    ("engine", .string(notes.provenance.engine)),
-                    ("model", .string(notes.provenance.model)),
+                    ("engine", .string(
+                        notes.provenance.digestEngine.isEmpty
+                            ? notes.provenance.engine : notes.provenance.digestEngine)),
+                    ("model", .string(
+                        notes.provenance.digestModel.isEmpty
+                            ? notes.provenance.model : notes.provenance.digestModel)),
                 ])))
         }
         let provenance: CanonicalJSONValue = .object(provenanceFields)

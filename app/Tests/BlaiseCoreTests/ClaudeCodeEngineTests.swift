@@ -126,7 +126,9 @@ private struct CPHarness {
 private func makeCPHarness(
     responses: [CPResponse],
     token: String? = "oauth-test-token-not-real",
-    binaryInstalled: Bool = true
+    binaryInstalled: Bool = true,
+    stagingDirectory: URL = FileManager.default.temporaryDirectory,
+    model: ClaudeNotesModel = .sonnet55
 ) async throws -> CPHarness {
     let database = try makeDatabase()
     let settings = SettingsStore(database: database)
@@ -173,8 +175,9 @@ private func makeCPHarness(
         descriptors: ClaudeCodeSummarizationEngine.descriptors,
         settings: settings, secrets: secrets)
     let engine = ClaudeCodeSummarizationEngine(
-        configuration: configuration, ledger: ledger,
+        configuration: configuration, ledger: ledger, model: model,
         homeDirectory: URL(fileURLWithPath: "/Users/fictional-tester"),
+        stagingDirectory: stagingDirectory,
         runner: runner)
     return CPHarness(
         engine: engine, database: database, invocations: invocations, binaryURL: binaryURL)
@@ -516,6 +519,36 @@ private func makeCPHarness(
         #expect(models == ["claude-sonnet-5-5"])
     }
 
+    @Test func opusSelectionStaysConsistentAcrossNotesAndDigest() async throws {
+        let harness = try await makeCPHarness(responses: [
+            cpStructuredSuccess(structuredOutputJSON: cpNotesJSON),
+            cpSuccess(result: cpDigestText),
+        ], model: .opus55)
+        defer { try? FileManager.default.removeItem(at: harness.binaryURL) }
+        let notes = try await harness.engine.generateNotes(makeNotesRequest())
+        let digest = try await harness.engine.generateDigest(cpDigestRequest())
+
+        #expect(harness.engine.id == "claude-opus-5-5-cli")
+        #expect(harness.engine.configurationID == "claude-cli")
+        #expect(harness.engine.suppressesAutoFallback)
+        #expect(notes.provenance.engine == harness.engine.id)
+        #expect(notes.provenance.model == "claude-opus-5-5")
+        #expect(digest.usage?.estimatedCostUSD == 0)
+        #expect(harness.invocations.values.count == 3) // notes, digest synthesis, combined audit
+        for invocation in harness.invocations.values {
+            let index = try #require(invocation.args.firstIndex(of: "--model"))
+            #expect(invocation.args[index + 1] == "claude-opus-5-5")
+            let effortIndex = try #require(invocation.args.firstIndex(of: "--effort"))
+            #expect(invocation.args[effortIndex + 1] == "high")
+            #expect(invocation.env["ANTHROPIC_API_KEY"] == nil)
+        }
+        let receipts = try await harness.database.pool.read { db in
+            try CloudSpendReceipt.fetchAll(db)
+        }
+        #expect(receipts.count == 3)
+        #expect(receipts.allSatisfy { $0.engineID == harness.engine.id && $0.model == "claude-opus-5-5" && $0.costUSD == 0 })
+    }
+
     /// The schema-validated `structured_output` object is read (mapped to a
     /// NotesResult) EVEN WHEN `result` is prose/garbage — proving the engine reads
     /// `structured_output`, not `result`, on the notes path.
@@ -843,5 +876,65 @@ private func makeCPHarness(
         let result = ClaudeCodeSummarizationEngine.repairDoubleEscapedDetailedNotes(
             notes(detailed: plain))
         #expect(result.detailedNotes == plain)
+    }
+}
+
+// MARK: - Staging faults (local, deterministic: permanent on every caller)
+
+@Suite struct ClaudeCodeStagingFaultTests {
+    enum Fault: String, CaseIterable, Sendable {
+        /// The staging directory is missing: the system-prompt file cannot be written.
+        case systemPromptFile
+        /// Files can be written but no directory created: the throwaway HOME cannot be.
+        case throwawayHome
+    }
+
+    enum Caller: String, CaseIterable, Sendable {
+        case notes, digest, editor, digestEditor
+    }
+
+    @Test(
+        "a staging fault is permanent for notes synthesis, the digest, the notes editor and the digest editor, and spawns nothing",
+        arguments: Fault.allCases, Caller.allCases)
+    func stagingFaultIsPermanent(fault: Fault, caller: Caller) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("blaise-cp-staging-test-\(UUID().uuidString)", isDirectory: true)
+        let staging = fault == .systemPromptFile ? root.appendingPathComponent("missing") : root
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        if fault == .throwawayHome { try acl(root, "+a", "everyone deny add_subdirectory") }
+        defer {
+            try? acl(root, "-N")
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let harness = try await makeCPHarness(
+            responses: [cpSuccess(result: cpDigestText)], stagingDirectory: staging)
+        let error = await engineError {
+            switch caller {
+            case .notes: _ = try await harness.engine.generateNotes(makeNotesRequest())
+            case .digest: _ = try await harness.engine.generateDigest(cpDigestRequest())
+            case .editor:
+                _ = try await harness.engine.editNotes(makeNotesEditorRequest(), purpose: .notesEditor)
+            case .digestEditor:
+                _ = try await harness.engine.editDigest(makeDigestEditorRequest(), purpose: .digestEditor)
+            }
+        }
+        guard case .permanent(let reason) = error else {
+            Issue.record("expected a permanent staging fault, got \(String(describing: error))")
+            return
+        }
+        #expect(reason.hasPrefix(
+            fault == .systemPromptFile
+                ? "could not stage the system-prompt file" : "could not stage the throwaway HOME dir"))
+        #expect(harness.invocations.values.isEmpty)
+    }
+
+    private func acl(_ url: URL, _ arguments: String...) throws {
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = arguments + [url.path]
+        try chmod.run()
+        chmod.waitUntilExit()
+        #expect(chmod.terminationStatus == 0)
     }
 }

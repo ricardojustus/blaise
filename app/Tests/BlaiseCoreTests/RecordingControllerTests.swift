@@ -640,6 +640,71 @@ struct RecordingControllerTests {
         #expect(started < stopped)
     }
 
+    @Test("a second trigger while start, grace resume or resume-from-pause is opening is refused before the engine", arguments: ["start", "grace", "pause"])
+    func doubleTriggerRefusedWhileOpening(path: String) async throws {
+        let harness = try makeControllerHarness()
+        var meetingID: MeetingID?
+        if path != "start" {
+            meetingID = try await harness.controller.start(source: .meet).id
+            if path == "pause" {
+                _ = try await harness.controller.pause()
+            } else {
+                _ = try await harness.controller.autoStop(finalizeImmediately: false)
+            }
+        }
+        let baseline = harness.engine.state.withLock { $0.startCalls }
+        // Hold ONLY the first engine start of the pair open; the real engine
+        // traps (`precondition(stopped)`) if a second start reaches it.
+        let gate = EditorGate()
+        let engine = harness.engine
+        engine.state.withLock {
+            $0.duringStart = {
+                if engine.state.withLock({ $0.startCalls }) == baseline + 1 { await gate.enterAndWait() }
+            }
+        }
+        let controller = harness.controller
+        let resumeID = meetingID
+        let trigger: @Sendable () async throws -> Void = {
+            switch path {
+            case "start": _ = try await controller.start(source: .meet)
+            case "grace": _ = try await controller.resume(meetingID: resumeID!)
+            default: _ = try await controller.resumePaused(meetingID: resumeID!)
+            }
+        }
+        let first = Task { try await trigger() }
+        await gate.waitUntilEntered()
+        await #expect(throws: RecordingControllerError.alreadyRecording) { try await trigger() }
+        #expect(engine.state.withLock { $0.startCalls } == baseline + 1)
+        gate.release()
+        try await first.value
+        #expect(await controller.currentSession() != nil)
+        _ = try await controller.stop()
+    }
+
+    @Test("grace-to-paused conversion is refused while a start is live or still opening", arguments: [false, true])
+    func gracePauseRefusedBesideAStart(opening: Bool) async throws {
+        let harness = try makeControllerHarness()
+        let controller = harness.controller
+        // A meeting held in grace: auto-stopped, row still `recording`, no session.
+        let grace = try await controller.start(source: .meet)
+        _ = try await controller.autoStop(finalizeImmediately: false)
+
+        let gate = EditorGate()
+        if opening {
+            harness.engine.state.withLock { $0.duringStart = { await gate.enterAndWait() } }
+        } else {
+            gate.release()
+        }
+        let next = Task { try await controller.start(source: .meet) }
+        if opening { await gate.waitUntilEntered() } else { _ = try await next.value }
+
+        #expect(await controller.pauseGraceMeeting(meetingID: grace.id) == false)
+        #expect(try await MeetingRepository(database: harness.database).fetch(grace.id)?.status == .recording)
+        gate.release()
+        _ = try await next.value
+        _ = try await controller.stop()
+    }
+
     @Test("a busy database writer never delays the write-failure stop", arguments: [false, true])
     func busyWriterDoesNotDelayWriteFailureStop(duringStart: Bool) async throws {
         let harness = try makeControllerHarness()

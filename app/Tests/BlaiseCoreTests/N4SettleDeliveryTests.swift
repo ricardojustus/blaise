@@ -82,7 +82,8 @@ final class SettleScriptedEngine:
         return DigestResult(
             digest: digest,
             usage: EngineUsage(inputUnits: 80, outputUnits: 40, estimatedCostUSD: nil),
-            promptVersion: DigestPromptBuilder.shippedVersion.rawValue)
+            promptVersion: DigestPromptBuilder.shippedVersion.rawValue,
+            model: "scripted")
     }
 
     func editNotes(

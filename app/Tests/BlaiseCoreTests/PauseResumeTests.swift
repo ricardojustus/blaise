@@ -291,9 +291,20 @@ struct PauseResumeTests {
         let harness = try makePauseHarness(transactionHook: { throw TestFailure() })
         let meeting = try await harness.controller.start(source: .meet)
 
+        var iterator = await harness.controller.subscribeForTest().makeAsyncIterator()
         await #expect(throws: TestFailure.self) {
             try await harness.controller.pause()
         }
+        // The stopped engine's session is released: a new recording starts
+        // without a relaunch, and the indicator got the stop events.
+        let next = try await harness.controller.start(source: .meet)
+        #expect(await harness.controller.currentSession()?.meetingID == next.id)
+        await harness.controller.finishEventStreamsForTest()
+        var sawStopped = false
+        while let event = await iterator.next() {
+            if case .stopped(meeting.id, let alarm, false) = event, alarm != nil { sawStopped = true }
+        }
+        #expect(sawStopped)
         // Neither the status flip NOR the part close committed: status stays
         // `recording` and the part row is still OPEN (no ended_at) — today's
         // kill-mid-capture semantics, exactly as AC4's pre-commit half says.
@@ -305,6 +316,41 @@ struct PauseResumeTests {
                 arguments: [meeting.id]) ?? -1
         }
         #expect(openParts == 1)
+    }
+
+    @Test("a failed pause whose only audio is in part 2 (part 1 paused empty) is re-dispatched at the next launch")
+    func failedPauseLaterPartAudioRedispatched() async throws {
+        let failCommit = Mutex(false)
+        let harness = try makePauseHarness(transactionHook: {
+            if failCommit.withLock({ $0 }) { throw TestFailure() }
+        })
+        let paths = harness.database.paths
+        // Part 1 paused empty: its zero-frame files and row are dropped.
+        harness.engine.state.withLock { $0.plantMode = .emptyStubs }
+        let meeting = try await harness.controller.start(source: .meet)
+        try await harness.controller.pause()
+        #expect(!FileManager.default.fileExists(atPath: paths.audioURL(meeting.id).path))
+        #expect(!FileManager.default.fileExists(atPath: paths.audioMicURL(meeting.id).path))
+        // Part 2 records real audio; its pause commit then fails.
+        harness.engine.state.withLock { $0.plantMode = .real }
+        try await harness.controller.resumePaused(meetingID: meeting.id)
+        failCommit.withLock { $0 = true }
+        await #expect(throws: TestFailure.self) {
+            try await harness.controller.pause()
+        }
+        #expect(FileManager.default.fileExists(atPath: paths.audioURL(meeting.id, part: 2).path))
+
+        // Relaunch: the startup sweep flips the row to failed/"interrupted",
+        // and the launch re-dispatch picks up the part-2 audio.
+        let reopened = try BlaiseDatabase(rootURL: harness.database.rootURL)
+        let swept = try #require(try await MeetingRepository(database: reopened).fetch(meeting.id))
+        #expect(swept.status == .failed)
+        #expect(swept.lastProcessingError == "interrupted")
+        let kicked = Recorder<MeetingID>()
+        let redispatched = await CaptureRecovery.redispatchInterrupted(
+            database: reopened, kick: { kicked.append($0) })
+        #expect(redispatched == [meeting.id])
+        #expect(kicked.values == [meeting.id])
     }
 
     @Test("AC3: a NON-discriminating hook (success) commits both writes together")
@@ -594,7 +640,7 @@ struct PauseResumeTests {
         var sawPaused = false
         var sawStopped = false
         while let event = await iterator.next() {
-            if case .paused(meeting.id, let secs) = event {
+            if case .paused(meeting.id, _, let secs) = event {
                 #expect(secs == 12.0)  // sum of the closed part-1 duration
                 sawPaused = true
             }
@@ -604,6 +650,49 @@ struct PauseResumeTests {
         // It is a pause, never a stop/processing kick.
         #expect(!sawStopped)
         #expect(harness.kicks.values.isEmpty)
+    }
+
+    @Test("pauseGraceMeeting on a row that already left `recording` emits no .paused")
+    func gracePauseNoOpEmitsNothing() async throws {
+        let harness = try makePauseHarness()
+        let meeting = makeMeeting(status: .processing)
+        try await MeetingRepository(database: harness.database).create(meeting)
+
+        var iterator = await harness.controller.subscribeForTest().makeAsyncIterator()
+        await harness.controller.pauseGraceMeeting(meetingID: meeting.id)
+        await harness.controller.finishEventStreamsForTest()
+
+        #expect(try await status(harness.database, meeting.id) == "processing")
+        var events: [RecordingEvent] = []
+        while let event = await iterator.next() { events.append(event) }
+        #expect(events.isEmpty)
+    }
+
+    @Test(".paused carries the row's current title, for a live pause and a grace conversion", arguments: [false, true])
+    func pausedEventCarriesCurrentTitle(fromGrace: Bool) async throws {
+        let harness = try makePauseHarness()
+        let meeting = try await harness.controller.start(source: .meet)
+        if fromGrace { _ = try await harness.controller.autoStop(finalizeImmediately: false) }
+        // Renamed after start: the controller's start-time snapshot is stale.
+        try await harness.database.pool.write { db in
+            try db.execute(
+                sql: "UPDATE meeting SET title = ? WHERE id = ?",
+                arguments: ["Vexatron Labs roadmap", meeting.id])
+        }
+
+        var iterator = await harness.controller.subscribeForTest().makeAsyncIterator()
+        if fromGrace {
+            #expect(await harness.controller.pauseGraceMeeting(meetingID: meeting.id))
+        } else {
+            _ = try await harness.controller.pause()
+        }
+        await harness.controller.finishEventStreamsForTest()
+
+        var titles: [String] = []
+        while let event = await iterator.next() {
+            if case .paused(meeting.id, let title, _) = event { titles.append(title) }
+        }
+        #expect(titles == ["Vexatron Labs roadmap"])
     }
 
     @Test("H-3 (handler half): the grace→Pause machine-input order lands .paused with NO processing display")
@@ -874,5 +963,70 @@ struct PauseResumeTests {
         try await CaptureParts.insertPart(database, meetingID: meeting.id, partIndex: 3, startedAtMs: 30_000)
         let total = await CaptureParts.accumulatedRecordedSeconds(database, meetingID: meeting.id)
         #expect(total == 15.0)  // 10 + 5; the open part 3 contributes nothing
+    }
+
+    /// Resumes `meeting` through `resume` and returns the controller events,
+    /// plus the closed-part total those events should carry.
+    private func resumeEvents(
+        _ harness: PauseHarness, _ meeting: Meeting, resume: () async throws -> Void
+    ) async throws -> (events: [RecordingEvent], closed: TimeInterval) {
+        var iterator = await harness.controller.subscribeForTest().makeAsyncIterator()
+        try await resume()
+        await harness.controller.finishEventStreamsForTest()
+        var events: [RecordingEvent] = []
+        while let event = await iterator.next() { events.append(event) }
+        // The resumed part is open, so this is the closed-part total.
+        let closed = await CaptureParts.accumulatedRecordedSeconds(
+            harness.database, meetingID: meeting.id)
+        return (events, closed)
+    }
+
+    /// The index of `.resumed` for `id` (with its seconds) and of `.started`.
+    private func resumeOrder(_ events: [RecordingEvent], _ id: MeetingID) -> (
+        resumed: Int?, seconds: TimeInterval?, started: Int?
+    ) {
+        var resumed: Int?, seconds: TimeInterval?, started: Int?
+        for (i, event) in events.enumerated() {
+            if case .resumed(id, _, let s) = event, resumed == nil { (resumed, seconds) = (i, s) }
+            if case .started(id, _) = event, started == nil { started = i }
+        }
+        return (resumed, seconds, started)
+    }
+
+    @Test("resume-from-pause emits .resumed with the accumulated time BEFORE .started (the timer base)")
+    func resumePausedEmitsResumedBeforeStarted() async throws {
+        let harness = try makePauseHarness()
+        let meeting = try await harness.controller.start(source: .meet)
+        try await Task.sleep(for: .milliseconds(20))
+        try await harness.controller.pause()
+        let (events, closed) = try await resumeEvents(harness, meeting) {
+            _ = try await harness.controller.resumePaused(meetingID: meeting.id)
+        }
+        let order = resumeOrder(events, meeting.id)
+        let resumed = try #require(order.resumed)
+        let started = try #require(order.started)
+        #expect(resumed < started)
+        #expect(closed > 0)
+        #expect(order.seconds == closed)
+    }
+
+    @Test("a grace resume continues the timer too: .resumed carries every closed part, before .started")
+    func graceResumeEmitsAccumulated() async throws {
+        let harness = try makePauseHarness()
+        let meeting = try await harness.controller.start(source: .meet)
+        try await Task.sleep(for: .milliseconds(20))
+        try await harness.controller.pause()
+        _ = try await harness.controller.resumePaused(meetingID: meeting.id)
+        try await Task.sleep(for: .milliseconds(20))
+        _ = try await harness.controller.autoStop(finalizeImmediately: false)
+        let (events, closed) = try await resumeEvents(harness, meeting) {
+            _ = try await harness.controller.resume(meetingID: meeting.id)
+        }
+        let order = resumeOrder(events, meeting.id)
+        let resumed = try #require(order.resumed)
+        let started = try #require(order.started)
+        #expect(resumed < started)
+        #expect(closed > 0)
+        #expect(order.seconds == closed)
     }
 }

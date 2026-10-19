@@ -7,7 +7,9 @@ import os
 // MARK: - Engines tab
 
 public enum EngineSlot: String, Sendable, CaseIterable {
-    case asr, summarization
+    /// `digest` picks from the summarization engines; an empty selection is
+    /// "Same as notes".
+    case asr, summarization, digest
 }
 
 /// Engine pickers + the pinned prepare UX state machine:
@@ -27,6 +29,7 @@ public final class EngineSettingsModel {
         public var kind: EngineKind
         public var costSummary: String?
         public var configDescriptors: [EngineConfigDescriptor]
+        public var configurationID: String
         /// nil = available.
         public var availabilityReason: String?
     }
@@ -41,8 +44,11 @@ public final class EngineSettingsModel {
     public private(set) var summarizationRows: [EngineRow] = []
     public private(set) var selectedASRID: String = EngineDefaults.asrEngineID
     public private(set) var selectedSummarizationID: String = EngineDefaults.summarizationEngineID
+    /// "" = Same as notes.
+    public private(set) var selectedDigestID: String = ""
     public private(set) var asrPrepare: PrepareState = .idle
     public private(set) var summarizationPrepare: PrepareState = .idle
+    public private(set) var digestPrepare: PrepareState = .idle
 
     private let registry: EngineRegistry
     private let settings: SettingsStore
@@ -61,6 +67,9 @@ public final class EngineSettingsModel {
         selectedSummarizationID =
             (try? await settings.get(EngineResolver.summarizationSettingsKey, as: String.self))
             ?? nil ?? EngineDefaults.summarizationEngineID
+        selectedDigestID =
+            (try? await settings.get(EngineResolver.digestSettingsKey, as: String.self))
+            ?? nil ?? ""
         await refreshRows()
     }
 
@@ -77,7 +86,7 @@ public final class EngineSettingsModel {
             summarization.append(await row(
                 id: engine.id, name: engine.displayName, kind: engine.kind,
                 cost: engine.costDescriptor, descriptors: engine.configDescriptors,
-                availability: engine.availability()))
+                availability: engine.availability(), configurationID: engine.configurationID))
         }
         asrRows = asr
         summarizationRows = summarization
@@ -85,21 +94,30 @@ public final class EngineSettingsModel {
 
     private func row(
         id: String, name: String, kind: EngineKind, cost: EngineCostDescriptor?,
-        descriptors: [EngineConfigDescriptor], availability: EngineAvailability
+        descriptors: [EngineConfigDescriptor], availability: EngineAvailability,
+        configurationID: String? = nil
     ) -> EngineRow {
         var reason: String?
         if case .unavailable(let value) = availability { reason = value }
         return EngineRow(
             id: id, displayName: name, kind: kind, costSummary: cost?.pricingSummary,
-            configDescriptors: descriptors, availabilityReason: reason)
+            configDescriptors: descriptors, configurationID: configurationID ?? id, availabilityReason: reason)
     }
 
     public func selectedID(_ slot: EngineSlot) -> String {
-        slot == .asr ? selectedASRID : selectedSummarizationID
+        switch slot {
+        case .asr: selectedASRID
+        case .summarization: selectedSummarizationID
+        case .digest: selectedDigestID
+        }
     }
 
     public func prepareState(_ slot: EngineSlot) -> PrepareState {
-        slot == .asr ? asrPrepare : summarizationPrepare
+        switch slot {
+        case .asr: asrPrepare
+        case .summarization: summarizationPrepare
+        case .digest: digestPrepare
+        }
     }
 
     /// Select + eager prepare. The settings write happens FIRST and the
@@ -109,8 +127,11 @@ public final class EngineSettingsModel {
     /// launch. A write that fails leaves the previous selection standing, which
     /// is the one still persisted; a prepare failure is never rolled back.
     public func select(_ id: String, slot: EngineSlot) async {
-        let key = slot == .asr
-            ? EngineResolver.asrSettingsKey : EngineResolver.summarizationSettingsKey
+        let key = switch slot {
+        case .asr: EngineResolver.asrSettingsKey
+        case .summarization: EngineResolver.summarizationSettingsKey
+        case .digest: EngineResolver.digestSettingsKey
+        }
         do {
             try await settings.set(key, to: id)
         } catch {
@@ -119,6 +140,7 @@ public final class EngineSettingsModel {
         switch slot {
         case .asr: selectedASRID = id
         case .summarization: selectedSummarizationID = id
+        case .digest: selectedDigestID = id
         }
         await prepare(slot: slot, engineID: id)
     }
@@ -128,15 +150,22 @@ public final class EngineSettingsModel {
         await prepare(slot: slot, engineID: selectedID(slot))
     }
 
-    /// Launch retry: fires prepare for both selected engines.
+    /// Launch retry: fires prepare for every selected engine.
     public func prepareSelectedEnginesAtLaunch() async {
         await load()
         async let asr: Void = prepare(slot: .asr, engineID: selectedASRID)
         async let summarization: Void = prepare(slot: .summarization, engineID: selectedSummarizationID)
-        _ = await (asr, summarization)
+        async let digest: Void = prepare(slot: .digest, engineID: selectedDigestID)
+        _ = await (asr, summarization, digest)
     }
 
     private func prepare(slot: EngineSlot, engineID: String) async {
+        // "Same as notes" has nothing of its own to prepare.
+        if slot == .digest, engineID.isEmpty {
+            prepareGeneration[slot] = (prepareGeneration[slot] ?? 0) + 1
+            setPrepareState(.idle, slot: slot)
+            return
+        }
         let generation = (prepareGeneration[slot] ?? 0) + 1
         prepareGeneration[slot] = generation
         setPrepareState(.preparing(engineID: engineID), slot: slot)
@@ -147,7 +176,7 @@ public final class EngineSettingsModel {
                     throw EngineError.notAvailable(reason: "engine '\(engineID)' is not registered")
                 }
                 try await engine.prepare()
-            case .summarization:
+            case .summarization, .digest:
                 guard let engine = registry.summarizationEngine(id: engineID) else {
                     throw EngineError.notAvailable(reason: "engine '\(engineID)' is not registered")
                 }
@@ -176,7 +205,8 @@ public final class EngineSettingsModel {
         let availability: EngineAvailability? =
             switch slot {
             case .asr: await registry.asrEngine(id: engineID)?.availability()
-            case .summarization: await registry.summarizationEngine(id: engineID)?.availability()
+            case .summarization, .digest:
+                await registry.summarizationEngine(id: engineID)?.availability()
             }
         if case .unavailable(let reason) = availability { return reason }
         if let error = error as? EngineError { return ProcessingPipeline.humanReason(error) }
@@ -187,6 +217,7 @@ public final class EngineSettingsModel {
         switch slot {
         case .asr: asrPrepare = state
         case .summarization: summarizationPrepare = state
+        case .digest: digestPrepare = state
         }
     }
 }

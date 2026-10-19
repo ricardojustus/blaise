@@ -1349,6 +1349,34 @@ private final class NoCharacterLayout: NSObject, NSTextLayoutManagerDelegate {
         // It still stands at the right end, as far as the column lets it.
         #expect(bar.frame.maxX >= right - 0.5)
     }
+
+    @Test("in a pane narrower than the full measure, the bar for words at a line's end stays inside the pane", arguments: [518, 600, 700])
+    func barInsideANarrowPane(width: Int) throws {
+        let line = "Vexatron Labs moved the kelp survey to Thursday so the jetty crew at Quoll Harbor can calibrate the buoy firmware first, then log the tide readings."
+        let doc = NotesDocumentBuilder.build(
+            NotesDocInput(
+                structured: NotesStructured(
+                    summary: line, detailedNotes: "One closing line.",
+                    decisions: [], actionItems: [], userActionItems: []),
+                doneKeys: [], searchTerms: [], portuguese: false, userActionTitle: "Demo User — Action Items",
+                direction: .aquarela))
+        let hosted = Hosted(width: CGFloat(width))
+        defer { hosted.close() }
+        let block = try #require(doc.blocks.first { $0.section == .summary && $0.range.length > 0 })
+        hosted.show(hosted.spec(doc))
+        let all = NSRange(location: 0, length: doc.text.length)
+        let firstLine = try #require(hosted.controller.markRects(NSRange(location: block.range.location, length: 1), visible: all).first).minY
+        let onFirstLine = (block.range.location..<NSMaxRange(block.range)).filter {
+            hosted.controller.markRects(NSRange(location: $0, length: 1), visible: all).first.map { abs($0.minY - firstLine) < 1 } ?? false
+        }
+        hosted.controller.textView.setSelectedRange(NSRange(location: onFirstLine.last! - 5, length: 5))
+        hosted.show(hosted.spec(doc, aim: NotesDocAim(anchorID: block.anchorID, isSpan: true)))
+        let bar = try #require(hosted.controller.textView.subviews.flatMap(\.subviews).first {
+            $0 is NSHostingView<AnyView> && abs($0.frame.height - SelectionActionBar.size.height) < 0.5
+        })
+        let pane = hosted.controller.scrollView
+        #expect(bar.convert(bar.bounds, to: pane).maxX <= pane.bounds.maxX + 0.5)
+    }
 }
 
 @MainActor

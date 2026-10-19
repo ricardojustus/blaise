@@ -70,7 +70,8 @@ final class AnchoringStubEngine:
         DigestResult(
             digest: "## HEADER\nmeeting: Quoll Harbor sync\nspeaker: (none resolved)\n",
             usage: EngineUsage(inputUnits: 1, outputUnits: 1, estimatedCostUSD: nil),
-            promptVersion: DigestPromptBuilder.shippedVersion.rawValue)
+            promptVersion: DigestPromptBuilder.shippedVersion.rawValue,
+            model: "stub")
     }
 
     func editNotes(_ request: NotesEditorRequest, purpose: CloudSpendPurpose) async throws -> NotesEditorResult {

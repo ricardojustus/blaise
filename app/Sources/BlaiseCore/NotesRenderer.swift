@@ -131,8 +131,8 @@ public enum NotesRenderer {
         // redundant there); the fenced-blob path renders the quoted form after
         // the whole blob, where adjacency no longer names the anchor.
         var detailedAsides: [Int: [(quote: String, text: String)]] = [:]
-        // A passage anchored in the detailed notes: after the whole section,
-        // quoted by its pieces (a rendered block has no raw paragraph index).
+        // A passage or a whole table anchored in the detailed notes: after the
+        // whole section, quoted (a rendered block has no raw paragraph index).
         var detailedPassageAsides: [(quote: String, text: String)] = []
         var decisionAsides: [(quote: String, text: String)] = []
         var actionAsides: [(quote: String, text: String)] = []
@@ -141,11 +141,9 @@ public enum NotesRenderer {
 
         static func plan(annotations: [MeetingCorrection], structured: NotesStructured) -> AnnotationWeave {
             var weave = AnnotationWeave()
-            let space = annotations.contains {
-                $0.kind == .annotation && CorrectionAnchoring.isPassage($0.quotedText)
-            } ? CorrectionAnchoring.RenderedSpace(structured) : nil
+            lazy var space = CorrectionAnchoring.RenderedSpace(structured)
             for row in annotations where row.kind == .annotation {
-                if let space, CorrectionAnchoring.isPassage(row.quotedText) {
+                if CorrectionAnchoring.isPassage(row.quotedText) {
                     weave.placePassage(row, in: space)
                     continue
                 }
@@ -154,7 +152,16 @@ public enum NotesRenderer {
                     let hit = CorrectionAnchoring.resolve(
                         quote: row.quotedText, occurrence: row.occurrence, in: blocks)
                 else {
-                    weave.unanchored.append((row.quotedText, row.userText))
+                    // A whole table lands where a passage in its section does.
+                    if CorrectionAnchoring.resolveTable(
+                        quote: row.quotedText, occurrence: row.occurrence, section: row.section, in: space) == nil
+                    {
+                        weave.unanchored.append((row.quotedText, row.userText))
+                    } else if row.section == .summary {
+                        weave.summaryAsides.append(row.userText)
+                    } else {
+                        weave.detailedPassageAsides.append((row.quotedText, row.userText))
+                    }
                     continue
                 }
                 switch row.section {

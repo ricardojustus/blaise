@@ -101,6 +101,9 @@ public struct IndicatorStateMachine: Sendable, Equatable {
         var accumulatedSeconds: TimeInterval
     }
     private var paused: PausedMeeting?
+    /// Recorded time before the part a pause-resume opens; the next
+    /// `.captureStarted` backdates the timer by it, then clears it.
+    private var resumedBaseSeconds: TimeInterval = 0
     /// Standing processing flag: a stop/auto-stop/End handed the meeting to the
     /// pipeline and the run has not finished. Cleared by `.processingFinished`.
     /// Spec §4 priority places processing ABOVE grace and paused.
@@ -143,7 +146,9 @@ public struct IndicatorStateMachine: Sendable, Equatable {
         /// G9 manual pause: the meeting is held open (no live capture).
         case meetingPaused(meetingTitle: String, accumulatedSeconds: TimeInterval)
         /// G9 paused meeting resumed (a `.captureStarted` follows immediately).
-        case meetingResumed
+        /// Carries the recorded time before this part so the timer continues
+        /// from it instead of restarting at zero.
+        case meetingResumed(accumulatedSeconds: TimeInterval)
         /// G9 paused meeting Ended → processing (the kick fires).
         case meetingEnded
     }
@@ -156,7 +161,8 @@ public struct IndicatorStateMachine: Sendable, Equatable {
             // paused state for THIS meeting; recording resumes the live
             // display. A standing grace for a DIFFERENT meeting stays stored
             // and resurfaces once this recording stops.
-            startedAt = at
+            startedAt = at.addingTimeInterval(-resumedBaseSeconds)
+            resumedBaseSeconds = 0
             micSilence = false
             systemAudioUnavailable = false
             captureDown = false
@@ -230,9 +236,10 @@ public struct IndicatorStateMachine: Sendable, Equatable {
             systemAudioUnavailable = false
             captureDown = false
             paused = PausedMeeting(title: title, accumulatedSeconds: seconds)
-        case .meetingResumed:
+        case .meetingResumed(let seconds):
             // `.captureStarted` follows immediately.
             paused = nil
+            resumedBaseSeconds = seconds
         case .meetingEnded:
             // End-from-pause flips into processing.
             paused = nil

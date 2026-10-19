@@ -382,12 +382,18 @@ public struct NotesProvenance: Codable, Sendable, Equatable {
     /// same way it depends on `rendererVersion`, so it travels in provenance.
     /// Decode-default "" — additive, no migration.
     public var userName: String
+    /// The engine id and model that synthesized the stored memory digest.
+    /// Empty when no digest was synthesized under this field (the payload then
+    /// names the notes engine and model). Decode-default "" — additive, no
+    /// migration.
+    public var digestEngine: String
+    public var digestModel: String
 
     public init(
         engine: String, model: String, pipelineVersion: String, runtime: String = "",
         rendererVersion: String = "", promptVersion: String = "",
         nameSubstitutions: [NameSubstitution.ReportEntry] = [],
-        userName: String = ""
+        userName: String = "", digestEngine: String = "", digestModel: String = ""
     ) {
         self.engine = engine
         self.model = model
@@ -397,6 +403,8 @@ public struct NotesProvenance: Codable, Sendable, Equatable {
         self.promptVersion = promptVersion
         self.nameSubstitutions = nameSubstitutions
         self.userName = userName
+        self.digestEngine = digestEngine
+        self.digestModel = digestModel
     }
 
     enum CodingKeys: String, CodingKey {
@@ -406,6 +414,8 @@ public struct NotesProvenance: Codable, Sendable, Equatable {
         case promptVersion = "prompt_version"
         case nameSubstitutions = "name_substitutions"
         case userName = "user_name"
+        case digestEngine = "digest_engine"
+        case digestModel = "digest_model"
     }
 
     public init(from decoder: Decoder) throws {
@@ -420,6 +430,8 @@ public struct NotesProvenance: Codable, Sendable, Equatable {
             try container.decodeIfPresent([NameSubstitution.ReportEntry].self, forKey: .nameSubstitutions)
             ?? []
         self.userName = try container.decodeIfPresent(String.self, forKey: .userName) ?? ""
+        self.digestEngine = try container.decodeIfPresent(String.self, forKey: .digestEngine) ?? ""
+        self.digestModel = try container.decodeIfPresent(String.self, forKey: .digestModel) ?? ""
     }
 }
 

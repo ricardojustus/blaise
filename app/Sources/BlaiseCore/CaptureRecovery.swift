@@ -406,7 +406,6 @@ public enum CaptureRecovery {
         excluding: Set<MeetingID> = [],
         kick: @escaping @Sendable (MeetingID) async -> Void
     ) async -> [MeetingID] {
-        let fm = FileManager.default
         let paths = database.paths
         let rows =
             (try? await database.pool.read { db in
@@ -417,10 +416,9 @@ public enum CaptureRecovery {
             }) ?? []
         var kicked: [MeetingID] = []
         for meetingID in rows where !excluding.contains(meetingID) {
-            let hasAudio =
-                fm.fileExists(atPath: paths.audioURL(meetingID).path)
-                || fm.fileExists(atPath: paths.audioMicURL(meetingID).path)
-            guard hasAudio else { continue }
+            // Any part's audio counts: part 1 may have been paused empty and
+            // dropped while later parts hold the recording.
+            guard CaptureParts.anyRetainedAudio(paths: paths, meetingID: meetingID) else { continue }
             await kick(meetingID)
             kicked.append(meetingID)
             logger.notice("interrupted meeting \(meetingID) has retained audio — re-dispatched")

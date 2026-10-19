@@ -57,7 +57,8 @@ private struct ClaudeHarness {
 
 private func makeClaudeHarness(
     responses: [(Int, String)] = [(200, successBody())],
-    apiKey: String? = "sk-test-not-a-real-key"
+    apiKey: String? = "sk-test-not-a-real-key",
+    model: ClaudeNotesModel = .sonnet46
 ) async throws -> ClaudeHarness {
     let database = try makeDatabase()
     let settings = SettingsStore(database: database)
@@ -76,7 +77,7 @@ private func makeClaudeHarness(
     let ledger = CloudSpendLedger(database: database)
     let api = FakeAPI(responses: responses)
     let engine = ClaudeSummarizationEngine(
-        configuration: configuration, ledger: ledger, transport: api.transport)
+        configuration: configuration, ledger: ledger, model: model, transport: api.transport)
     return ClaudeHarness(
         engine: engine, ledger: ledger, database: database, secrets: secrets,
         settings: settings, api: api)
@@ -766,7 +767,7 @@ private func makeClaudeDigestPipelineHarness(
         let first = try #require(try JSONSerialization.jsonObject(with: firstData) as? [String: Any])
         let second = try #require(try JSONSerialization.jsonObject(with: secondData) as? [String: Any])
         #expect(first["max_tokens"] as? Int == 8_192)
-        #expect(second["max_tokens"] as? Int == 16_384)
+        #expect(second["max_tokens"] as? Int == 32_000)
         #expect(requests[1].timeoutInterval == 480)
 
         // BOTH attempts billed → ledger counted both.
@@ -1059,15 +1060,16 @@ private let nonSchemaBody = "{\"unexpected\": \"this is not the notes schema\"}"
 /// pin the C gate's input independently of the body length).
 private func notesAPIBody(
     notes: String, stopReason: String = "end_turn",
-    inputTokens: Int = 12_000, outputTokens: Int = 2_500
+    inputTokens: Int = 12_000, outputTokens: Int = 2_500, leadingThinking: Bool = false
 ) -> String {
     let text = notes
         .replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
         .replacingOccurrences(of: "\n", with: "\\n")
+    let thinking = leadingThinking ? #"{"type": "thinking", "thinking": "", "signature": "sig"}, "# : ""
     return """
         {"id": "msg_test", "type": "message", "role": "assistant",
-         "content": [{"type": "text", "text": "\(text)"}],
+         "content": [\(thinking){"type": "text", "text": "\(text)"}],
          "stop_reason": "\(stopReason)",
          "usage": {"input_tokens": \(inputTokens), "output_tokens": \(outputTokens)}}
         """
@@ -1338,13 +1340,13 @@ private func makeNotesRequest(transcriptBytes bytes: Int) -> NotesRequest {
         let result = try await harness.engine.generateNotes(makeNotesRequest(transcriptBytes: 20_000))
 
         #expect(harness.api.requests.values.count == 2, "stub → exactly one retry (2 sends)")
-        // Budgets: 8 192 then 16 384.
+        // Budgets: 8 192 then the 32 000 retry.
         let firstData = try #require(harness.api.requests.values[0].httpBody)
         let secondData = try #require(harness.api.requests.values[1].httpBody)
         let firstBody = try JSONSerialization.jsonObject(with: firstData) as? [String: Any]
         let secondBody = try JSONSerialization.jsonObject(with: secondData) as? [String: Any]
         #expect(firstBody?["max_tokens"] as? Int == 8_192)
-        #expect(secondBody?["max_tokens"] as? Int == 16_384)
+        #expect(secondBody?["max_tokens"] as? Int == 32_000)
         // The full retry ships (its decisions/actions survive into the result).
         #expect(result.structured.decisions == ["Aprovar"])
         #expect(result.structured.actionItems.contains { $0.text == "preparar" })
@@ -1352,6 +1354,49 @@ private func makeNotesRequest(transcriptBytes bytes: Int) -> NotesRequest {
         let total = try await harness.ledger.accumulatedThisMonth()
         let expected = attemptCost(outputTokens: 505) + attemptCost(outputTokens: 4_000)
         #expect(abs(total - expected) < 1e-9, "both stub + retry are billed")
+    }
+
+    // Thinking models bill reasoning as output: a thin visible answer behind
+    // thousands of reasoning tokens is still a stub and still retries, while the
+    // same billed count on a non-thinking model stays a normal meeting.
+    @Test(arguments: [ClaudeNotesModel.sonnet55, .opus55, .sonnet46])
+    func reasoningTokensDoNotHideAStub(model: ClaudeNotesModel) async throws {
+        let stub = notesAPIBody(
+            notes: notesJSON(detailedNotes: "## Resumo\nA equipe discutiu e então"),
+            stopReason: "end_turn", outputTokens: 6_000, leadingThinking: model.thinks)
+        let full = notesAPIBody(
+            notes: notesJSON(
+                detailedNotes: "## Resumo\nUma discussão completa da reunião inteira.",
+                decisions: ["Aprovar"], actionItems: [("Wren", "preparar")]),
+            stopReason: "end_turn", outputTokens: 7_000, leadingThinking: model.thinks)
+        let harness = try await makeClaudeHarness(
+            responses: [(200, stub), (200, full)], model: model)
+        let result = try await harness.engine.generateNotes(makeNotesRequest(transcriptBytes: 20_000))
+
+        if model.thinks {
+            #expect(harness.api.requests.values.count == 2)
+            #expect(result.structured.decisions == ["Aprovar"])
+        } else {
+            #expect(harness.api.requests.values.count == 1)
+        }
+    }
+
+    // Two thinking-model stubs whose billed counts point the other way from
+    // their visible text: the retry gate and the best-of-two length rung both
+    // judge the visible answer, so the longer first draft ships.
+    @Test func thinkingModelStubsAreRankedByVisibleText() async throws {
+        let longStub = notesAPIBody(
+            notes: notesJSON(detailedNotes: "## Resumo\n" + String(repeating: "palavra ", count: 250)),
+            stopReason: "end_turn", outputTokens: 300, leadingThinking: true)
+        let shortStub = notesAPIBody(
+            notes: notesJSON(detailedNotes: "## Resumo\nA equipe"),
+            stopReason: "end_turn", outputTokens: 9_000, leadingThinking: true)
+        let harness = try await makeClaudeHarness(
+            responses: [(200, longStub), (200, shortStub)], model: .sonnet55)
+        let result = try await harness.engine.generateNotes(makeNotesRequest(transcriptBytes: 20_000))
+
+        #expect(harness.api.requests.values.count == 2)
+        #expect(result.structured.detailedNotes.contains("palavra"))
     }
 
     // Double-stub: both attempts are stubs → best-of-two ships, NO throw, the

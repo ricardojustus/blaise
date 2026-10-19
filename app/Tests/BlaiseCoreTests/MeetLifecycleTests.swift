@@ -287,7 +287,7 @@ private final class NoSessionAutomationController: RecordingAutomating, @uncheck
     func endPaused(meetingID: MeetingID) async throws -> Meeting {
         throw BlaiseDatabaseError.meetingNotFound(meetingID)
     }
-    func pauseGraceMeeting(meetingID: MeetingID) async {}
+    func pauseGraceMeeting(meetingID: MeetingID) async -> Bool { false }
     func pausedMeetingID(excluding: MeetingID?) async -> MeetingID? { nil }
 }
 

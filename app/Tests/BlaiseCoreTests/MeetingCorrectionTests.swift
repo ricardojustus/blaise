@@ -516,7 +516,7 @@ private func makeRow(
         let bytes = try Data(contentsOf: url)
         let hex = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
         #expect(
-            hex == "3d96bf824a76889158f68d7b8aa7959dabb6197bfdddc25f048ca81a46bb85e9",
+            hex == "6a58eb72eae68b58c0e6e7d1a4229e3db8621187e33fcc11676ccd38cbb84877",
             "the payload builder changed — re-pin deliberately, and only for a change whose new payload field is authorized by name")
     }
 

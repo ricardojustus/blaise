@@ -46,6 +46,18 @@ private final class MockAutomationController: RecordingAutomating, @unchecked Se
         var endPausedCalls: [MeetingID] = []
         var pauseGraceCalls: [MeetingID] = []
         var pausedMeetingIDs: [MeetingID] = []
+        /// true simulates the controller's atomic re-check refusing the
+        /// conversion (a start landed after the tracker's own checks).
+        var pauseGraceRefuses = false
+        /// Runs once on entry to `pauseGraceMeeting`, before the re-check
+        /// (models what lands just before the controller call).
+        var pauseGraceBefore: (@Sendable () async -> Void)?
+        /// Runs once after the conversion claimed the controller (models its
+        /// in-flight DB awaits; a concurrent conversion is refused meanwhile).
+        var pauseGraceInFlight: (@Sendable () async -> Void)?
+        var pauseGraceOpening = false
+        /// Runs once inside the next `pausedMeetingID` lookup.
+        var pausedLookupGate: (@Sendable () async -> Void)?
     }
 
     let state = MockBox(State())
@@ -161,19 +173,39 @@ private final class MockAutomationController: RecordingAutomating, @unchecked Se
         }
     }
 
-    func pauseGraceMeeting(meetingID: MeetingID) async {
-        state.with { s in
+    func pauseGraceMeeting(meetingID: MeetingID) async -> Bool {
+        let before = state.with { s in defer { s.pauseGraceBefore = nil }; return s.pauseGraceBefore }
+        await before?()
+        // The controller's atomic re-check: refused while a session is live or
+        // another start/resume/conversion is still opening.
+        let claimed = state.with { s in
             s.pauseGraceCalls.append(meetingID)
+            if s.pauseGraceRefuses || s.session != nil || s.pauseGraceOpening
+                || s.pausedMeetingIDs.contains(meetingID)  // the flip would no-op
+            {
+                return false
+            }
+            s.pauseGraceOpening = true
+            return true
+        }
+        guard claimed else { return false }
+        let inFlight = state.with { s in defer { s.pauseGraceInFlight = nil }; return s.pauseGraceInFlight }
+        await inFlight?()
+        return state.with { s in
+            s.pauseGraceOpening = false
             if var meeting = s.meetings[meetingID] {
                 meeting.status = .paused
                 s.meetings[meetingID] = meeting
             }
             s.pausedMeetingIDs.append(meetingID)
+            return true
         }
     }
 
     func pausedMeetingID(excluding: MeetingID?) async -> MeetingID? {
-        state.with { s in s.pausedMeetingIDs.first { $0 != excluding } }
+        let gate = state.with { s in defer { s.pausedLookupGate = nil }; return s.pausedLookupGate }
+        await gate?()
+        return state.with { s in s.pausedMeetingIDs.first { $0 != excluding } }
     }
 }
 
@@ -945,6 +977,74 @@ struct TrackerGraceTests {
         await h.tracker.evaluate()
         #expect(h.controller.state.with { $0.kicks } == [meeting.id])
     }
+
+    @Test("a grace Resume refused because another meeting is paused surfaces .actionFailed")
+    func refusedGraceResumeSurfaces() async throws {
+        let h = makeTrackerHarness()
+        let meeting = try await autoStopIntoGrace(h)
+        let refusal = RecordingControllerError.meetingPaused(
+            meetingID: ULID.generate(), title: "Quoll Harbor review")
+        h.controller.state.with { $0.resumeError = refusal }
+        let mirror = Recorder<MeetAutomationEvent>()
+        let events = await h.tracker.events()
+        let collector = Task { for await e in events { mirror.append(e) } }
+        defer { collector.cancel() }
+
+        await h.tracker.resumeFromGrace()
+
+        #expect(await waitUntil {
+            mirror.values.contains(.actionFailed(message: "Could not resume recording: \(refusal)"))
+        })
+        #expect(await h.tracker.graceState?.meetingID == meeting.id)
+    }
+
+    @Test("a grace Resume refused because another recording is live surfaces .actionFailed")
+    func refusedGraceResumeWhileLiveSurfaces() async throws {
+        let h = makeTrackerHarness()
+        let meeting = try await autoStopIntoGrace(h)
+        _ = try await h.controller.start(
+            source: .meet, title: "Quoll Harbor review", meetingCode: nil, attendees: [], anchor: nil)
+        let mirror = Recorder<MeetAutomationEvent>()
+        let events = await h.tracker.events()
+        let collector = Task { for await e in events { mirror.append(e) } }
+        defer { collector.cancel() }
+
+        await h.tracker.resumeFromGrace()
+
+        #expect(await waitUntil {
+            mirror.values.contains(.actionFailed(
+                message: "Could not resume recording: \(RecordingControllerError.alreadyRecording)"))
+        })
+        #expect(h.controller.state.with { $0.resumeCalls }.isEmpty)
+        #expect(await h.tracker.graceState?.meetingID == meeting.id)
+    }
+
+    @Test("a rejoin signal refused because another recording is live stays silent; the notification Resume surfaces .actionFailed")
+    func refusedRejoinSignalIsSilent() async throws {
+        let h = makeTrackerHarness()
+        let meeting = try await autoStopIntoGrace(h)
+        _ = try await h.controller.start(
+            source: .meet, title: "Quoll Harbor review", meetingCode: nil, attendees: [], anchor: nil)
+        let mirror = Recorder<MeetAutomationEvent>()
+        let events = await h.tracker.events()
+        let collector = Task { for await e in events { mirror.append(e) } }
+        defer { collector.cancel() }
+        let refusal = MeetAutomationEvent.actionFailed(
+            message: "Could not resume recording: \(RecordingControllerError.alreadyRecording)")
+
+        h.advance(5)
+        await h.signal(kind: .heartbeat)  // the grace call's rejoin heartbeat
+        await h.tracker.resumeFromGrace(meetingID: meeting.id)  // the notification action
+
+        #expect(h.controller.state.with { $0.resumeCalls }.isEmpty)
+        #expect(await h.tracker.graceState?.meetingID == meeting.id)
+        // A later event bounds the stream so the count below is final.
+        await h.tracker.finalizeGraceNow(meetingID: meeting.id)
+        #expect(await waitUntil {
+            mirror.values.contains(.graceEnded(meetingID: meeting.id, reason: .expired))
+        })
+        #expect(mirror.values.filter { $0 == refusal }.count == 1)
+    }
 }
 
 @Suite("C14 tracker: watchdog")
@@ -1317,6 +1417,198 @@ struct G9TrackerContractTests {
         #expect(await h.tracker.graceState?.meetingID == meeting.id)
     }
 
+    @Test("pauseFromGrace refused by the controller's atomic re-check leaves the grace standing")
+    func graceToPausedControllerRefusalKeepsGrace() async throws {
+        let h = makeTrackerHarness(resumeWindow: 300)
+        let meeting = try await startRecording(h)
+        await h.signal(kind: .heartbeat)
+        h.advance(310)
+        await h.tracker.evaluate()
+        h.advance(91)
+        await h.tracker.evaluate()  // watchdog fires → grace
+        let until = try #require(await h.tracker.graceState?.until)
+        // The tracker's own checks pass; a start landed before the write, so
+        // the controller refuses.
+        h.controller.state.with { $0.pauseGraceRefuses = true }
+
+        let converted = await h.tracker.pauseFromGrace(meetingID: meeting.id)
+        #expect(!converted)
+        #expect(h.controller.state.with { $0.pauseGraceCalls } == [meeting.id])
+        #expect(await h.tracker.graceState?.meetingID == meeting.id)
+        #expect(h.lastGraceWrite(meeting.id) == .some(Int64(until.timeIntervalSince1970 * 1000)))
+        #expect(!h.notifier.state.with { $0.watchdogWithdrawals }.contains(meeting.id))
+        // Expiry still finalizes it.
+        h.advance(300)
+        await h.tracker.evaluate()
+        #expect(h.controller.state.with { $0.kicks } == [meeting.id])
+        // The refusal left no paused-class suppression behind: the call is
+        // offered again like any finalized one.
+        await h.signal(kind: .heartbeat)
+        #expect(h.meetStartCount() == 1)
+    }
+
+    @Test("a heartbeat while the grace→Pause write is in flight never re-posts \"Meeting in progress\"")
+    func heartbeatDuringGracePauseDoesNotPost() async throws {
+        let h = makeTrackerHarness(resumeWindow: 300)
+        let meeting = try await graceViaLeave(h)
+        let flightEntered = MockBox(false), flightRelease = MockBox(false)
+        h.controller.state.with { $0.pauseGraceInFlight = gate(flightEntered, flightRelease) }
+        let tracker = h.tracker
+        let conversion = Task { await tracker.pauseFromGrace(meetingID: meeting.id) }
+        #expect(await waitUntil { flightEntered.with { $0 } })
+        h.advance(5)
+        await h.signal(kind: .heartbeat)
+        flightRelease.with { $0 = true }
+        #expect(await conversion.value)
+        #expect(h.meetStartCount() == 0)
+    }
+
+    /// Leave the call, then let the end-debounce auto-stop it into grace.
+    private func graceViaLeave(_ h: TrackerHarness) async throws -> Meeting {
+        let meeting = try await startRecording(h)
+        await h.signal(kind: .heartbeat)
+        h.advance(5)
+        await h.signal(kind: .callEnded, reason: "left")
+        h.advance(26)
+        await h.tracker.evaluate()
+        #expect(await h.tracker.graceState?.meetingID == meeting.id)
+        return meeting
+    }
+
+    /// Records entry, then holds until `release` is set (bounded).
+    private func gate(_ entered: MockBox<Bool>, _ release: MockBox<Bool>) -> @Sendable () async -> Void {
+        {
+            entered.with { $0 = true }
+            _ = await waitUntil(timeout: .seconds(5)) { release.with { $0 } }
+        }
+    }
+
+    @Test("two concurrent grace→Pause calls: the refused one never restores the grace the other converts")
+    func concurrentGracePausesNoRestore() async throws {
+        let h = makeTrackerHarness(resumeWindow: 300)
+        let meeting = try await graceViaLeave(h)
+        let lookupEntered = MockBox(false), lookupRelease = MockBox(false)
+        let flightEntered = MockBox(false), flightRelease = MockBox(false)
+        h.controller.state.with {
+            $0.pausedLookupGate = gate(lookupEntered, lookupRelease)
+            $0.pauseGraceInFlight = gate(flightEntered, flightRelease)
+        }
+        let tracker = h.tracker
+        let aDone = MockBox(false), bDone = MockBox(false)
+        // A holds in its pre-check; B starts while A's grace entry still stands.
+        let a = Task {
+            let r = await tracker.pauseFromGrace(meetingID: meeting.id)
+            aDone.with { $0 = true }
+            return r
+        }
+        #expect(await waitUntil { lookupEntered.with { $0 } })
+        let b = Task {
+            let r = await tracker.pauseFromGrace(meetingID: meeting.id)
+            bDone.with { $0 = true }
+            return r
+        }
+        #expect(await waitUntil { bDone.with { $0 } || flightEntered.with { $0 } })
+        // Whichever conversion is in flight, the other one finishes while it is.
+        lookupRelease.with { $0 = true }
+        #expect(await waitUntil {
+            aDone.with { $0 } || (bDone.with { $0 } && flightEntered.with { $0 })
+        })
+        flightRelease.with { $0 = true }
+        let results = [await a.value, await b.value]
+
+        #expect(results.filter { $0 }.count == 1)
+        #expect(await h.tracker.graceState == nil)
+        #expect(h.lastGraceWrite(meeting.id) == .some(nil))
+        // The paused call's fresh heartbeat never resumes it.
+        h.advance(5)
+        await h.signal(kind: .heartbeat)
+        #expect(h.controller.state.with { $0.resumeCalls }.isEmpty)
+    }
+
+    @Test("a grace→Pause refused because THIS meeting's resume went live (or was then paused) never re-arms its grace", arguments: [false, true])
+    func gracePauseRefusedAfterOwnResume(thenPaused: Bool) async throws {
+        let h = makeTrackerHarness(resumeWindow: 300)
+        let meeting = try await graceViaLeave(h)
+        let mirror = Recorder<MeetAutomationEvent>()
+        let events = await h.tracker.events()
+        let collector = Task { for await e in events { mirror.append(e) } }
+        defer { collector.cancel() }
+        let tracker = h.tracker, controller = h.controller
+        controller.state.with {
+            $0.pauseGraceBefore = {
+                // The meeting's own resume opened and its fact landed first.
+                controller.state.with {
+                    $0.session = RecordingSessionInfo(
+                        meetingID: meeting.id, meetingCode: TrackerHarness.code)
+                }
+                await tracker.recordingStarted(
+                    meetingID: meeting.id, meetingCode: TrackerHarness.code,
+                    title: "Weekly sync", partIndex: 2)
+                if thenPaused {
+                    controller.state.with {
+                        $0.session = nil
+                        $0.pausedMeetingIDs.append(meeting.id)
+                    }
+                    await tracker.recordingPaused(
+                        meetingID: meeting.id, meetingCode: TrackerHarness.code)
+                }
+            }
+        }
+
+        #expect(!(await h.tracker.pauseFromGrace(meetingID: meeting.id)))
+        #expect(await h.tracker.graceState == nil)
+        #expect(h.lastGraceWrite(meeting.id) == .some(nil))
+        let reason: GraceEndReason = thenPaused ? .paused : .resumed
+        #expect(await waitUntil { mirror.values.contains(.graceEnded(meetingID: meeting.id, reason: reason)) })
+        #expect(mirror.values.filter {
+            if case .graceEnded(meeting.id, _) = $0 { return true }; return false
+        }.count == 1)
+        // The window's expiry never processes the live (or paused) meeting.
+        h.advance(400)
+        await h.tracker.evaluate()
+        #expect(h.controller.state.with { $0.kicks }.isEmpty)
+    }
+
+    @Test("a grace→Pause refused while THIS meeting's resume is opening, which goes live during the refusal's state reads, never re-arms its grace")
+    func gracePauseRefusedWhileOwnResumeGoesLive() async throws {
+        let h = makeTrackerHarness(resumeWindow: 300)
+        let meeting = try await graceViaLeave(h)
+        let mirror = Recorder<MeetAutomationEvent>()
+        let events = await h.tracker.events()
+        let collector = Task { for await e in events { mirror.append(e) } }
+        defer { collector.cancel() }
+        let tracker = h.tracker, controller = h.controller
+        controller.state.with {
+            $0.pauseGraceBefore = {
+                controller.state.with {
+                    // The meeting's own grace resume holds the in-flight flag.
+                    $0.pauseGraceOpening = true
+                    // It goes live (fact delivered) while the refusal branch
+                    // awaits its paused lookup.
+                    $0.pausedLookupGate = {
+                        controller.state.with {
+                            $0.pauseGraceOpening = false
+                            $0.session = RecordingSessionInfo(
+                                meetingID: meeting.id, meetingCode: TrackerHarness.code)
+                        }
+                        await tracker.recordingStarted(
+                            meetingID: meeting.id, meetingCode: TrackerHarness.code,
+                            title: "Weekly sync", partIndex: 2)
+                    }
+                }
+            }
+        }
+
+        #expect(!(await h.tracker.pauseFromGrace(meetingID: meeting.id)))
+        #expect(await h.tracker.graceState == nil)
+        #expect(h.lastGraceWrite(meeting.id) == .some(nil))
+        #expect(await waitUntil { mirror.values.contains(.graceEnded(meetingID: meeting.id, reason: .resumed)) })
+        // The window's expiry never processes the live meeting.
+        h.advance(400)
+        await h.tracker.evaluate()
+        #expect(h.controller.state.with { $0.kicks }.isEmpty)
+    }
+
     @Test("manualControl cleared on Resume; paused suppression cleared (AC1)")
     func manualControlClearedOnResume() async throws {
         let h = makeTrackerHarness()
@@ -1370,10 +1662,24 @@ struct G9IndicatorTests {
         m.apply(.meetingPaused(meetingTitle: "Held", accumulatedSeconds: 120))
         #expect(m.state == .paused(meetingTitle: "Held", accumulatedSeconds: 120))
         // A resume re-enters recording (meetingResumed then captureStarted).
-        m.apply(.meetingResumed)
+        m.apply(.meetingResumed(accumulatedSeconds: 0))
         let now = msDate()
         m.apply(.captureStarted(at: now))
         #expect(m.state == .recording(startedAt: now))
+    }
+
+    @Test("after a pause-resume the timer continues from the accumulated recorded time")
+    func resumedTimerContinuesFromAccumulated() {
+        var m = IndicatorStateMachine()
+        m.apply(.meetingPaused(meetingTitle: "Held", accumulatedSeconds: 120))
+        m.apply(.meetingResumed(accumulatedSeconds: 120))
+        let now = msDate()
+        m.apply(.captureStarted(at: now))
+        #expect(m.state == .recording(startedAt: now.addingTimeInterval(-120)))
+        // The base is consumed: a later fresh start counts from zero.
+        m.apply(.captureStopping)
+        m.apply(.captureStarted(at: now.addingTimeInterval(600)))
+        #expect(m.state == .recording(startedAt: now.addingTimeInterval(600)))
     }
 
     @Test("grace > paused: a standing grace window wins the display over a paused meeting")

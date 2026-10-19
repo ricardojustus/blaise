@@ -658,6 +658,11 @@ struct EnginesSettingsTab: View {
                 rows: model.summarizationRows,
                 consequence:
                     "If the selected engine cannot run, that run falls back once to the other registered engine (noted on the meeting).")
+            EngineSlotSection(
+                model: model, slot: .digest, title: "Memory digest",
+                rows: model.summarizationRows,
+                consequence:
+                    "If the selected model cannot run, the digest waits and retries on its own; notes are not affected.")
         }
         .formStyle(.grouped)
         .task { await model.load() }
@@ -690,10 +695,15 @@ private struct EngineSlotSection: View {
                                 // Same for a digest debt parked under an engine
                                 // that could not edit digests.
                                 await appEnv.pipeline.resumeOwedSettles()
+                            } else if slot == .digest {
+                                await appEnv.pipeline.resumeOwedSettles()
                             }
                         }
                     })
             ) {
+                if slot == .digest {
+                    Text("Same as notes").tag("")
+                }
                 ForEach(rows) { row in
                     HStack(spacing: 6) {
                         Text(row.displayName)
@@ -727,8 +737,19 @@ private struct EngineSlotSection: View {
             if let selected = rows.first(where: { $0.id == model.selectedID(slot) }),
                 !selected.configDescriptors.isEmpty
             {
-                ForEach(selected.configDescriptors, id: \.key) { descriptor in
-                    EngineConfigField(engineID: selected.id, descriptor: descriptor)
+                // One credential set, one field: the digest reuses the notes
+                // engine's fields when both selections share a runtime.
+                if slot == .digest,
+                    rows.first(where: { $0.id == model.selectedID(.summarization) })?
+                        .configurationID == selected.configurationID
+                {
+                    Text("Uses the details set under Notes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(selected.configDescriptors, id: \.key) { descriptor in
+                        EngineConfigField(engineID: selected.configurationID, descriptor: descriptor)
+                    }
                 }
             }
         }
@@ -778,7 +799,7 @@ private struct EngineSlotSection: View {
 
 /// Generic per-engine config field from `configDescriptors`: secrets render
 /// masked and land in the Keychain; everything else in SettingsStore — all
-/// under `engine.<id>.<key>` (the Claude `apiKey` lands here — Q5).
+/// under `engine.<configurationID>.<key>` (the Claude `apiKey` lands here — Q5).
 private struct EngineConfigField: View {
     @Environment(AppEnvironment.self) private var appEnv
     let engineID: String

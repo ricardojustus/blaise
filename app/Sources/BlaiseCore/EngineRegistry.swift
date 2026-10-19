@@ -75,6 +75,9 @@ public struct ResolvedEngine<Engine: Sendable>: Sendable {
 public struct EngineResolver: Sendable {
     public static let asrSettingsKey = "asrEngineID"
     public static let summarizationSettingsKey = "summarizationEngineID"
+    /// The memory digest's own selection. Absent or empty means "same as
+    /// notes": the digest resolves exactly like the notes slot.
+    public static let digestSettingsKey = "digestEngineID"
 
     private let registry: EngineRegistry
     private let settings: SettingsStore
@@ -100,6 +103,18 @@ public struct EngineResolver: Sendable {
         let effectiveID = try await settings.get(Self.summarizationSettingsKey, as: String.self)
             ?? EngineDefaults.summarizationEngineID
         guard let resolved = Self.resolveSummarization(id: effectiveID, registry: registry) else {
+            throw EngineError.noEnginesRegistered(slot: "summarization")
+        }
+        return resolved
+    }
+
+    /// The engine every memory-digest call runs on. An unset or empty digest
+    /// selection follows the notes slot; a set one resolves through the same
+    /// registry rules as the notes slot.
+    public func resolveDigest() async throws -> ResolvedEngine<any SummarizationEngine> {
+        guard let id = try await settings.get(Self.digestSettingsKey, as: String.self), !id.isEmpty
+        else { return try await resolveSummarization() }
+        guard let resolved = Self.resolveSummarization(id: id, registry: registry) else {
             throw EngineError.noEnginesRegistered(slot: "summarization")
         }
         return resolved

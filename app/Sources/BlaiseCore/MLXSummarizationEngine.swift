@@ -450,7 +450,8 @@ public actor MLXSummarizationEngine: SummarizationEngine {
                 inputUnits: parsed.usage.inputTokens,
                 outputUnits: parsed.usage.outputTokens,
                 estimatedCostUSD: nil),
-            promptVersion: version.rawValue)
+            promptVersion: version.rawValue,
+            model: Self.modelRepo)
     }
 
     /// The stdin JSON request for the driver's `--digest` mode: free-text

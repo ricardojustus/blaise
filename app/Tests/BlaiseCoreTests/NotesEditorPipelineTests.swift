@@ -157,14 +157,21 @@ private final class ScriptedNotesEditorEngine:
 
     let id: String
     let displayName = "Scripted notes editor"
+    let configurationID: String
+    let suppressesAutoFallback: Bool
     let kind: EngineKind = .cloud
     let loadProfile: EngineLoadProfile = .lightweight
     let costDescriptor: EngineCostDescriptor? = nil
     let configDescriptors: [EngineConfigDescriptor] = []
     let state = Mutex(State())
 
-    init(id: String = "scripted-notes-editor") {
+    init(
+        id: String = "scripted-notes-editor", configurationID: String? = nil,
+        suppressesAutoFallback: Bool = false
+    ) {
         self.id = id
+        self.configurationID = configurationID ?? id
+        self.suppressesAutoFallback = suppressesAutoFallback
     }
 
     func availability() async -> EngineAvailability {
@@ -1362,6 +1369,49 @@ INSTRUCTIONS:
         #expect(engine.callCount == 2)
     }
 
+    @Test("a fallback-triggering failure on the last attempt surfaces its own error and prepares no fallback")
+    func lastAttemptFallbackTriggerSurfacesItsError() async throws {
+        let root = try makeTempRoot()
+        let database = try BlaiseDatabase(rootURL: root)
+        let clock = EditorManualClock()
+        let primary = ScriptedNotesEditorEngine(id: "primary-editor")
+        primary.setOutcomes([
+            .error(.transient("offline 1")), .error(.transient("offline 2")),
+            .error(.configurationMissing(key: "fictional-editor-key")),
+        ])
+        let fallback = ScriptedNotesEditorEngine(id: "fallback-editor")
+        let registry = try EngineRegistry(asr: [], summarization: [primary, fallback])
+        let settings = SettingsStore(database: database)
+        try await settings.set(EngineResolver.summarizationSettingsKey, to: primary.id)
+        try await settings.set(UserIdentity.settingsKey, to: UserIdentity.onboardedUser)
+        let pipeline = ProcessingPipeline(
+            database: database, registry: registry, diarizer: PipelineMockDiarizer(),
+            vocabulary: try VocabFixtures.pipelineVocabulary(), now: clock.now,
+            notesEditorSleep: clock.sleep,
+            settleSleep: { _ in throw CancellationError() })
+        let harness = EditorHarness(
+            root: root, database: database, pipeline: pipeline, engine: primary, clock: clock)
+        let (meeting, _) = try await seedEditorMeeting(harness)
+        _ = try await insertCorrection(database, meetingID: meeting.id, createdAt: clock.now())
+
+        let task = Task { try await pipeline.sendPendingNotesToEditor(meetingID: meeting.id) }
+        #expect(await eventually { primary.callCount == 1 })
+        #expect(await eventually { clock.activeSleeperCount == 1 })
+        clock.advance(by: .seconds(1))
+        #expect(await eventually { primary.callCount == 2 })
+        #expect(await eventually { clock.activeSleeperCount == 1 })
+        clock.advance(by: .seconds(2))
+        do {
+            try await task.value
+            Issue.record("the last attempt's failure should escape")
+        } catch let error as EngineError {
+            #expect(error == .configurationMissing(key: "fictional-editor-key"))
+        }
+        #expect(primary.callCount == 3)
+        #expect(fallback.state.withLock { $0.prepareCalls } == 0)
+        #expect(fallback.callCount == 0)
+    }
+
     @Test("AC-8: a live mutation cannot cancel the in-flight editor and arms exactly one successor")
     func mutationCrossesLiveCall() async throws {
         let gate = EditorGate()
@@ -1705,6 +1755,43 @@ INSTRUCTIONS:
         await Task.yield()
         #expect(primary.callCount == 1)
         #expect(clock.activeSleeperCount == 0)
+    }
+
+    @Test func editorFallbackSkipsModelsSharingFailedCredentials() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try BlaiseDatabase(rootURL: root)
+        let clock = EditorManualClock()
+        let primary = ScriptedNotesEditorEngine(id: "primary-model", configurationID: "shared-api")
+        primary.setOutcomes([.error(.configurationMissing(key: "apiKey"))])
+        let sibling = ScriptedNotesEditorEngine(id: "sibling-model", configurationID: "shared-api")
+        sibling.setOutcomes([.result([])])
+        let subscription = ScriptedNotesEditorEngine(
+            id: "subscription-editor", suppressesAutoFallback: true)
+        subscription.setOutcomes([.result([])])
+        let fallback = ScriptedNotesEditorEngine(id: "independent-editor")
+        fallback.setOutcomes([.result([])])
+        let registry = try EngineRegistry(
+            asr: [], summarization: [primary, sibling, subscription, fallback])
+        let settings = SettingsStore(database: database)
+        try await settings.set(EngineResolver.summarizationSettingsKey, to: primary.id)
+        try await settings.set(UserIdentity.settingsKey, to: UserIdentity.onboardedUser)
+        let pipeline = ProcessingPipeline(
+            database: database, registry: registry, diarizer: PipelineMockDiarizer(),
+            vocabulary: try VocabFixtures.pipelineVocabulary(), now: clock.now,
+            notesEditorSleep: clock.sleep,
+            settleSleep: { _ in throw CancellationError() })
+        let harness = EditorHarness(
+            root: root, database: database, pipeline: pipeline, engine: primary, clock: clock)
+        let (meeting, _) = try await seedEditorMeeting(harness)
+        _ = try await insertCorrection(database, meetingID: meeting.id, createdAt: clock.now())
+
+        try await pipeline.sendPendingNotesToEditor(meetingID: meeting.id)
+
+        #expect(primary.callCount == 1)
+        #expect(sibling.callCount == 0)
+        #expect(subscription.callCount == 0)
+        #expect(fallback.callCount == 1)
     }
 
     enum ReadFault: String, CaseIterable, Sendable {

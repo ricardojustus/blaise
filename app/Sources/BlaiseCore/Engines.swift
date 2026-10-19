@@ -519,7 +519,7 @@ public enum ConfigKind: String, Codable, Sendable, Equatable, CaseIterable {
 }
 
 /// Engines declare; C10 renders generically. Values live in `SettingsStore`
-/// (non-secrets) or `SecretStore` (secrets) under `engine.<id>.<key>`.
+/// (non-secrets) or `SecretStore` (secrets) under `engine.<configurationID>.<key>`.
 public struct EngineConfigDescriptor: Codable, Sendable, Equatable {
     public var key: String
     public var label: String
@@ -560,6 +560,8 @@ extension ASREngine {
 }
 
 public protocol SummarizationEngine: Sendable {
+    /// Configuration storage namespace, shared by model variants of a runtime.
+    var configurationID: String { get }
     var id: String { get }
     var displayName: String { get }
     var kind: EngineKind { get }
@@ -569,7 +571,8 @@ public protocol SummarizationEngine: Sendable {
     /// When the user has SELECTED this engine and it fails (after its own bounded
     /// retries) with a fallback-trigger error, the pipeline must NOT silently fall
     /// back to a metered/other engine — it leaves the meeting's notes PENDING with
-    /// a user-visible warning so it can be retried on the chosen engine. Default
+    /// a user-visible warning so it can be retried on the chosen engine. Such
+    /// engines are also excluded as automatic fallback destinations. Default
     /// `false` (the protocol extension below) → the cloud/local engines fall back
     /// as before; ONLY the subscription `claude -p` Account engine overrides it to
     /// `true` (staying free is a user choice that must not be silently spent past).
@@ -585,9 +588,8 @@ public protocol SummarizationEngine: Sendable {
 
     /// G14: the SECOND synthesis call, fired AFTER the notes — produces the
     /// machine-facing `memory_digest`, taking the degarbled transcript + the
-    /// just-produced notes as a salience guide (`DigestRequest`). Same engine
-    /// the user selected for notes (the swappable seam — the
-    /// digest rides it). It carries a NEW bounded transient-retry built for it
+    /// just-produced notes as a salience guide (`DigestRequest`), on the
+    /// memory-digest engine selection (default: the notes engine). It carries a NEW bounded transient-retry built for it
     /// (one bounded re-issue on a 429/529/5xx/transient before the error
     /// escapes — a transient blip never becomes a memory gap on the first
     /// wobble). `purpose` is threaded to the cloud accounting write under the
@@ -596,6 +598,7 @@ public protocol SummarizationEngine: Sendable {
 }
 
 extension SummarizationEngine {
+    public var configurationID: String { id }
     public func prepare() async throws {}
 
     /// Default: engines DO participate in the runtime auto-fallback. Only the

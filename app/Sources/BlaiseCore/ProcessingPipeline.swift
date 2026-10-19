@@ -1492,8 +1492,11 @@ public actor ProcessingPipeline {
             } else if let structuredNotes {
                 let blocks = CorrectionAnchoring.blocks(
                     of: structuredNotes, section: row.section)
-                status = CorrectionAnchoring.resolve(
-                    quote: row.quotedText, occurrence: row.occurrence, in: blocks) == nil
+                status = (CorrectionAnchoring.resolve(
+                    quote: row.quotedText, occurrence: row.occurrence, in: blocks)
+                    ?? CorrectionAnchoring.resolveTable(
+                        quote: row.quotedText, occurrence: row.occurrence, section: row.section,
+                        in: CorrectionAnchoring.RenderedSpace(structuredNotes))) == nil
                     ? .stale : .applied
             } else {
                 status = .pending
@@ -1820,9 +1823,12 @@ public actor ProcessingPipeline {
                     continue
                 }
 
-                guard let fallback = try await preparedNotesEditorFallback(
-                    after: engine, error: error, usedFallback: usedFallback,
-                    cancelToken: cancelToken)
+                // The last attempt has no send left for a fallback: its own
+                // error is the activation's.
+                guard attempts < 3,
+                    let fallback = try await preparedNotesEditorFallback(
+                        after: engine, error: error, usedFallback: usedFallback,
+                        cancelToken: cancelToken)
                 else { throw error }
                 engine = fallback.engine
                 editor = fallback.editor
@@ -1842,6 +1848,8 @@ public actor ProcessingPipeline {
             !engine.suppressesAutoFallback,
             let fallback = registry.summarizationEngines.first(where: { candidate in
                 candidate.id != engine.id
+                    && candidate.configurationID != engine.configurationID
+                    && !candidate.suppressesAutoFallback
                     && candidate.loadProfile == .lightweight
                     && candidate is any NotesEditingEngine
             }),
@@ -2194,7 +2202,7 @@ public actor ProcessingPipeline {
         guard notes.memoryDigest != nil,
             !DigestPendingClass.isPending(meeting.lastProcessingError),
             enabled,
-            let resolved = try? await resolver.resolveSummarization(),
+            let resolved = try? await resolver.resolveDigest(),
             resolved.engine is any DigestEditingEngine
         else { return false }
         return true
@@ -2664,7 +2672,7 @@ public actor ProcessingPipeline {
             notes.digestEditOwed,
             let storedDigest = notes.memoryDigest,
             await MemoryDigestSettings.isEnabled(in: settings),
-            let resolved = try? await resolver.resolveSummarization(),
+            let resolved = try? await resolver.resolveDigest(),
             let editor = resolved.engine as? any DigestEditingEngine
         else { return .skipped }
 
@@ -2831,6 +2839,10 @@ public actor ProcessingPipeline {
         /// (toggle off / failed before derivation); the persist step then keeps
         /// the empty default.
         var resolvedScopedAliasBindings: [AliasPair]?
+        /// The engine id and synthesis model of this run's produced digest
+        /// (`generateMemoryDigest` sets it); the persist step records it in
+        /// notes provenance.
+        var digestProducer: (engine: String, model: String)?
         var harvestCandidate: VoiceProfileCandidate?
         var harvestPendingAppend: VoiceProfilePendingAppend?
         /// Whether the user started this run; the notes stage passes it to
@@ -4290,7 +4302,10 @@ public actor ProcessingPipeline {
                     reason: "\(primary.displayName): \(Self.humanReason(primaryError))")
             }
             guard
-                let fallback = registry.summarizationEngines.first(where: { $0.id != primary.id })
+                let fallback = registry.summarizationEngines.first(where: {
+                    $0.id != primary.id && $0.configurationID != primary.configurationID
+                        && !$0.suppressesAutoFallback
+                })
             else {
                 // A stage failure's message is what the meeting's error banner
                 // shows a person, so it names engines the way they are named on
@@ -4545,12 +4560,13 @@ public actor ProcessingPipeline {
     /// the Settings → Handoff toggle is ON, neutralizes residual S-labels in the
     /// produced digest string (the same emphasis-aware G13 detector, via the
     /// new `SLabelNeutralizer.neutralizeText` flat-string entry point), and
-    /// returns the clean digest. The digest rides the SAME engine the user
-    /// selected for notes (the swappable seam). Bounded transient retry lives
-    /// INSIDE `generateDigest`; a failure that survives it returns `.failed`
-    /// (non-fatal — the caller writes the digest-pending marker and the run
-    /// still completes). `notes` is the name-substituted `NotesStructured`
-    /// salience guide; the digest re-derives facts from `segments`.
+    /// returns the clean digest. The digest runs on the memory-digest engine
+    /// selection, which defaults to the notes engine (the swappable seam).
+    /// Bounded transient retry lives INSIDE `generateDigest`; a failure that
+    /// survives it returns `.failed` (non-fatal — the caller writes the
+    /// digest-pending marker and the run still completes). `notes` is the
+    /// name-substituted `NotesStructured` salience guide; the digest re-derives
+    /// facts from `segments`.
     ///
     /// T3.1 (md-v3): the digest request also carries the app-derived structured
     /// inputs — `scopedAliasBindings` (alias→canonical, admitted ONLY on actual
@@ -4678,13 +4694,15 @@ public actor ProcessingPipeline {
         // by the resume path). The MLX path spends nothing.
         let purpose: CloudSpendPurpose = context.digestPurpose ?? .digest
         do {
-            let resolved = try await resolver.resolveSummarization()
+            let resolved = try await resolver.resolveDigest()
             let engine = resolved.engine
             try await engine.prepare()
             if context.cancelToken?.isCancelled == true { throw EngineError.cancelled }
             let result = try await CancellationToken.$current.withValue(context.cancelToken) {
                 try await engine.generateDigest(request, purpose: purpose)
             }
+            // Provenance names the synthesis call, never a later audit pass.
+            context.digestProducer = (engine.id, result.model)
             // G13-clean guarantee delivered HERE: neutralize every residual
             // S-label in the produced digest string (incl. a model-authored
             // `_S0_`/`**S0**`) to the unattributed prose descriptor. The label
@@ -4742,8 +4760,8 @@ public actor ProcessingPipeline {
                 // #102: the cost toggle — does the COMBINED AUDIT run on Haiku?
                 // Hoisted out of the `||` (the right operand is a non-awaiting
                 // autoclosure). Settings OR the dev env override, default OFF →
-                // Sonnet. This is the ONLY call site that may pick Haiku; notes,
-                // synthesis, and the md-v5 verify/reconcile passes never read it.
+                // the selected model. Only the combined audit reads this override;
+                // notes, synthesis, and the md-v5 verify/reconcile passes don't.
                 let haikuOn = await MemoryDigestSettings.isHaikuAuditEnabled(in: settings)
                     || ProcessInfo.processInfo.environment["BLAISE_HAIKU_AUDIT"] == "1"
                 if auditRequested, let claudeEngine = engine as? ClaudeSummarizationEngine {
@@ -4754,7 +4772,7 @@ public actor ProcessingPipeline {
                             // `ClaudeSummarizationEngine.haikuModel` (here `Self` is
                             // ProcessingPipeline — `Self.haikuModel` would not
                             // compile); when OFF omit the arg so the engine's
-                            // `= Self.model` default keeps it byte-identical Sonnet.
+                            // default keeps it on the selected API model.
                             if haikuOn {
                                 return try await claudeEngine.combinedAuditDigest(
                                     request, draftDigest: clean, purpose: purpose,
@@ -5203,6 +5221,10 @@ public actor ProcessingPipeline {
             provenance.pipelineVersion = PipelineVersion.current
             provenance.rendererVersion = NotesRenderer.version
             provenance.userName = user.name
+            if memoryDigest != nil, let producer = context.digestProducer {
+                provenance.digestEngine = producer.engine
+                provenance.digestModel = producer.model
+            }
             // G13: neutralize S-labels as the LAST write to notes.structured
             // before stage 12 hands it on — stage 13 build()s exactly this
             // value, and a .preFinalize kill resumes on a clean row.
@@ -5970,6 +5992,10 @@ public actor ProcessingPipeline {
             // scoped set is already on `notes` (reloaded above), so the re-mint
             // preserves it.
             notes.memoryDigest = clean
+            if let producer = context.digestProducer {
+                notes.provenance.digestEngine = producer.engine
+                notes.provenance.digestModel = producer.model
+            }
             // The healed digest is instruction-aware and this transaction
             // delivers it, so the meeting owes the settle chain nothing.
             notes.digestEditOwed = false

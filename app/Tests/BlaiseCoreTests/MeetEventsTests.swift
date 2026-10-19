@@ -907,8 +907,9 @@ func finalizeGoldenMeeting(
         #expect(response.status == 200)
 
         // The fire-and-forget dispatch regenerates and re-mints (supersession
-        // of the old row happens at delivery, not enqueue).
-        #expect(try await waitUntil { try await harness.queueRows(meeting.id) == 2 })
+        // of the old row happens at delivery, not enqueue). A whole regenerate
+        // under parallel shard load can outlast the default 10 s.
+        #expect(try await waitUntil(timeout: .seconds(60)) { try await harness.queueRows(meeting.id) == 2 })
         let after = try #require(try await harness.meeting(meeting.id))
         #expect(after.status == .ready)
         #expect(after.attendees.contains { $0.name == "Maria Silva" && $0.source == .meetExtension })

@@ -552,7 +552,7 @@ final class AppEnvironment {
                             self.captureStatus.lastActionError = alarm
                         }
                     }
-                case .paused(let id, let accumulatedSeconds):
+                case .paused(let id, let title, let accumulatedSeconds):
                     self.notificationAdapter.withdrawSystemAudioUnavailable()
                     // G9: the meeting is held open. The long-session ticker
                     // stops (no live capture); the indicator shows the
@@ -560,20 +560,20 @@ final class AppEnvironment {
                     self.tickerTask?.cancel()
                     self.captureStatus.meetingEndPendingUntil = nil
                     self.captureStatus.pausedMeetingID = id
-                    let title = self.captureStatus.activeMeetingTitle ?? "Recording"
+                    self.captureStatus.activeMeetingTitle = title
                     self.captureStatus.apply(
                         .meetingPaused(meetingTitle: title, accumulatedSeconds: accumulatedSeconds))
                     // G12 §2: no live capture while paused — settle the meter.
                     self.levelMeterModel = nil
                     self.levelMeter.reset()
                     self.silenceWatchdog.disarm()
-                case .resumed(let id, _, _):
+                case .resumed(let id, _, let accumulatedSeconds):
                     // G9: the held meeting resumed — back to recording (the
                     // `.started` re-emission applies `.captureStarted`).
                     if self.captureStatus.pausedMeetingID == id {
                         self.captureStatus.pausedMeetingID = nil
                     }
-                    self.captureStatus.apply(.meetingResumed)
+                    self.captureStatus.apply(.meetingResumed(accumulatedSeconds: accumulatedSeconds))
                 }
             }
         }
@@ -896,6 +896,8 @@ final class AppEnvironment {
             forName: .EKEventStoreChanged, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
+                // A calendar added or removed must reach an open Settings picker.
+                self?.calendarSuggestions.refreshAppleCalendars()
                 await self?.refreshSchedulerSnapshots()
             }
         }
@@ -1804,21 +1806,23 @@ final class AppEnvironment {
             uvBinary: uvBinary,
             driverScript: notesDriverScript,
             requirementsFile: requirementsFile)
-        let claude = ClaudeSummarizationEngine(
-            configuration: configuration(
-                for: ClaudeSummarizationEngine.engineID, descriptors: ClaudeSummarizationEngine.descriptors),
-            ledger: ledger)
+        let apiConfiguration = configuration(
+            for: ClaudeSummarizationEngine.engineID, descriptors: ClaudeSummarizationEngine.descriptors)
+        let claudeModels = ClaudeNotesModel.apiModels.map { model in
+            ClaudeSummarizationEngine(configuration: apiConfiguration, ledger: ledger, model: model)
+        }
         // The "Account engine" — the user's Claude subscription via the `claude -p`
         // CLI (~$0). Registered alongside the API engine so the existing engine
         // picker surfaces it; it is NEVER the default (`EngineDefaults.summarization`
         // stays the API engine) and runs only when the user selects it AND it is
         // available (the `claude` binary resolves AND the OAuth token is set).
-        let claudeCode = ClaudeCodeSummarizationEngine(
-            configuration: configuration(
-                for: ClaudeCodeSummarizationEngine.engineID,
-                descriptors: ClaudeCodeSummarizationEngine.descriptors),
-            ledger: ledger)
-        // `try!` is safe: the ids are distinct constants. Summarization
+        let cliConfiguration = configuration(
+            for: ClaudeCodeSummarizationEngine.engineID,
+            descriptors: ClaudeCodeSummarizationEngine.descriptors)
+        let claudeCodeModels = ClaudeNotesModel.cliModels.map { model in
+            ClaudeCodeSummarizationEngine(configuration: cliConfiguration, ledger: ledger, model: model)
+        }
+        // `try!` is safe: the catalog has distinct ids. Summarization
         // order is load-bearing (D17): the lightweight API engine is
         // registered FIRST so that any first-registered substitution path
         // can never land on the 18 GB-peak local engine (the resolver also
@@ -1829,6 +1833,8 @@ final class AppEnvironment {
         // is preferred, then the local MLX engine, and the account engine runs
         // ONLY when the user explicitly selects it.
         return try! EngineRegistry(
-            asr: [whisper, parakeet], summarization: [claude, gemma, claudeCode])
+            asr: [whisper, parakeet],
+            summarization: claudeModels.map { $0 as any SummarizationEngine }
+                + [gemma] + claudeCodeModels.map { $0 as any SummarizationEngine })
     }
 }

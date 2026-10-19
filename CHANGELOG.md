@@ -2,6 +2,30 @@
 
 All notable changes to Blaise are documented here. Dates are DD/MM/YYYY.
 
+## [1.10.2] — 19/10/2026
+
+More Claude models for notes, a separate model for the memory digest, and recording and notes fixes.
+
+### Added
+- **More Claude models for notes.** Sonnet 5.5, Opus 5.5 and Haiku 4.5 through the API, beside Sonnet 4.6; Opus 5.5
+  beside Sonnet 5.5 on the Claude subscription. Your saved choice and credentials carry over, and API spend uses the
+  chosen model's rates. Sonnet 5.5 and Opus 5.5 think before writing on both paths. Contributed by Arthur Soares (@arthursoares), #17.
+- **A separate model for the memory digest.** Settings → Engines → Memory digest. "Same as notes" is the default; pick
+  another model and only the digest uses it. If that model can't run, the digest waits and retries on its own.
+
+### Changed
+- The default engines are renamed in the picker: "Claude Sonnet 4.6 (API)" and "Claude Sonnet 5.5 (subscription)".
+- An AI edit whose API call fails no longer falls back to the Claude subscription; it waits for the engine you chose.
+
+### Fixed
+- **Long digests.** The API digest has room for a long meeting (32,000 tokens), and a digest that still runs out is
+  retried later instead of being saved cut off.
+- **Recording.** Pressing start or resume twice no longer crashes; a failed pause no longer blocks the next recording;
+  the timer keeps counting after a resume; the quit dialog says processing happens at the next launch.
+- **Notes.** AI Correct and Add Note aimed at a whole table land under that table; the selection bar stays inside a narrow
+  notes pane; the notes engine reports its real error on its last attempt.
+- **Calendar.** A calendar added or removed shows up in an open Settings picker.
+
 ## [1.10.1] — 04/10/2026
 
 Fixes: playback after the Mac sleeps mid-recording, and the Reprocess All cost.

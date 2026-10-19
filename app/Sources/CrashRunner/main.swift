@@ -137,7 +137,8 @@ struct StubNotesEngine: SummarizationEngine {
         DigestResult(
             digest: "## HEADER\nmeeting: reunião de teste\nspeaker: (none resolved)\n",
             usage: nil,
-            promptVersion: DigestPromptBuilder.shippedVersion.rawValue)
+            promptVersion: DigestPromptBuilder.shippedVersion.rawValue,
+            model: "stub-model")
     }
 }
 

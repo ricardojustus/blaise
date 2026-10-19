@@ -16,18 +16,11 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     DigestEditingEngine
 {
     public static let engineID = "claude-sonnet"
-    /// Engine identity = model + runtime (D5). Both the notes and the digest
-    /// calls run on this model (Sonnet) — the cost/receipt accounting is keyed on
-    /// it, so the wire model must match unconditionally.
+    /// Legacy default kept for source compatibility and static-builder tests.
+    /// Each engine instance pins its actual wire model in `selectedModel`.
     public static let model = "claude-sonnet-4-6"
-    /// #102: the OPTIONAL combined-audit model (md-v6 STEP-1/STEP-2 auditor).
-    /// `claude-haiku-4-5` is the exact API id (Haiku 4.5, 200K ctx, $1/$5 in the
-    /// current model table). Used ONLY by the combined-audit call, ONLY when the
-    /// Haiku-audit toggle is ON; notes + synthesis + md-v5 verify/reconcile stay
-    /// on `model` (Sonnet). The wire body, the receipt `model:` field, and the
-    /// cost feeding both the ledger AND `DigestResult.estimatedCostUSD` all carry
-    /// this SAME string for a Haiku audit call (the consistency invariant — see
-    /// `cost(of:model:)` / `pricePerMTok(for:)`).
+    /// Legacy spelling used by the optional combined-audit override. Haiku 4.5
+    /// can also be selected for every call through `ClaudeNotesModel`.
     public static let haikuModel = "claude-haiku-4-5"
     public static let apiKeyConfigKey = "apiKey"
     public static let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
@@ -35,13 +28,11 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     /// Verified pricing (live 2026-06-10). Sonnet 4.6 = $3 in / $15 out per MTok.
     public static let inputUSDPerMTok = 3.0
     public static let outputUSDPerMTok = 15.0
-    /// #102: Haiku 4.5 pricing = $1 in / $5 out per MTok (≈⅓ of Sonnet). Used by
-    /// `pricePerMTok(for:)` for an EXACT `haikuModel` string match only.
-    public static let haikuInputUSDPerMTok = 1.0
-    public static let haikuOutputUSDPerMTok = 5.0
     public static let maxInputTokens = 150_000
     public static let maxTokensFirstAttempt = 8_192
-    public static let maxTokensRetryAttempt = 16_384
+    /// Thinking models spend part of this on reasoning; 32k matches the
+    /// subscription engine's `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+    public static let maxTokensRetryAttempt = 32_000
     /// #104 notes-completeness guard (PROVISIONAL, calibratable — like #100's).
     /// The output-token floor below which even a tiny meeting's notes look
     /// anomalously thin: the stub-anomaly gate (C) never fires above it, so a
@@ -58,22 +49,17 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     public static let firstAttemptTimeout: TimeInterval = 300
     public static let retryAttemptTimeout: TimeInterval = 480
 
-    public nonisolated let id: String = ClaudeSummarizationEngine.engineID
-    public nonisolated let displayName = "Claude Sonnet 4.6 (cloud)"
+    public nonisolated let selectedModel: ClaudeNotesModel
+    public nonisolated let id: String
+    public nonisolated let configurationID = ClaudeSummarizationEngine.engineID
+    public nonisolated let displayName: String
     public nonisolated let kind: EngineKind = .cloud
     /// Lightweight (D17): an HTTPS call, no local weights — the runtime
     /// fallback may auto-fire to this engine.
     public nonisolated let loadProfile: EngineLoadProfile = .lightweight
-    /// #102 (F9): `pricingSummary`/`estimatedPerMeetingUSD` describe the engine's
-    /// SONNET calls (notes + synthesis), the dominant cost. `0.074` is the
-    /// conservative Sonnet per-meeting estimate used ONLY by the reprocess-budget
-    /// UI dialog — it is display-only, never ledgered, so over-estimating the
-    /// budget is safe even when the combined-audit runs on the cheaper Haiku. The
-    /// LEDGER truth is always the per-receipt model + `cost(of:model:)`.
-    public nonisolated let costDescriptor: EngineCostDescriptor? = EngineCostDescriptor(
-        pricingSummary: "US$ 3 in / US$ 15 out per million tokens (Claude Sonnet 4.6)",
-        estimatedPerMeetingUSD: 0.074
-    )
+    /// Display pricing follows the constructor-selected model. Ledger truth is
+    /// always the per-receipt model plus `cost(of:model:)`.
+    public nonisolated let costDescriptor: EngineCostDescriptor?
     public static let descriptors: [EngineConfigDescriptor] = [
         EngineConfigDescriptor(
             key: ClaudeSummarizationEngine.apiKeyConfigKey, label: "Anthropic API key",
@@ -93,13 +79,27 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
 
     /// Services are constructor-injected at the composition root (C2);
     /// `EngineConfiguration` carries user config only.
-    public init(configuration: EngineConfiguration, ledger: CloudSpendLedger) {
-        self.init(configuration: configuration, ledger: ledger, transport: Self.urlSessionTransport)
+    public init(
+        configuration: EngineConfiguration, ledger: CloudSpendLedger,
+        model: ClaudeNotesModel = .sonnet46
+    ) {
+        self.init(
+            configuration: configuration, ledger: ledger, model: model,
+            transport: Self.urlSessionTransport)
     }
 
-    init(configuration: EngineConfiguration, ledger: CloudSpendLedger, transport: @escaping Transport) {
+    init(
+        configuration: EngineConfiguration, ledger: CloudSpendLedger,
+        model: ClaudeNotesModel = .sonnet46, transport: @escaping Transport
+    ) {
         self.configuration = configuration
         self.ledger = ledger
+        self.selectedModel = model
+        self.id = model.apiEngineID
+        self.displayName = "\(model.displayName) (API)"
+        self.costDescriptor = EngineCostDescriptor(
+            pricingSummary: "US$ \(Self.priceLabel(model.inputUSDPerMTok)) in / US$ \(Self.priceLabel(model.outputUSDPerMTok)) out per million tokens (\(model.displayName))",
+            estimatedPerMeetingUSD: model.estimatedPerMeetingUSD)
         self.transport = transport
     }
 
@@ -223,7 +223,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
             EngineUsage(
                 inputUnits: response.usage.inputTokens,
                 outputUnits: response.usage.outputTokens,
-                estimatedCostUSD: Self.cost(of: response.usage)))
+                estimatedCostUSD: Self.cost(of: response.usage, model: selectedModel.rawValue)))
     }
 
     /// N4: ONE constrained transport attempt with ZERO internal transient
@@ -287,7 +287,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         }
 
         // First attempt at 8_192 output tokens; `stop_reason == "max_tokens"`
-        // → ONE retry at 16_384, then permanent.
+        // → ONE retry at `maxTokensRetryAttempt`, then permanent.
         // G10 §1: the cancel token binds at ATTEMPT BOUNDARIES. Checked before
         // each send (here and before the retry), never mid-flight: an in-flight
         // attempt is shielded so its usage/receipt always land — interrupting
@@ -337,7 +337,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
             if let firstDecoded = Self.decodeNotes(first) {
                 let transcriptBytes = request.transcript.reduce(0) { $0 + $1.text.utf8.count }
                 let firstStub = Self.isLikelyStub(
-                    firstDecoded, outputTokens: first.usage.outputTokens,
+                    firstDecoded, outputTokens: visibleOutputTokens(first),
                     transcriptBytes: transcriptBytes)
                 if firstStub && CancellationToken.current?.isCancelled != true {
                     // FIX 1 (always-finalizes invariant): the first attempt is a
@@ -360,19 +360,21 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
                         let retryStub =
                             retryDecoded.map {
                                 Self.isLikelyStub(
-                                    $0, outputTokens: retry.usage.outputTokens,
+                                    $0, outputTokens: visibleOutputTokens(retry),
                                     transcriptBytes: transcriptBytes)
                             } ?? true
                         let retryCand = StubCandidate(
                             attempt: .retry, response: retry, decoded: retryDecoded,
                             isStub: retryStub)
-                        let winner = Self.bestOfNotes(firstCand, retryCand)
+                        let winner = Self.bestOfNotes(
+                            firstCand, retryCand, outputTokens: { visibleOutputTokens($0.response) })
                         Self.logStubRetry(
                             logger: logger, first: firstCand, retry: retryCand,
                             chosenIsFirst: winner.attempt == .first,
                             firstBits: Self.stubBits(
-                                firstDecoded, outputTokens: first.usage.outputTokens,
-                                transcriptBytes: transcriptBytes))
+                                firstDecoded, outputTokens: visibleOutputTokens(first),
+                                transcriptBytes: transcriptBytes),
+                            outputTokens: { visibleOutputTokens($0.response) })
                         final = winner.response
                     } catch {
                         // The retry failed; the first stub is already billed and
@@ -386,7 +388,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
                     // Always-log even when no retry fires (F4): the predicate bits
                     // for this single attempt, so a near-miss is observable.
                     let bits = Self.stubBits(
-                        firstDecoded, outputTokens: first.usage.outputTokens,
+                        firstDecoded, outputTokens: visibleOutputTokens(first),
                         transcriptBytes: transcriptBytes)
                     logger.info(
                         """
@@ -423,11 +425,11 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
             usage: EngineUsage(
                 inputUnits: final.usage.inputTokens,
                 outputUnits: final.usage.outputTokens,
-                estimatedCostUSD: Self.cost(of: final.usage)
+                estimatedCostUSD: Self.cost(of: final.usage, model: selectedModel.rawValue)
             ),
             provenance: NotesProvenance(
                 engine: id,
-                model: Self.model,
+                model: selectedModel.rawValue,
                 pipelineVersion: "",
                 runtime: "anthropic-messages-api/URLSession",
                 promptVersion: promptVersion.rawValue
@@ -468,6 +470,14 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     /// decode at the bottom of `generateNotesBody` (the text-guard + decode),
     /// applied LOCALLY to a single attempt so the stub predicate can run before
     /// the shared decode picks the winner.
+    /// Thinking models bill reasoning as output, so the completeness heuristics
+    /// size their notes by the visible text instead (~4 UTF-8 bytes per token).
+    func visibleOutputTokens(_ response: APIResponse) -> Int {
+        guard selectedModel.thinks else { return response.usage.outputTokens }
+        let text = response.content.first(where: { $0.type == "text" })?.text ?? ""
+        return text.utf8.count / 4
+    }
+
     static func decodeNotes(_ response: APIResponse) -> NotesEngineResponse? {
         guard let text = response.content.first(where: { $0.type == "text" })?.text else {
             return nil
@@ -537,7 +547,10 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     ///   6. deterministic tie → `first`.
     /// Combined with rung 4, `bestOfNotes` NEVER returns a nil-decoded winner when
     /// a decodable candidate exists.
-    static func bestOfNotes(_ first: StubCandidate, _ retry: StubCandidate) -> StubCandidate {
+    static func bestOfNotes(
+        _ first: StubCandidate, _ retry: StubCandidate,
+        outputTokens: (StubCandidate) -> Int = { $0.response.usage.outputTokens }
+    ) -> StubCandidate {
         // 1. non-stub beats stub.
         if first.isStub != retry.isStub {
             return first.isStub ? retry : first
@@ -564,9 +577,10 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
             return firstDecodable ? first : retry
         }
         // 5. higher outputTokens.
-        if first.response.usage.outputTokens != retry.response.usage.outputTokens {
-            return first.response.usage.outputTokens >= retry.response.usage.outputTokens
-                ? first : retry
+        let firstTokens = outputTokens(first)
+        let retryTokens = outputTokens(retry)
+        if firstTokens != retryTokens {
+            return firstTokens >= retryTokens ? first : retry
         }
         // 6. deterministic tie → first.
         return first
@@ -579,12 +593,13 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     /// silently shipped).
     nonisolated static func logStubRetry(
         logger: Logger, first: StubCandidate, retry: StubCandidate,
-        chosenIsFirst: Bool, firstBits: (c: Bool, a: Bool, b: Bool)
+        chosenIsFirst: Bool, firstBits: (c: Bool, a: Bool, b: Bool),
+        outputTokens: (StubCandidate) -> Int = { $0.response.usage.outputTokens }
     ) {
         let doubleStubSameShape =
             first.isStub && retry.isStub
             && first.response.stopReason == retry.response.stopReason
-            && first.response.usage.outputTokens == retry.response.usage.outputTokens
+            && outputTokens(first) == outputTokens(retry)
         logger.warning(
             """
             notes completeness: stub retry fired \
@@ -615,15 +630,14 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         let version = DigestPromptBuilder.shippedVersion
         let system = DigestPromptBuilder.systemPrompt(for: version)
         let user = DigestPromptBuilder.userMessage(for: request)
-        // #102 (F4 scope): synthesis ALWAYS runs Sonnet — the Haiku toggle only
-        // applies to the combined-audit. Pass `Self.model` explicitly because the
-        // deep `runDigestCall` requires a non-defaulted `model`.
+        // Synthesis uses the immutable constructor selection. The explicit audit
+        // override, when present, is resolved separately in that call chain.
         return try await runDigestCall(
             system: system, user: user, request: request, purpose: purpose, version: version,
-            model: Self.model)
+            model: selectedModel.rawValue)
     }
 
-    /// OPTIONAL second pass — the env-gated (`BLAISE_DIGEST_VERIFY=1`) Sonnet
+    /// OPTIONAL second pass — the env-gated (`BLAISE_DIGEST_VERIFY=1`) selected-model
     /// auditor/repairer. Runs the SAME cloud path as `generateDigestBody` (same
     /// `runDigestCall` → same request build, decode/parse/ledger, one-shot bounded
     /// retry, maxTokens/timeout), but with the verify system prompt and a user
@@ -633,18 +647,16 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     /// in-flight cloud calls; the pipeline's fallback-on-throw to the draft is
     /// preserved (any throw — including a verify that produced no parseable digest
     /// — falls back to the good draft).
-    /// #102: `model` defaults to `Self.model` (Sonnet) — the md-v5 verify pass is
-    /// OUT OF SCOPE for the Haiku audit (D1/F4) and always runs Sonnet under the
-    /// default. The param exists only so the deep `runDigestCall` can require a
-    /// non-defaulted `model` (an omission anywhere = compile error, never a
-    /// silent Sonnet).
+    /// A nil `model` resolves to the instance's immutable selection. An explicit
+    /// value is preserved for compatibility with audit/testing callers.
     public func verifyDigest(
         _ request: DigestRequest, draftDigest: String, purpose: CloudSpendPurpose,
-        model: String = ClaudeSummarizationEngine.model
+        model: String? = nil
     ) async throws -> DigestResult {
-        try await chain.run {
+        let resolvedModel = model ?? selectedModel.rawValue
+        return try await chain.run {
             try await self.verifyDigestBody(
-                request, draftDigest: draftDigest, purpose: purpose, model: model)
+                request, draftDigest: draftDigest, purpose: purpose, model: resolvedModel)
         }
     }
 
@@ -658,7 +670,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         let result = try await runDigestCall(
             system: system, user: user, request: request, purpose: purpose, version: version,
             model: model)
-        // Harden the verify output: the Sonnet auditor sometimes narrates its
+        // Harden the verify output: the auditor sometimes narrates its
         // reasoning before emitting `## HEADER`. Drop any such chain-of-thought
         // preamble so the persisted digest starts at the first LINE-START
         // `## HEADER`. If no parseable digest is present, `stripPreamble` THROWS —
@@ -667,7 +679,8 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         return DigestResult(
             digest: try Self.stripPreamble(result.digest),
             usage: result.usage,
-            promptVersion: result.promptVersion)
+            promptVersion: result.promptVersion,
+            model: result.model)
     }
 
     /// md-v5 THIRD pass — the notes-anchored recall reconciler. Same cloud path
@@ -678,17 +691,15 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     /// grounds. Bills under the caller's `purpose`. Any throw (incl. no parseable
     /// digest) falls back to the pre-reconcile digest in the pipeline — recall
     /// reconciliation never costs the good digest.
-    /// #102: `model` defaults to `Self.model` (Sonnet) — the md-v5 reconcile pass
-    /// is OUT OF SCOPE for the Haiku audit (D1/F4) and always runs Sonnet under
-    /// the default; the param exists only to satisfy the non-defaulted deep
-    /// `runDigestCall` requirement (F2).
+    /// A nil `model` resolves to the instance's immutable selection.
     public func reconcileDigest(
         _ request: DigestRequest, draftDigest: String, purpose: CloudSpendPurpose,
-        model: String = ClaudeSummarizationEngine.model
+        model: String? = nil
     ) async throws -> DigestResult {
-        try await chain.run {
+        let resolvedModel = model ?? selectedModel.rawValue
+        return try await chain.run {
             try await self.reconcileDigestBody(
-                request, draftDigest: draftDigest, purpose: purpose, model: model)
+                request, draftDigest: draftDigest, purpose: purpose, model: resolvedModel)
         }
     }
 
@@ -707,7 +718,8 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         return DigestResult(
             digest: try Self.stripPreamble(result.digest),
             usage: result.usage,
-            promptVersion: result.promptVersion)
+            promptVersion: result.promptVersion,
+            model: result.model)
     }
 
     /// md-v6 COMBINED AUDIT — the single pass that REPLACES the md-v5
@@ -721,19 +733,16 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     /// notes items the transcript body grounds. Bills under the caller's
     /// `purpose`. Any throw (incl. no parseable digest) falls back to the
     /// synthesis draft in the pipeline — the audit never costs the good digest.
-    /// #102: `model` defaults to `Self.model` (Sonnet) — omitting it at the call
-    /// site is byte-identical to today. The pipeline passes
-    /// `ClaudeSummarizationEngine.haikuModel` ONLY when the Haiku-audit toggle is
-    /// ON; that one resolved string flows to the wire body, the receipt `model:`,
-    /// AND `cost(of:model:)` (consistency invariant). This is the ONLY call that
-    /// may run on Haiku.
+    /// A nil `model` resolves to the instance's immutable selection. An explicit
+    /// audit override flows unchanged to the wire body, receipt, and cost.
     public func combinedAuditDigest(
         _ request: DigestRequest, draftDigest: String, purpose: CloudSpendPurpose,
-        model: String = ClaudeSummarizationEngine.model
+        model: String? = nil
     ) async throws -> DigestResult {
-        try await chain.run {
+        let resolvedModel = model ?? selectedModel.rawValue
+        return try await chain.run {
             try await self.combinedAuditDigestBody(
-                request, draftDigest: draftDigest, purpose: purpose, model: model)
+                request, draftDigest: draftDigest, purpose: purpose, model: resolvedModel)
         }
     }
 
@@ -754,7 +763,8 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         return DigestResult(
             digest: try Self.stripPreamble(result.digest),
             usage: result.usage,
-            promptVersion: result.promptVersion)
+            promptVersion: result.promptVersion,
+            model: result.model)
     }
 
     /// Extract the corrected digest from the verify pass's output, dropping any
@@ -793,8 +803,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     /// combined audit; only the `system`/`user` strings differ. maxTokens/timeout
     /// are identical for all (the `performDigestAttempt` request build).
     ///
-    /// #102 (F2): `model` is NON-DEFAULTED — every caller must pass it explicitly
-    /// so an omission is a COMPILE error, never a silent Sonnet. It feeds BOTH
+    /// `model` is resolved before entering this shared path. It feeds BOTH
     /// `performDigestAttempt` calls (initial + retry — same model, F3) AND the
     /// returned `DigestResult.estimatedCostUSD` (F1 sink d): the input-size guard
     /// below is the combined-audit's OWN `maxInputTokens=150_000` (system+user)/3
@@ -851,8 +860,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
             if Task.isCancelled || CancellationToken.current?.isCancelled == true {
                 throw EngineError.cancelled
             }
-            // #102 (F3): the bounded retry carries the SAME `model` as the initial
-            // attempt — a Haiku audit that retries re-issues a Haiku body.
+            // The bounded retry carries the SAME `model` as the initial attempt.
             response = try await performDigestAttempt(
                 apiKey: apiKey, system: system, user: user, request: request,
                 purpose: purpose, model: model)
@@ -860,6 +868,11 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
 
         if response.stopReason == "refusal" {
             throw EngineError.permanent("model refused the digest request")
+        }
+        // A capped digest is cut mid-section; never persist it as complete.
+        if response.stopReason == "max_tokens" {
+            throw EngineError.permanent(
+                "digest output hit the \(Self.maxTokensRetryAttempt)-token limit")
         }
         guard let text = response.content.first(where: { $0.type == "text" })?.text else {
             throw EngineError.permanent(
@@ -877,7 +890,8 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
                 // class as the prior `BLAISE_DIGEST_MODEL` HIGH, so it threads the
                 // SAME `model`.
                 estimatedCostUSD: Self.cost(of: response.usage, model: model)),
-            promptVersion: version.rawValue)
+            promptVersion: version.rawValue,
+            model: model)
     }
 
     /// True for the errors the digest's one-shot bounded retry re-issues: a
@@ -955,27 +969,24 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         throw Self.mapHTTPError(statusCode: http.statusCode, type: errorType, message: message)
     }
 
-    /// The digest Messages request: free-text (NO `output_config` json_schema —
-    /// the digest is Markdown, not a schema-shaped document), temperature only.
-    ///
-    /// #102 (F2/F7): `model` is NON-DEFAULTED — the wire body carries whatever the
-    /// caller resolved (Sonnet for synthesis/verify/reconcile; optionally Haiku
-    /// for the combined audit). Both Sonnet 4.6 and Haiku 4.5 accept `temperature`
-    /// (we pin digest decode to 0), so it is included unconditionally for either
-    /// model. The wire model here is the SAME string the caller feeds to the
-    /// receipt `model:` and `cost(of:model:)` (the consistency invariant — the
-    /// prior `BLAISE_DIGEST_MODEL` HIGH was a wire/cost/receipt divergence).
+    /// The digest Messages request is free-text. Model-specific thinking and
+    /// effort parameters follow the same policy as structured requests.
     static func buildDigestURLRequest(
         apiKey: String, system: String, user: String, maxTokens: Int, timeout: TimeInterval,
         model: String
     ) throws -> URLRequest {
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": maxTokens,
-            "temperature": NotesDecodingParameters.digestTemperature,
             "system": system,
             "messages": [["role": "user", "content": user]],
         ]
+        if ClaudeNotesModel(rawValue: model)?.thinks == true {
+            body["thinking"] = ["type": "adaptive"]
+            body["output_config"] = ["effort": "high"]
+        } else {
+            body["temperature"] = NotesDecodingParameters.digestTemperature
+        }
         let serialized = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -1006,7 +1017,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     ) async throws -> APIResponse {
         let urlRequest = try Self.buildURLRequest(
             apiKey: apiKey, system: system, user: user, maxTokens: maxTokens, timeout: timeout,
-            schema: schema)
+            schema: schema, model: selectedModel.rawValue)
         let named = label.map { "\($0) " } ?? ""
 
         let data: Data
@@ -1028,6 +1039,7 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
             let transport = self.transport
             let ledger = self.ledger
             let id = self.id
+            let model = self.selectedModel.rawValue
             (data, http) = try await Task.detached {
                 let (data, http) = try await transport(urlRequest)
                 // Ledger inside the shield, BEFORE returning, ONLY on a billed
@@ -1035,10 +1047,10 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
                 // G7: the same write leaves a receipt.
                 if http.statusCode == 200, let usage = Self.decodeEditorUsage(from: data) {
                     try await ledger.add(
-                        Self.cost(of: usage),
+                        Self.cost(of: usage, model: model),
                         receipt: CloudSpendLedger.ReceiptDraft(
                             engineID: id,
-                            model: Self.model,
+                            model: model,
                             purpose: purpose,
                             meetingID: meetingID,
                             inputTokens: usage.inputTokens,
@@ -1091,24 +1103,21 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         }
     }
 
-    /// #102: the per-MTok price pair for `model`. Haiku is matched by EXACT
-    /// string equality (never substring/prefix) → a future haiku-shaped id won't
-    /// silently inherit the (1,5) pricing. EVERY other string — including the
-    /// Sonnet `model`, an unknown, or a haiku-shaped-but-not-exact id — falls
-    /// through to the (3,15) Sonnet pair, the CONSERVATIVE default (F6).
+    /// Catalog models use their pinned price pair. Every unknown string falls
+    /// through to legacy Sonnet 4.6 pricing as the conservative default.
     static func pricePerMTok(for model: String) -> (input: Double, output: Double) {
-        if model == haikuModel {
-            return (haikuInputUSDPerMTok, haikuOutputUSDPerMTok)
+        if let known = ClaudeNotesModel(rawValue: model) {
+            return (known.inputUSDPerMTok, known.outputUSDPerMTok)
         }
         return (inputUSDPerMTok, outputUSDPerMTok)
     }
 
-    /// #102: model-aware cost. Defaults to `Self.model` (Sonnet) so every
-    /// non-audit caller (notes, synthesis, md-v5 verify/reconcile) bills Sonnet
-    /// unchanged; the combined-audit threads its resolved `auditModel`. The model
-    /// string passed here MUST be identical to the one on the wire body and in
-    /// the receipt `model:` field for any single call (the consistency invariant
-    /// — the prior `BLAISE_DIGEST_MODEL` HIGH was exactly this divergence).
+    private static func priceLabel(_ price: Double) -> String {
+        price.rounded() == price ? String(Int(price)) : String(price)
+    }
+
+    /// Model-aware cost. The static default remains Sonnet 4.6 for compatibility;
+    /// instance paths always pass the selected or explicitly overridden model.
     static func cost(of usage: APIUsage, model: String = ClaudeSummarizationEngine.model) -> Double {
         let price = pricePerMTok(for: model)
         return Double(usage.inputTokens) / 1_000_000 * price.input
@@ -1123,11 +1132,11 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
     }
 
     /// Request construction (unit-tested: URL, headers minus the real key,
-    /// the json_schema block, decoding pins — temperature ONLY, no top_p:
-    /// the API rejects both together on Claude 4+ models).
+    /// the json_schema block and model-specific decoding parameters).
     static func buildURLRequest(
         apiKey: String, system: String, user: String, maxTokens: Int, timeout: TimeInterval,
-        schema: String = NotesResponseSchema.json
+        schema: String = NotesResponseSchema.json,
+        model: String
     ) throws -> URLRequest {
         // The schema is spliced in as its RAW authored JSON, not via
         // JSONSerialization: dictionary round-trips destroy property order
@@ -1138,19 +1147,26 @@ public actor ClaudeSummarizationEngine: SummarizationEngine, NotesEditingEngine,
         // skeleton (C6 bake-off finding, 2026-06-10: 3/3 empty at 48
         // output tokens vs rich notes with authored order).
         let placeholder = "BLAISE-NOTES-SCHEMA-SPLICE-7F2A"
-        let body: [String: Any] = [
+        var outputConfig: [String: Any] = [
+            "format": [
+                "type": "json_schema",
+                "schema": placeholder,
+            ]
+        ]
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": maxTokens,
-            "temperature": NotesDecodingParameters.temperature,
             "system": system,
             "messages": [["role": "user", "content": user]],
-            "output_config": [
-                "format": [
-                    "type": "json_schema",
-                    "schema": placeholder,
-                ]
-            ],
+            "output_config": outputConfig,
         ]
+        if ClaudeNotesModel(rawValue: model)?.thinks == true {
+            body["thinking"] = ["type": "adaptive"]
+            outputConfig["effort"] = "high"
+            body["output_config"] = outputConfig
+        } else {
+            body["temperature"] = NotesDecodingParameters.temperature
+        }
         let serialized = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         guard let template = String(data: serialized, encoding: .utf8),
             template.contains("\"\(placeholder)\"")

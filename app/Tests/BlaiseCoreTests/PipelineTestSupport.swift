@@ -267,6 +267,7 @@ final class PipelineMockNotes: SummarizationEngine, @unchecked Sendable {
         var digestBuilder: (@Sendable (DigestRequest) -> String)?
         /// Throw this error on every digest call (AC5c persistent failure).
         var digestError: EngineError?
+        var digestModel = "mock-model"
         /// Throw a transient error the first N digest calls, then succeed (the
         /// bounded-retry / transient-then-success path).
         var digestTransientFailCount = 0
@@ -315,7 +316,7 @@ final class PipelineMockNotes: SummarizationEngine, @unchecked Sendable {
 
     func generateDigest(_ request: DigestRequest, purpose: CloudSpendPurpose) async throws -> DigestResult {
         if let hook = state.withLock({ $0.onGenerate }) { await hook() }
-        enum Outcome { case fail(EngineError); case ok(String) }
+        enum Outcome { case fail(EngineError); case ok(String, model: String) }
         let outcome = state.withLock { state -> Outcome in
             state.digestRequests.append(request)
             state.digestPurposes.append(purpose)
@@ -325,15 +326,16 @@ final class PipelineMockNotes: SummarizationEngine, @unchecked Sendable {
                 return .fail(.transient("mock transient digest failure attempt \(attempt)"))
             }
             let value = state.digestBuilder.map { $0(request) } ?? state.digestString
-            return .ok(value)
+            return .ok(value, model: state.digestModel)
         }
         switch outcome {
         case .fail(let error): throw error
-        case .ok(let digest):
+        case .ok(let digest, let model):
             return DigestResult(
                 digest: digest,
                 usage: EngineUsage(inputUnits: 80, outputUnits: 40, estimatedCostUSD: nil),
-                promptVersion: DigestPromptBuilder.shippedVersion.rawValue)
+                promptVersion: DigestPromptBuilder.shippedVersion.rawValue,
+                model: model)
         }
     }
 }

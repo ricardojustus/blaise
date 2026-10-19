@@ -731,6 +731,27 @@ public enum CorrectionAnchoring {
         return matches(quote: quote, in: blocks).firstIndex(of: targeted.blockIndex) ?? 0
     }
 
+    /// The fallback for a one-piece quote `resolve` finds in none of its
+    /// section's raw blocks: a whole-table quote is the table's on-screen text,
+    /// which no raw block holds (cell pipes, the divider row). It resolves among
+    /// the section's rendered blocks — the space its occurrence was captured
+    /// in — and the hit counts only when that block is a table whose whole
+    /// on-screen text is the quote. Containment alone would also accept a
+    /// paragraph quote that a table's flattening happens to hold (across two
+    /// rows, or across a link whose URL a cell drops). `blockIndex` is within
+    /// the section's rendered blocks.
+    public static func resolveTable(
+        quote: String, occurrence: Int, section: MeetingCorrection.Section, in space: RenderedSpace
+    ) -> (blockIndex: Int, occurrence: Int)? {
+        let indices = space.blocks.indices.filter { space.blocks[$0].section == section }
+        let folded = space.foldedBlocks(of: section)
+        guard let hit = resolve(quote: quote, occurrence: occurrence, in: folded),
+            folded.folds[hit.blockIndex] == fold(quote),
+            space.tables.contains(indices[hit.blockIndex])
+        else { return nil }
+        return hit
+    }
+
     // MARK: - Passages (a quote whose pieces span paragraphs)
 
     /// Capture's joiner: a quote spanning paragraphs stores the selected text
@@ -839,6 +860,8 @@ public enum CorrectionAnchoring {
         public let blocks: [RenderedBlock]
         let folds: [[Character]]
         private let foldTexts: [String]
+        /// The indices of the blocks that are tables.
+        let tables: Set<Int>
 
         public init(_ structured: NotesStructured) {
             self.init(structured, parsed: ParsedNotes(structured))
@@ -846,9 +869,17 @@ public enum CorrectionAnchoring {
 
         /// The same space from notes already parsed.
         public init(_ structured: NotesStructured, parsed: ParsedNotes) {
-            blocks = CorrectionAnchoring.renderedBlocks(of: structured, parsed: parsed)
+            let blocks = CorrectionAnchoring.renderedBlocks(of: structured, parsed: parsed)
+            self.blocks = blocks
             foldTexts = blocks.map { CorrectionAnchoring.fold($0.text) }
             folds = foldTexts.map(Array.init)
+            tables = Set(blocks.indices.filter { index in
+                let id = blocks[index].id
+                let source = id.section == .summary ? parsed.summary
+                    : id.section == .detailedNotes ? parsed.detailed : []
+                guard source.indices.contains(id.index), case .table = source[id.index].kind else { return false }
+                return true
+            })
         }
 
         /// One section's blocks with the folds this space already holds, in
@@ -1018,17 +1049,17 @@ public enum CorrectionAnchoring {
     /// refreshes WHERE it points, never WHAT it is. Recomputing the status here
     /// is what made resolution last only until the next synthesis.
     ///
-    /// A passage resolves by the passage rule in the rendered space, folded
-    /// once for the whole pass and only when a passage row is present.
+    /// A passage, or a whole-table quote, resolves in the rendered space,
+    /// folded once for the whole pass and only when such a row needs it.
     public static func reanchor(
         annotations: [MeetingCorrection], against structured: NotesStructured
     ) -> [Update] {
         let rows = annotations.filter { $0.kind == .annotation }
-        let space = rows.contains { isPassage($0.quotedText) } ? RenderedSpace(structured) : nil
+        lazy var space = RenderedSpace(structured)
         return rows
             .map { row in
                 let hit: (blockIndex: Int, occurrence: Int)?
-                if let space, isPassage(row.quotedText) {
+                if isPassage(row.quotedText) {
                     hit = resolvePassage(
                         quote: row.quotedText, occurrence: row.occurrence,
                         section: row.section, in: space
@@ -1037,6 +1068,9 @@ public enum CorrectionAnchoring {
                     let sectionBlocks = blocks(of: structured, section: row.section)
                     hit = resolve(
                         quote: row.quotedText, occurrence: row.occurrence, in: sectionBlocks)
+                        ?? resolveTable(
+                            quote: row.quotedText, occurrence: row.occurrence,
+                            section: row.section, in: space)
                 }
                 if row.status == .resolved {
                     return Update(

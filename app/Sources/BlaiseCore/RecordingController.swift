@@ -128,8 +128,11 @@ public protocol RecordingAutomating: Sendable {
     @discardableResult
     func endPaused(meetingID: MeetingID) async throws -> Meeting
     /// G9 grace→paused conversion: write a grace meeting (no live session,
-    /// parts already finalized at auto-stop) durably to `paused`.
-    func pauseGraceMeeting(meetingID: MeetingID) async
+    /// parts already finalized at auto-stop) durably to `paused`. Returns
+    /// whether it converted (false = refused by the single-open-meeting
+    /// predicate, or the row already left `recording`).
+    @discardableResult
+    func pauseGraceMeeting(meetingID: MeetingID) async -> Bool
     /// G9 (M-9): the id of any meeting durably `paused` (excluding the given
     /// id) — the single-open-meeting predicate consulted by every grace/resume
     /// entry, including grace→paused conversion.
@@ -212,13 +215,14 @@ public enum RecordingEvent: Sendable, Equatable {
     /// G9: manual pause finalized the current part and committed `paused`.
     /// `accumulatedSeconds` is the sum of all closed part durations (the
     /// indicator's "paused" timer). DISTINCT from `.stopping/.stopped` — a
-    /// pause never processes and never enters grace.
-    case paused(meetingID: MeetingID, accumulatedSeconds: TimeInterval)
-    /// G9: a paused meeting resumed — engine live again, new part open. The
-    /// indicator returns to recording; carries the resumed-part start so the
-    /// timer continues from the accumulated base. (`.started` re-emission
-    /// also fires; `.resumed` lets the holder distinguish pause-resume from a
-    /// fresh start for the accumulated-timer base.)
+    /// pause never processes and never enters grace. `title` is the row's
+    /// current title (a rename or a tracker-driven start is reflected).
+    case paused(meetingID: MeetingID, title: String, accumulatedSeconds: TimeInterval)
+    /// G9: a paused meeting resumed (or a C14 grace meeting rejoined) — engine
+    /// live again, new part open. The indicator returns to recording; carries
+    /// the resumed-part start so the timer continues from the accumulated
+    /// base. (`.started` follows; `.resumed` lets the holder distinguish a
+    /// resume from a fresh start for the accumulated-timer base.)
     case resumed(meetingID: MeetingID, at: Date, accumulatedSeconds: TimeInterval)
     /// G12 §2: a ≤ 10 Hz raw RMS pair (mic, system) for the live level meter.
     /// The UI holder feeds it into the `LevelMeter` model (smoothing + silence).
@@ -247,6 +251,11 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
     }
 
     private var active: ActiveSession?
+    /// A start, resume, resume-from-pause or grace-to-paused conversion is
+    /// between its refusal checks and its outcome. Actor reentrancy lets a
+    /// second trigger in at any of those awaits; the shared engine traps a
+    /// second `start` while running.
+    private var opening = false
     private var eventContinuations: [UUID: AsyncStream<RecordingEvent>.Continuation] = [:]
     /// Off-actor encodes still running (a stop past its session release).
     /// The quit intercept awaits these via `awaitQuiescence()` — terminating
@@ -405,7 +414,9 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         // finalize-in-flight meetings (status still `recording`, no live
         // session) deliberately do NOT refuse — the shipped back-to-back
         // stop-then-start path stays green.
-        guard active == nil else { throw RecordingControllerError.alreadyRecording }
+        guard active == nil, !opening else { throw RecordingControllerError.alreadyRecording }
+        opening = true
+        defer { opening = false }
         try await refuseIfAnyMeetingPaused(excluding: nil)
         try checkDiskSpace()
 
@@ -525,7 +536,9 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         // meeting X refuses when a live session exists or any OTHER meeting is
         // durably `paused` — never two open meetings through any door
         // (including the C14 grace rejoin into this method).
-        guard active == nil else { throw RecordingControllerError.alreadyRecording }
+        guard active == nil, !opening else { throw RecordingControllerError.alreadyRecording }
+        opening = true
+        defer { opening = false }
         try await refuseIfAnyMeetingPaused(excluding: meetingID)
         try checkDiskSpace()
         guard var meeting = try await MeetingRepository(database: database).fetch(meetingID) else {
@@ -533,6 +546,10 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         }
         let resumedAt = now()
         let part = await CaptureParts.nextPartIndex(database, meetingID: meetingID)
+        // Read before the session is published, so nothing awaits between
+        // registering the session and its events.
+        let accumulated = await CaptureParts.accumulatedRecordedSeconds(
+            database, meetingID: meetingID)
         meeting.endedAt = nil
         meeting.updatedAt = resumedAt
         // G12: a surgical two-column write, not a full-row `update(meeting)`.
@@ -571,6 +588,7 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         }
 
         active = ActiveSession(meeting: meeting, partIndex: part, engineEvents: channel.sink)
+        emit(.resumed(meetingID: meetingID, at: resumedAt, accumulatedSeconds: accumulated))
         emit(.started(meetingID: meetingID, at: resumedAt))
         if startInfo.micStreams == 0 {
             logger.error("input device exposes no streams; mic track will be EMPTY")
@@ -658,10 +676,29 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         // The single transaction: close the part AND write `paused` together.
         // A crash here either committed (durably `paused`) or did not (stays
         // `recording` — kill-mid-capture). The AC3 hook proves atomicity.
-        try await CaptureParts.closePartAndSetStatus(
-            database, meetingID: meeting.id, partIndex: partIndex,
-            endedAtMs: pausedAtMs, status: .paused,
-            midTransactionHook: transactionHook)
+        do {
+            try await CaptureParts.closePartAndSetStatus(
+                database, meetingID: meeting.id, partIndex: partIndex,
+                endedAtMs: pausedAtMs, status: .paused,
+                midTransactionHook: transactionHook)
+        } catch {
+            // The engine is stopped and the part encoded, but the row stays
+            // `recording`: release the session so recording is not blocked
+            // until relaunch, and leave the row to the launch flip + redispatch
+            // (the kill-mid-capture path). The stop events move the indicator
+            // off `.recording` so Start is offered again.
+            active = nil
+            emit(.stopping(meetingID: meeting.id))
+            emit(.stopped(
+                meetingID: meeting.id,
+                alarm: "Pause failed. The recording was stopped; any audio it captured is kept and will be processed at the next launch",
+                kickedProcessing: false))
+            let observer = self.observer
+            let failed = meeting
+            Task { await observer.recordingStopped(
+                meetingID: failed.id, meetingCode: failed.meetingCode, manual: false) }
+            throw error
+        }
         meeting.status = .paused
         // Mirror the ms-truncated value persisted by closePartAndSetStatus so
         // the returned meeting matches the durable row exactly.
@@ -673,7 +710,8 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         active = nil
         let accumulated = await CaptureParts.accumulatedRecordedSeconds(
             database, meetingID: meeting.id)
-        emit(.paused(meetingID: meeting.id, accumulatedSeconds: accumulated))
+        let title = (try? await MeetingRepository(database: database).fetch(meeting.id))?.title
+        emit(.paused(meetingID: meeting.id, title: title ?? meeting.title, accumulatedSeconds: accumulated))
         logger.notice("recording paused: \(meeting.id) part=\(partIndex)")
         let observer = self.observer
         let paused = meeting
@@ -700,7 +738,9 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
     public func resumePaused(meetingID: MeetingID) async throws -> Meeting {
         // M-9: refuse if a live session exists or any OTHER meeting is paused
         // (resuming THIS paused meeting is the point — exclude it).
-        guard active == nil else { throw RecordingControllerError.alreadyRecording }
+        guard active == nil, !opening else { throw RecordingControllerError.alreadyRecording }
+        opening = true
+        defer { opening = false }
         try await refuseIfAnyMeetingPaused(excluding: meetingID)
         try checkDiskSpace()
         guard var meeting = try await MeetingRepository(database: database).fetch(meetingID) else {
@@ -843,15 +883,29 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
     /// (no part-finalize). The grace meeting's `endedAt` already stands from
     /// the auto-stop. Idempotent: only flips a `recording` row (a racing
     /// finalize that already moved it is a no-op).
-    public func pauseGraceMeeting(meetingID: MeetingID) async {
-        try? await database.pool.write { db in
+    ///
+    /// The single-open-meeting predicate is re-checked HERE, under the same
+    /// in-flight flag as start/resume: the caller's checks precede this write
+    /// by several awaits, and a start landing in between would otherwise
+    /// leave a live session beside a paused meeting.
+    @discardableResult
+    public func pauseGraceMeeting(meetingID: MeetingID) async -> Bool {
+        guard active == nil, !opening else { return false }
+        opening = true
+        defer { opening = false }
+        guard await pausedMeetingID(excluding: meetingID) == nil else { return false }
+        let flipped = (try? await database.pool.write { db in
             try db.execute(
                 sql: "UPDATE meeting SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
                 arguments: [
                     MeetingStatus.paused.rawValue, self.now(), meetingID,
                     MeetingStatus.recording.rawValue,
                 ])
-        }
+            return db.changesCount > 0
+        }) ?? false
+        // A no-op flip (the row already left `recording`) must not drive the
+        // holder into a paused display for a meeting that is not paused.
+        guard flipped else { return false }
         // Drive the SAME holder path a live pause does: the recording-events
         // handler sets `pausedMeetingID` + applies `.meetingPaused`. Without
         // this the converted meeting shows no paused display and its Resume /
@@ -859,8 +913,10 @@ public actor RecordingController: RecordingSessionProviding, RecordingAutomating
         // parts, so `accumulatedSeconds` is the sum of the closed durations.
         let accumulated = await CaptureParts.accumulatedRecordedSeconds(
             database, meetingID: meetingID)
-        emit(.paused(meetingID: meetingID, accumulatedSeconds: accumulated))
+        let title = (try? await MeetingRepository(database: database).fetch(meetingID))?.title
+        emit(.paused(meetingID: meetingID, title: title ?? "Recording", accumulatedSeconds: accumulated))
         logger.notice("grace meeting written to paused: \(meetingID)")
+        return true
     }
 
     /// G10 §2/2b: per-meeting paused teardown for a DELETE of a `paused`

@@ -80,19 +80,19 @@ public enum MemoryDigestSettings {
 
     /// #102: the "Run the combined audit on Haiku" cost toggle (Settings →
     /// Handoff). It gates ONLY which model the md-v6 COMBINED-AUDIT call runs on:
-    /// ON → `ClaudeSummarizationEngine.haikuModel` (Haiku 4.5, ≈⅓ the Sonnet
-    /// cost); OFF → the default `ClaudeSummarizationEngine.model` (Sonnet). It
+    /// ON → `ClaudeSummarizationEngine.haikuModel` (Haiku 4.5);
+    /// OFF → the memory-digest engine's API model. It
     /// does NOT gate whether the audit runs (the verify/reconcile toggles do that)
     /// and has NO effect on notes, synthesis, or the md-v5 verify/reconcile
-    /// passes — those always stay Sonnet. Default OFF (Sonnet) until validated for
-    /// Haiku-audit quality; default-OFF is byte-identical Sonnet everywhere. Read
+    /// passes — those stay on their own engine's model. Default OFF until validated for
+    /// Haiku-audit quality. Read
     /// at the same pipeline combined-audit decision point; the dev env override
     /// `BLAISE_HAIKU_AUDIT=1` forces Haiku on regardless (so the quality gauntlet
     /// runner can flip it without writing settings), paralleling
     /// `BLAISE_DIGEST_VERIFY`/`BLAISE_DIGEST_RECONCILE`.
     public static let haikuAuditEnabledKey = "handoff.memoryDigest.haikuAudit.enabled"
     /// Default OFF: an unset toggle (no row yet) means the combined audit runs on
-    /// SONNET — the conservative, validated default.
+    /// the selected model.
     public static let defaultHaikuAuditEnabled = false
 
     /// The live Haiku-audit-toggle value (default OFF when unset).
@@ -257,16 +257,18 @@ public struct DigestRequest: Sendable, Equatable {
 /// S-label-neutralized — the pipeline runs `SLabelNeutralizer.neutralizeText`
 /// over it at the mint), the usage, and the digest prompt version that produced
 /// it (`md-v3` is the shipped contract; the field carries whichever version
-/// minted the digest).
+/// minted the digest), and the model the call actually ran on.
 public struct DigestResult: Sendable, Equatable {
     public var digest: String
     public var usage: EngineUsage?
     public var promptVersion: String
+    public var model: String
 
-    public init(digest: String, usage: EngineUsage? = nil, promptVersion: String) {
+    public init(digest: String, usage: EngineUsage? = nil, promptVersion: String, model: String) {
         self.digest = digest
         self.usage = usage
         self.promptVersion = promptVersion
+        self.model = model
     }
 }
 

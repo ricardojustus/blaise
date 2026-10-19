@@ -5,7 +5,7 @@ import Foundation
 ///
 /// Routing is by the engine's declared descriptor kind: `.secret` →
 /// `SecretStore`, everything else → `SettingsStore`, all under
-/// `engine.<id>.<key>`.
+/// `engine.<configurationID>.<key>`.
 ///
 /// Normative (C2 spec): configuration VALUES are read from the stores at
 /// call time (live read-through); only descriptors are static. A key entered

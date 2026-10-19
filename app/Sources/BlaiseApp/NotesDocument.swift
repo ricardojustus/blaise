@@ -958,7 +958,9 @@ func notesDocRows(
         folded[section] = blocks
         return live.filter {
             $0.kind == kind && $0.section == section
-                && CorrectionAnchoring.resolve(quote: $0.quotedText, occurrence: $0.occurrence, in: blocks) != nil
+                && (CorrectionAnchoring.resolve(quote: $0.quotedText, occurrence: $0.occurrence, in: blocks)
+                    ?? CorrectionAnchoring.resolveTable(
+                        quote: $0.quotedText, occurrence: $0.occurrence, section: section, in: document.space)) != nil
         }
     }
     func place(_ byIndex: [Int: [MeetingCorrection]], pending: Bool, anchor: (Int) -> String) {
@@ -1029,7 +1031,8 @@ func notesDocRows(
 
 /// The margin notes that stand in the "Your notes" tail: an annotation the
 /// reading column shows whose anchor resolves nowhere — by the passage rule
-/// for a passage, today's resolve otherwise, each section folded once.
+/// for a passage, today's resolve otherwise (a whole table by its rendered
+/// fallback), each section folded once.
 @MainActor
 func notesDocUnanchored(
     _ rows: [MeetingCorrection], structured: NotesStructured, space: CorrectionAnchoring.RenderedSpace
@@ -1043,7 +1046,9 @@ func notesDocUnanchored(
         let blocks = folded[row.section]
             ?? CorrectionAnchoring.FoldedBlocks(CorrectionAnchoring.blocks(of: structured, section: row.section))
         folded[row.section] = blocks
-        return CorrectionAnchoring.resolve(quote: row.quotedText, occurrence: row.occurrence, in: blocks) == nil
+        return (CorrectionAnchoring.resolve(quote: row.quotedText, occurrence: row.occurrence, in: blocks)
+            ?? CorrectionAnchoring.resolveTable(
+                quote: row.quotedText, occurrence: row.occurrence, section: row.section, in: space)) == nil
     }
 }
 

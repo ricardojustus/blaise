@@ -110,6 +110,14 @@ Blaise is local-first by design, and the privacy boundary is stated honestly:
   transcript, same destination — only the billing and the credential differ, and
   no API key is exposed to it), or a **local engine** that runs on-device and
   makes no network call at all.
+  **Settings → Engines → Notes (Summarization)** offers Sonnet 5.5, Opus 5.5,
+  Haiku 4.5, and the existing Sonnet 4.6 through the API; the subscription
+  choices are Sonnet 5.5 and Opus 5.5. API choices share your saved Anthropic key;
+  subscription choices share your OAuth token and CLI path. Existing selections
+  stay selected. The chosen model also handles AI edits to the notes.
+  **Settings → Engines → Memory digest** picks the model for the memory digest
+  and its edits; it defaults to Same as notes. The optional Haiku digest-audit
+  setting still applies.
 - **Spend tracking and a ceiling are built in.** Blaise tracks what the notes step
   costs and enforces a configurable monthly ceiling, so the cloud step can never
   run away.
@@ -117,8 +125,9 @@ Blaise is local-first by design, and the privacy boundary is stated honestly:
   integrations read metadata only (event times and attendees; huddle presence — never
   huddle messages or audio). Their credentials live in the macOS Keychain and never
   leave the machine except as Blaise's own API calls to the respective service.
-- **Fully offline mode.** Select the local MLX notes engine and Blaise synthesises
-  notes entirely on-device. If neither a cloud key nor a local model is available,
+- **Fully offline mode.** Select the local MLX notes engine, with Memory digest on
+  "Same as notes" (or the local engine too), and Blaise synthesises notes and the
+  digest entirely on-device. If neither a cloud key nor a local model is available,
   the meeting is transcribed and stored with notes marked *pending* — nothing is
   lost, and notes can be generated later.
 

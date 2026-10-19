@@ -245,6 +245,11 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
     /// same-code auto-stop finalizes the standing window first.
     private var graces: [MeetingID: GraceState] = [:]
 
+    /// Meetings with a grace→paused conversion in flight: a second concurrent
+    /// conversion of the same meeting is refused, so its refusal can never
+    /// restore a grace the first one is converting.
+    private var convertingGrace: Set<MeetingID> = []
+
     /// A `call-ended` that landed before the controller's detached
     /// `recordingStarted` fact (start-instant race): buffered per code,
     /// consumed when the fact arrives, pruned after its reason-aware deadline.
@@ -398,7 +403,7 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
         // recording.)
         if let grace = graces.values.first(where: { $0.code == code }) {
             if fresh, kind == .callStarted || kind == .heartbeat {
-                await resumeFromGrace(meetingID: grace.meetingID)
+                await resumeFromGrace(meetingID: grace.meetingID, signal: true)
             }
             return
         }
@@ -579,7 +584,10 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
     /// grace path. Returns whether a grace entry was converted.
     @discardableResult
     public func pauseFromGrace(meetingID: MeetingID) async -> Bool {
-        guard let grace = graces[meetingID] else { return false }
+        guard let grace = graces[meetingID], convertingGrace.insert(meetingID).inserted else {
+            return false
+        }
+        defer { convertingGrace.remove(meetingID) }
         // M-9: the universal single-open-meeting predicate guards THIS entry
         // too. Refuse a second open meeting — a live session anywhere, OR any
         // OTHER meeting already durably `paused` — so converting grace→paused
@@ -595,16 +603,42 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
             return false
         }
         graces.removeValue(forKey: meetingID)
+        // With the entry gone, only this suppression keeps a heartbeat during
+        // the awaits below from re-posting "Meeting in progress" for the call.
+        let priorSuppression = suppressions[grace.code]
+        suppressions[grace.code] = Suppression(kind: .paused, lastSignalAt: now())
         // G11 §3 exit (grace→paused): clear the durable column BEFORE the
         // controller flips `recording → paused`. A kill between the clear and
         // the flip leaves a plain `recording` row (today's launch flip), never
         // a `paused` row carrying a stale grace column.
         await persistGrace(meetingID, nil)
+        // The controller re-checks the predicate atomically (a start may have
+        // landed during the awaits above). Refused: the grace stands as it was,
+        // unless a resume of THIS meeting went live (or was then paused) during
+        // those awaits — its grace is already over, and restoring it would let
+        // expiry process a live meeting or a rejoin resume a paused one.
+        guard await controller.pauseGraceMeeting(meetingID: meetingID) else {
+            // `live` is read LAST, and no await may sit between it and the
+            // restore below: a resume going live after this read finds the
+            // restored entry in its `recordingStarted` fact and clears it.
+            let paused = await controller.pausedMeetingID(excluding: nil) == meetingID
+            let live = await controller.currentSession()?.meetingID == meetingID
+            if !paused { suppressions[grace.code] = priorSuppression }
+            if live || paused {
+                // The resume's `recordingStarted` found no entry to end.
+                emit(.graceEnded(meetingID: meetingID, reason: live ? .resumed : .paused))
+                await notifier.withdrawWatchdogStop(meetingID: meetingID)
+                logger.notice("pause-from-grace refused: the meeting already left grace")
+                return false
+            }
+            graces[meetingID] = grace
+            await persistGrace(meetingID, Int64(grace.until.timeIntervalSince1970 * 1000))
+            logger.notice("pause-from-grace refused by the controller — grace continues")
+            return false
+        }
         emit(.graceEnded(meetingID: meetingID, reason: .paused))
         await notifier.withdrawWatchdogStop(meetingID: meetingID)
         manualControl.insert(meetingID)
-        suppressions[grace.code] = Suppression(kind: .paused, lastSignalAt: now())
-        await controller.pauseGraceMeeting(meetingID: meetingID)
         logger.notice("grace converted to paused for \(meetingID)")
         return true
     }
@@ -858,12 +892,17 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
 
     /// The grace rejoin (signal-driven), the `meetStart`/watchdog
     /// notification actions, and the menu's Resume item — all resume the
-    /// same way.
-    public func resumeFromGrace(meetingID: MeetingID) async {
+    /// same way. A refusal surfaces an error only for a user action; a
+    /// rejoin `signal` is ignored and logged.
+    public func resumeFromGrace(meetingID: MeetingID, signal: Bool = false) async {
         guard graces[meetingID] != nil else { return }
         guard await controller.currentSession() == nil else {
             // One session at a time; the grace meeting finalizes at expiry.
             logger.notice("resume signal ignored: a different recording is active")
+            if !signal {
+                emit(.actionFailed(
+                    message: "Could not resume recording: \(RecordingControllerError.alreadyRecording)"))
+            }
             return
         }
         // G11 §3 exit ordering (r3-M2): the rejoin-resume exit clears the
@@ -887,6 +926,7 @@ public actor MeetCallTracker: MeetCallSignalReceiving, RecordingLifecycleObservi
                     meetingID, Int64(grace.until.timeIntervalSince1970 * 1000))
             }
             logger.error("grace resume failed: \(error) — grace continues until expiry")
+            emit(.actionFailed(message: "Could not resume recording: \(error)"))
         }
     }
 

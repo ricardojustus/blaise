@@ -10,10 +10,11 @@ import UniformTypeIdentifiers
 /// SAME stop+encode path as a manual stop (the CAFs are crash-safe either
 /// way; this just finishes the job now instead of at next launch's sweep).
 ///
-/// G9: a `paused` meeting counts as open — quitting offers a dialog
-/// ("End & process, or quit and keep it paused?"). Quitting keeps the state
-/// (the paused row is durable); relaunch surfaces the paused meeting with
-/// Resume / End & process.
+/// G9: a `paused` meeting counts as open — quitting offers a dialog (end it
+/// and process it at the next launch, or quit and keep it paused). Ending
+/// flips it to processing, but the run itself happens at the next launch:
+/// the app is quitting. Keeping it paused preserves the durable row;
+/// relaunch surfaces the paused meeting with Resume / End & process.
 final class BlaiseAppDelegate: NSObject, NSApplicationDelegate {
     weak var environment: AppEnvironment?
     /// The AppKit menu-bar indicator + recording menu (NSStatusItem + NSPopover),
@@ -71,13 +72,14 @@ final class BlaiseAppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
-    /// The paused-quit dialog. Returns true if the user chose End & process.
+    /// The paused-quit dialog. Returns true if the user chose to end it.
     @MainActor
     private static func askEndOrKeepPaused() -> Bool {
         let alert = NSAlert()
         alert.messageText = "A meeting is paused"
-        alert.informativeText = "End & process it, or quit and keep it paused?"
-        alert.addButton(withTitle: "End & Process")
+        alert.informativeText =
+            "End it now and process it the next time Blaise opens, or quit and keep it paused?"
+        alert.addButton(withTitle: "End & Process on Next Launch")
         alert.addButton(withTitle: "Quit & Keep Paused")
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn

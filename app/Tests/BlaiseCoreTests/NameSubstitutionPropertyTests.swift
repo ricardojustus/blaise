@@ -83,8 +83,10 @@ import Testing
             "O'Neil's note about sammy and xq",
         ]
         // Owners that exercise rule 2 (field-level fuzzy fix) — including
-        // near-misses of the candidate full names below.
-        let owners = ["xq", "sammy", "Vidau", "Samy", "Halden Vidal", "Marco Vidal"]
+        // near-misses of the candidate full names below. "Vidau" and "Samy" tie
+        // between two candidates (ambiguous → no-op); "Halde" is the unique
+        // near-miss that makes rule 2 actually fire in the sweep.
+        let owners = ["xq", "sammy", "Vidau", "Samy", "Halde", "Halden Vidal", "Marco Vidal"]
         return texts.flatMap { t in
             owners.map { owner in
                 NotesStructured(
@@ -112,6 +114,7 @@ import Testing
         let everyday = try everydayClosure()
         let cases = noteCases()
         let candidateSets = candidateSets()
+        var rule2Fires = 0
         // 120 generated contexts (varied seeds × write counts × candidate sets)
         // × the adversarial notes — each store is one the §2 write path produced
         // and would ship; each candidate set is empty (original) or the C-3
@@ -125,7 +128,9 @@ import Testing
                         polishCanonicals: [])
                     let label = "seed \(seed), writes \(writes), candidates \(candidates.count)"
                     for input in cases {
-                        let once = NameSubstitution.apply(notes: input, context: context).notes
+                        let first = NameSubstitution.apply(notes: input, context: context)
+                        rule2Fires += first.report.filter { $0.rule == 2 }.count
+                        let once = first.notes
                         let twice = NameSubstitution.apply(notes: once, context: context)
                         #expect(once == twice.notes, "apply∘apply must equal apply (\(label))")
                         #expect(twice.report.isEmpty, "second pass must be a no-op (\(label))")
@@ -133,6 +138,7 @@ import Testing
                 }
             }
         }
+        #expect(rule2Fires > 0, "the generated sweep must exercise rule 2")
 
         // C-3 GUARANTEE: the random write draw may or may not produce the exact
         // `Vidal → Marco Vidal` row that drives the rule-2→rule-1 relay, so
