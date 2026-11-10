@@ -3,6 +3,45 @@
     <channel>
         <title>Blaise</title>
         <item>
+            <title>1.10.3</title>
+            <pubDate>Tue, 10 Nov 2026 14:45:28 -0300</pubDate>
+            <link>https://github.com/ricardojustus/blaise/releases/tag/v1.10.3</link>
+            <sparkle:version>665</sparkle:version>
+            <sparkle:shortVersionString>1.10.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.6.1</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[# Blaise 1.10.3: Google Meet participants again
+
+Your meetings, transcripts, notes and settings carry over untouched, and nothing needs reprocessing.
+
+## Fixed
+
+- **Google Meet participants, speaker names and auto-end.** Google is moving call tabs to a new address
+  (`meet.google.com/meet/<code>`). The Meet extension read that address as a meeting called "meet", so Blaise could not
+  connect the call to its recording: no participants, no automatic end, and a "no signals" reminder on every Meet call.
+  The extension and the app now read the meeting code from both address forms.
+- **Launch & Record** opens the Meet link that carries the meeting it records, even when an invite contains more than
+  one Meet link.
+
+## Update the Meet extension (one manual step)
+
+The app updates itself; the Chrome extension does not. To get the fix:
+
+1. Download `blaise-meet-extension.zip` below and unzip it over the folder you loaded the extension from (or load the
+   new folder).
+2. In `chrome://extensions`, press **Reload** on "Blaise Meet Companion". It should read version **0.3.1**.
+3. Refresh any open Google Meet tab.
+
+Your shared secret survives the reload; you don't need to enter it again.
+
+## Assets
+
+- `Blaise-1.10.3.zip`: the notarised, stapled app (macOS 15.6.1+, Apple Silicon)
+- `blaise-meet-extension.zip`: the Chrome extension for Google Meet participant/speaker signals (0.3.1, updated)
+]]></description>
+            <enclosure url="https://github.com/ricardojustus/blaise/releases/download/v1.10.3/Blaise-1.10.3.zip" length="34747703" type="application/octet-stream" sparkle:edSignature="90T//RoBOSYTyfrBGAwHrrGdDULQS+lx8EyoUNBW1N66n2/uxze76yl7w4spU06qC07FI5808cuOspat2BNCBw=="/>
+        </item>
+        <item>
             <title>1.10.2</title>
             <pubDate>Mon, 19 Oct 2026 10:55:08 -0300</pubDate>
             <link>https://github.com/ricardojustus/blaise/releases/tag/v1.10.2</link>
@@ -80,43 +119,6 @@ A fix release. Your meetings, transcripts, notes and settings carry over untouch
 - `blaise-meet-extension.zip`: the Chrome extension for Google Meet participant/speaker signals (unchanged)
 ]]></description>
             <enclosure url="https://github.com/ricardojustus/blaise/releases/download/v1.10.1/Blaise-1.10.1.zip" length="34799730" type="application/octet-stream" sparkle:edSignature="bxlqWi9JEHbTXiU20G9ssu6GSiPbR8gLCtTkv0tdUH68CQ54STJaSaMsakoKjiDqrkfzOAo/ImJ8r07UAYBBDQ=="/>
-        </item>
-        <item>
-            <title>1.10.0</title>
-            <pubDate>Fri, 02 Oct 2026 10:25:17 -0300</pubDate>
-            <link>https://github.com/ricardojustus/blaise/releases/tag/v1.10.0</link>
-            <sparkle:version>588</sparkle:version>
-            <sparkle:shortVersionString>1.10.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>15.6.1</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description sparkle:format="markdown"><![CDATA[# Blaise 1.10.0: timecode links, backups, a Claude connector, and notes language
-
-Four features in one release. Your meetings, transcripts, notes and settings carry over untouched; the library gets
-one new table for the timecode links on first launch.
-
-## What changed
-
-- **Timecode links.** Hover an item in the notes (a paragraph, a decision or an action item) and a small play mark
-  appears beside it. Click it and the recording plays from 3 seconds before that moment; click again to pause. The
-  notes don't scroll and nothing gets selected. Right-click a paragraph for "Play from m:ss", and VoiceOver reads
-  each mark as a button. New notes get their marks automatically, through one extra call on the Claude subscription
-  engine. "Generate Timestamps" adds them to a meeting from before this version. Turn it off with "Link notes to the
-  recording" in Settings.
-- **Backups.** A new Backup tab. Pick a folder, and Blaise backs up your library there every day. Encryption is
-  optional: Blaise generates the password, shows it once (copy or print it), and keeps it in your login Keychain.
-  Restore any backup from the same tab; your current library is set aside, not deleted.
-- **Connect to Claude.** "Connect to Claude…" sets up a read-only connector so Claude Desktop and Claude Code can
-  search your meetings and read their notes, action items and transcripts. It never changes anything in Blaise.
-- **Notes language.** Choose Auto, English or Portuguese for your notes. It applies to new notes and to notes you
-  regenerate yourself; existing notes are never rewritten in bulk.
-- **Upgrading from 1.9.2:** delivered in place by the updater.
-
-## Assets
-
-- `Blaise-1.10.0.zip`: the notarised, stapled app (macOS 15.6.1+, Apple Silicon)
-- `blaise-meet-extension.zip`: the Chrome extension for Google Meet participant/speaker signals (unchanged)
-]]></description>
-            <enclosure url="https://github.com/ricardojustus/blaise/releases/download/v1.10.0/Blaise-1.10.0.zip" length="34824383" type="application/octet-stream" sparkle:edSignature="xjrrDl8A+/sIYRywVPli4vRdlavbojtYGJoTe8eeC0iU3ow6YUZesr7PYiypnJjikQhoshYXMyRDwXQAuZDqCQ=="/>
         </item>
     </channel>
 </rss>
