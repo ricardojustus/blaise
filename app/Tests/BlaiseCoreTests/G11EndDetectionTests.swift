@@ -472,6 +472,20 @@ struct UpcomingMeetingsTests {
         #expect(rows.isEmpty, "an already-recorded code's row disappears")
     }
 
+    @Test("Launch & Record opens the link carrying the row's code, /meet/ form included")
+    func rowURLMatchesCode() {
+        let inCall = event(id: "evt-a", title: "Afternoon", startHour: 15, endHour: 16,
+            link: "https://meet.google.com/meet/abc-defg-hij?authuser=1")
+        let a = try! #require(UpcomingMeetings.rows(from: [inCall], now: noonSP, calendar: spCal).first)
+        #expect(a.meetingCode == "abc-defg-hij")
+        #expect(a.urlString == "https://meet.google.com/meet/abc-defg-hij?authuser=1")
+        let twoLinks = event(id: "evt-b", title: "Afternoon", startHour: 15, endHour: 16,
+            link: "meet.google.com/meet/abc-defg-hij\nhttps://meet.google.com/xyz-qrst-uvw?authuser=1")
+        let b = try! #require(UpcomingMeetings.rows(from: [twoLinks], now: noonSP, calendar: spCal).first)
+        #expect(b.meetingCode == "abc-defg-hij")
+        #expect(b.urlString == "https://meet.google.com/abc-defg-hij", "never another call's link")
+    }
+
     @Test("a row's Record action binds the §1 anchor (end + identifier)")
     func rowCarriesAnchor() {
         let later = event(id: "evt-later", title: "Afternoon", startHour: 15, endHour: 16,

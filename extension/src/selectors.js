@@ -337,13 +337,14 @@
 
   // ---- Meeting identity. ----
 
-  /** Meeting code from the URL path: meet.google.com/abc-defg-hij[?...].
+  /** Meeting code from the URL path: meet.google.com/abc-defg-hij[?...],
+   * or the same under a leading /meet/ segment (Meet's in-call address).
    * meet.google.com/lookup/<alias> paths use the alias as the code; other
-   * non-meeting segments (landing, new) yield null. */
+   * non-meeting segments (landing, new, meet) yield null. */
   function meetingCodeFromURL(href) {
     let path;
     try {
-      path = new URL(href).pathname;
+      path = new URL(href).pathname.replace(/^\/meet(?=\/)/, "");
     } catch {
       return null;
     }
@@ -353,7 +354,7 @@
     if (lookup) return lookup[1];
     const segment = path.match(/^\/([A-Za-z0-9_-]+)(?:\/|$)/);
     if (!segment) return null;
-    if (segment[1] === "landing" || segment[1] === "new" || segment[1] === "lookup") {
+    if (["landing", "new", "lookup", "meet"].includes(segment[1])) {
       return null;
     }
     return segment[1];

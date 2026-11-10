@@ -110,6 +110,22 @@ struct PreMeetingSchedulerTests {
         #expect(h.notifier.posts.count == 1, "fired-set dedupe (eventIdentifier + start)")
     }
 
+    @Test("the notification opens the link carrying the posted code, /meet/ form included")
+    func postedURLMatchesCode() async {
+        let h = makeSchedulerHarness()
+        let start = SchedulerHarness.epoch.addingTimeInterval(30)
+        await h.scheduler.update(snapshots: [
+            meetEvent(id: "ek-a", start: start,
+                location: "https://meet.google.com/meet/abc-defg-hij?authuser=1"),
+            meetEvent(id: "ek-b", start: start,
+                location: "meet.google.com/meet/xyz-qrst-uvw\nhttps://meet.google.com/qqq-rrrr-sss"),
+        ])
+        await h.scheduler.evaluate()
+        let urls = Dictionary(uniqueKeysWithValues: h.notifier.posts.map { ($0.code, $0.url) })
+        #expect(urls["abc-defg-hij"] == "https://meet.google.com/meet/abc-defg-hij?authuser=1")
+        #expect(urls["xyz-qrst-uvw"] == "https://meet.google.com/xyz-qrst-uvw", "never another call's link")
+    }
+
     @Test("a posted event removed from the snapshot set (hidden calendar) is withdrawn")
     func vanishedEventWithdrawn() async {
         let h = makeSchedulerHarness()

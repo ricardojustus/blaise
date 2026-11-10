@@ -125,11 +125,12 @@ public enum UpcomingMeetings {
     private static func meetURLString(
         event: CalendarEventSnapshot, linkText: String, code: String?
     ) -> String? {
-        guard code != nil else { return nil }
-        let pattern = #"https?://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}[^\s>"']*"#
+        guard let code else { return nil }
+        // The link carrying THIS code, so the opened call is the recorded one.
+        let pattern = #"https?://meet\.google\.com/(?:meet/)?"# + code + #"\b[^\s>"']*"#
         if let range = linkText.range(of: pattern, options: [.regularExpression, .caseInsensitive]) {
             return String(linkText[range])
         }
-        return code.map { "https://meet.google.com/\($0)" }
+        return "https://meet.google.com/\(code)"
     }
 }

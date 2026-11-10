@@ -114,6 +114,16 @@ describe("meetingCodeFromURL", () => {
     expect(S.meetingCodeFromURL("https://meet.google.com/abc-defg-hij/extra")).toBe("abc-defg-hij");
   });
 
+  it("extracts the code from the /meet/<code> in-call address", () => {
+    expect(S.meetingCodeFromURL("https://meet.google.com/meet/abc-defg-hij")).toBe("abc-defg-hij");
+    expect(S.meetingCodeFromURL("https://meet.google.com/meet/abc-defg-hij?authuser=1")).toBe(
+      "abc-defg-hij",
+    );
+    expect(S.meetingCodeFromURL("https://meet.google.com/meet/lookup/team-sync")).toBe("team-sync");
+    expect(S.meetingCodeFromURL("https://meet.google.com/meet")).toBeNull();
+    expect(S.meetingCodeFromURL("https://meet.google.com/meet/")).toBeNull();
+  });
+
   it("rejects non-meeting paths", () => {
     expect(S.meetingCodeFromURL("https://meet.google.com/")).toBeNull();
     expect(S.meetingCodeFromURL("https://meet.google.com/landing")).toBeNull();

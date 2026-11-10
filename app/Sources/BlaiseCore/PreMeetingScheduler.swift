@@ -140,7 +140,8 @@ public actor PreMeetingScheduler {
     /// default browser). Reconstructed from the code when the event carried
     /// a bare code rather than a full link.
     private func meetURLString(linkText: String, code: String) -> String {
-        let pattern = #"https?://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}[^\s>"']*"#
+        // The link carrying THIS code, so the opened call is the recorded one.
+        let pattern = #"https?://meet\.google\.com/(?:meet/)?"# + code + #"\b[^\s>"']*"#
         if let range = linkText.range(of: pattern, options: [.regularExpression, .caseInsensitive]) {
             return String(linkText[range])
         }

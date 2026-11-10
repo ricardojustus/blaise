@@ -12,7 +12,7 @@ public enum MeetLinkParser {
     /// text: a meet.google.com link (with or without scheme/query) or a bare
     /// pasted code. nil when nothing matches — never a guess.
     public static func meetingCode(from text: String) -> String? {
-        let pattern = #"(?:meet\.google\.com/)([a-z]{3}-[a-z]{4}-[a-z]{3})\b"#
+        let pattern = #"(?:meet\.google\.com/(?:meet/)?)([a-z]{3}-[a-z]{4}-[a-z]{3})\b"#
         if let range = text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) {
             let match = String(text[range])
             return String(match.split(separator: "/").last!).lowercased()

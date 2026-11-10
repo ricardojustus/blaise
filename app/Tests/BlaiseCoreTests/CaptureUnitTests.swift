@@ -520,6 +520,9 @@ struct MeetLinkParserTests {
         #expect(
             MeetLinkParser.meetingCode(
                 from: "Join: https://meet.google.com/abc-defg-hij\nAgenda: …") == "abc-defg-hij")
+        #expect(
+            MeetLinkParser.meetingCode(from: "https://meet.google.com/meet/abc-defg-hij?authuser=1")
+                == "abc-defg-hij")
         #expect(MeetLinkParser.meetingCode(from: "  abc-defg-hij  ") == "abc-defg-hij")
         #expect(MeetLinkParser.meetingCode(from: "ABC-DEFG-HIJ") == "abc-defg-hij")
         #expect(MeetLinkParser.meetingCode(from: "https://zoom.us/j/123456") == nil)
